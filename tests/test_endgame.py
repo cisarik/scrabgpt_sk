@@ -4,7 +4,7 @@ from pathlib import Path
 
 from scrabgpt.core.board import Board
 from scrabgpt.core.game import Game, GameEndReason, PlayerState
-from scrabgpt.core.tiles import TILE_POINTS, TileBag
+from scrabgpt.core.tiles import TileBag, get_tile_points
 from scrabgpt.core.types import Placement
 
 PREMIUMS_PATH = str((Path(__file__).resolve().parents[1] / "scrabgpt" / "assets" / "premiums.json").resolve())
@@ -25,7 +25,8 @@ def test_endgame_bag_empty_player_out() -> None:
     assert game.end_reason == GameEndReason.BAG_EMPTY_AND_PLAYER_OUT
     assert not human.rack
     assert ai.rack == list("STAPLES")
-    leftover_ai = sum(TILE_POINTS[ch] for ch in ai.rack)
+    points = get_tile_points()
+    leftover_ai = sum(points.get(ch, 0) for ch in ai.rack)
     assert game.leftover_points == {"Human": 0, "AI": leftover_ai}
     scores = game.scores()
     assert scores["Human"] == move_score + leftover_ai
@@ -50,8 +51,9 @@ def test_endgame_no_moves_available() -> None:
     assert game.ended is True
     assert game.end_reason == GameEndReason.NO_MOVES_AVAILABLE
 
-    leftover_human = sum(TILE_POINTS[ch] for ch in human.rack)
-    leftover_ai = sum(TILE_POINTS[ch] for ch in ai.rack)
+    points = get_tile_points()
+    leftover_human = sum(points.get(ch, 0) for ch in human.rack)
+    leftover_ai = sum(points.get(ch, 0) for ch in ai.rack)
     assert game.leftover_points == {"Human": leftover_human, "AI": leftover_ai}
 
     scores = game.scores()
@@ -76,8 +78,9 @@ def test_endgame_all_players_pass_twice() -> None:
     assert game.ended is True
     assert game.end_reason == GameEndReason.ALL_PLAYERS_PASSED_TWICE
 
-    leftover_human = sum(TILE_POINTS[ch] for ch in human.rack)
-    leftover_ai = sum(TILE_POINTS[ch] for ch in ai.rack)
+    points = get_tile_points()
+    leftover_human = sum(points.get(ch, 0) for ch in human.rack)
+    leftover_ai = sum(points.get(ch, 0) for ch in ai.rack)
     assert game.leftover_points == {"Human": leftover_human, "AI": leftover_ai}
     scores = game.scores()
     assert scores["Human"] == -leftover_human

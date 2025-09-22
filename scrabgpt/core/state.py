@@ -9,6 +9,7 @@ from typing import Any, Literal, TypedDict
 
 from .board import Board
 from .tiles import TileBag
+from .variant_store import get_active_variant_slug
 
 
 class BlankPos(TypedDict):
@@ -116,6 +117,7 @@ class SaveGameState(TypedDict, total=False):
     - bag: reťazec zvyšných kameňov (presné poradie)
     - human_score, ai_score: celé čísla
     - turn: "HUMAN" | "AI"
+    - variant: slug aktuálneho Scrabble variantu
 
     Voliteľné:
     - last_move_cells: pozície posledného ťahu na zvýraznenie
@@ -138,6 +140,7 @@ class SaveGameState(TypedDict, total=False):
     human_score: int
     ai_score: int
     turn: Literal["HUMAN", "AI"]
+    variant: str
     last_move_cells: list[_Pos]
     last_move_points: int
     consecutive_passes: int
@@ -167,6 +170,7 @@ def build_save_state_dict(
     game_end_reason: str | None = None,
     repro: bool = False,
     seed: int = 0,
+    variant_slug: str | None = None,
 ) -> SaveGameState:
     """Vytvorí JSON-serializovateľný stav hry (schema v1).
 
@@ -189,6 +193,8 @@ def build_save_state_dict(
                 row_chars.append(".")
         grid.append("".join(row_chars))
 
+    variant = variant_slug or getattr(bag, "variant_slug", None) or get_active_variant_slug()
+
     return SaveGameState(
         schema_version="1",
         grid=grid,
@@ -200,6 +206,7 @@ def build_save_state_dict(
         human_score=human_score,
         ai_score=ai_score,
         turn=turn,
+        variant=str(variant),
         last_move_cells=[{"row": r, "col": c} for (r, c) in (last_move_cells or [])],
         last_move_points=last_move_points,
         consecutive_passes=consecutive_passes,
@@ -255,6 +262,9 @@ def parse_save_state_dict(data: dict[str, Any]) -> SaveGameState:
     turn = data.get("turn", "HUMAN")
     assert turn in ("HUMAN", "AI")
 
+    variant = data.get("variant", get_active_variant_slug())
+    assert isinstance(variant, str) and variant
+
     last_move_cells = _parse_pos_list("last_move_cells")
     last_move_points = data.get("last_move_points", 0)
     assert isinstance(last_move_points, int)
@@ -284,6 +294,7 @@ def parse_save_state_dict(data: dict[str, Any]) -> SaveGameState:
         human_score=human_score,
         ai_score=ai_score,
         turn=turn,
+        variant=variant,
         last_move_cells=last_move_cells,
         last_move_points=last_move_points,
         consecutive_passes=consecutive_passes,
@@ -328,4 +339,5 @@ def restore_bag_from_save(state: SaveGameState) -> TileBag:
     # Dôležité: pri poskytnutých `tiles` sa taška už nesmie premiešať
     letters = list(state["bag"]) if state.get("bag") else []
     seed = state.get("seed", 0)
-    return TileBag(seed=seed, tiles=letters)
+    variant = state.get("variant")
+    return TileBag(seed=seed, tiles=letters, variant=variant)

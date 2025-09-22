@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from .board import Board
-from .tiles import TILE_POINTS
+from .tiles import get_tile_points
 from .types import Placement, Premium, ScoreBreakdown
 
 
@@ -21,6 +21,8 @@ def score_words(
     # pomocna mapa pre rychle zistenie, ci bunka je nova
     new_cells = set(placed.keys())
 
+    tile_points = get_tile_points()
+
     for word, coords in words_coords:
         word_multiplier = 1
         word_points = 0
@@ -28,7 +30,7 @@ def score_words(
         for (r,c) in coords:
             cell = board.cells[r][c]
             letter = cell.letter or ""
-            base = 0 if cell.is_blank else TILE_POINTS.get(letter, 0)
+            base = 0 if cell.is_blank else tile_points.get(letter, 0)
             # ak je to nova bunka, mozeme uplatnit prémie poli
             if (r,c) in new_cells and cell.premium and not cell.premium_used:
                 if cell.premium == Premium.DL:

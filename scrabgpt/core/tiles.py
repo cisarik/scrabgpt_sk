@@ -5,37 +5,46 @@ import random
 from dataclasses import dataclass, field
 
 from .types import TilePoints
+from .variant_store import VariantDefinition, get_active_variant, load_variant
 
-# Bodove hodnoty pismen pre anglicky Scrabble (oficialne)
-TILE_POINTS: TilePoints = {
-    **{c: 1 for c in "AEILNORSTU"},
-    **{c: 2 for c in "DG"},
-    **{c: 3 for c in "BCMP"},
-    **{c: 4 for c in "FHVWY"},
-    "K": 5,
-    **{c: 8 for c in "JX"},
-    **{c: 10 for c in "QZ"},
-    "?": 0,  # blank
-}
 
-# Distribucia dlazdic
-DISTRIBUTION = {
-    "A": 9, "B": 2, "C": 2, "D": 4, "E": 12, "F": 2, "G": 3, "H": 2, "I": 9,
-    "J": 1, "K": 1, "L": 4, "M": 2, "N": 6, "O": 8, "P": 2, "Q": 1, "R": 6,
-    "S": 4, "T": 6, "U": 4, "V": 2, "W": 2, "X": 1, "Y": 2, "Z": 1, "?": 2,
-}
+def _resolve_variant(variant: VariantDefinition | str | None) -> VariantDefinition:
+    if isinstance(variant, VariantDefinition):
+        return variant
+    if isinstance(variant, str) and variant:
+        return load_variant(variant)
+    return get_active_variant()
+
+
+def get_tile_points(variant: VariantDefinition | str | None = None) -> TilePoints:
+    """Vráti bodové hodnoty písmen pre daný (alebo aktívny) variant."""
+
+    resolved = _resolve_variant(variant)
+    return dict(resolved.tile_points)
+
+
+def get_tile_distribution(variant: VariantDefinition | str | None = None) -> dict[str, int]:
+    """Vráti distribúciu písmen pre daný (alebo aktívny) variant."""
+
+    resolved = _resolve_variant(variant)
+    return dict(resolved.distribution)
 
 @dataclass
 class TileBag:
-    """Taška s pismenami s deterministickym RNG pre TDD a reprodukovatelnost."""
+    """Taška s písmenami, ktorá rešpektuje aktívny Scrabble variant."""
+
     seed: int | None = None
     tiles: list[str] = field(default_factory=list)
+    variant: VariantDefinition | str | None = None
 
     def __post_init__(self) -> None:
-        # Pozn.: Ak su poskytnute `tiles`, zachovaj ich presne v danom poradi
-        # (pouzite pri load-e hry). Inak napln podla distribucie a premiešaj.
+        self._variant = _resolve_variant(self.variant)
+        self.variant = self._variant
+        self.variant_slug = self._variant.slug
+        # Pozn.: Ak sú poskytnuté `tiles`, zachovaj ich presne v danom poradí
+        # (použité pri load-e hry). Inak naplň podľa distribúcie a premiešaj.
         if not self.tiles:
-            for ch, count in DISTRIBUTION.items():
+            for ch, count in self._variant.distribution.items():
                 self.tiles.extend([ch] * count)
             self._rng = random.Random(self.seed)
             self._rng.shuffle(self.tiles)

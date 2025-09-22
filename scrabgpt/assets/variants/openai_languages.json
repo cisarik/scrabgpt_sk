@@ -1,0 +1,463 @@
+{
+  "fetched_at": "2025-09-22T10:17:39",
+  "languages": [
+    {
+      "name": "Amharic",
+      "code": "am",
+      "aliases": [
+        "አማርኛ",
+        "Amharčina"
+      ],
+      "script": "Ge'ez (Ethiopic)"
+    },
+    {
+      "name": "Arabic",
+      "code": "ar",
+      "aliases": [
+        "العربية",
+        "Arabčina"
+      ],
+      "script": "Arabic"
+    },
+    {
+      "name": "Bengali",
+      "code": "bn",
+      "aliases": [
+        "বাংলা",
+        "Bengálčina",
+        "Bangla"
+      ],
+      "script": "Bengali"
+    },
+    {
+      "name": "Bosnian",
+      "code": "bs",
+      "aliases": [
+        "Bosanski",
+        "Bosnian"
+      ],
+      "script": "Latin"
+    },
+    {
+      "name": "Bulgarian",
+      "code": "bg",
+      "aliases": [
+        "Български",
+        "Bulharčina"
+      ],
+      "script": "Cyrillic"
+    },
+    {
+      "name": "Burmese",
+      "code": "my",
+      "aliases": [
+        "မြန်မာစာ",
+        "Burmese",
+        "Myanma"
+      ],
+      "script": "Burmese (Myanmar)"
+    },
+    {
+      "name": "Chinese (Mandarin)",
+      "code": "zh",
+      "aliases": [
+        "中文",
+        "Chinese",
+        "Čínština",
+        "Mandarin"
+      ],
+      "script": "Han (Simplified/Traditional)"
+    },
+    {
+      "name": "Croatian",
+      "code": "hr",
+      "aliases": [
+        "Hrvatski",
+        "Chorvátčina"
+      ],
+      "script": "Latin"
+    },
+    {
+      "name": "Czech",
+      "code": "cs",
+      "aliases": [
+        "Čeština",
+        "Čeština (Czech)"
+      ],
+      "script": "Latin"
+    },
+    {
+      "name": "Dutch",
+      "code": "nl",
+      "aliases": [
+        "Nederlands",
+        "Holandčina"
+      ],
+      "script": "Latin"
+    },
+    {
+      "name": "English",
+      "code": "en",
+      "aliases": [
+        "English",
+        "Angličtina"
+      ],
+      "script": "Latin"
+    },
+    {
+      "name": "Filipino",
+      "code": "tl",
+      "aliases": [
+        "Tagalog",
+        "Tagalčina",
+        "Filipino"
+      ],
+      "script": "Latin"
+    },
+    {
+      "name": "French",
+      "code": "fr",
+      "aliases": [
+        "Français",
+        "Francúzština"
+      ],
+      "script": "Latin"
+    },
+    {
+      "name": "German",
+      "code": "de",
+      "aliases": [
+        "Deutsch",
+        "Nemčina"
+      ],
+      "script": "Latin"
+    },
+    {
+      "name": "Greek",
+      "code": "el",
+      "aliases": [
+        "Ελληνικά",
+        "Grečtina"
+      ],
+      "script": "Greek"
+    },
+    {
+      "name": "Gujarati",
+      "code": "gu",
+      "aliases": [
+        "ગુજરાતી",
+        "Gudžarátčina"
+      ],
+      "script": "Gujarati"
+    },
+    {
+      "name": "Hausa",
+      "code": "ha",
+      "aliases": [
+        "Hausa",
+        "Hausčina"
+      ],
+      "script": "Latin / Arabic"
+    },
+    {
+      "name": "Hebrew",
+      "code": "he",
+      "aliases": [
+        "עברית",
+        "Hebrejčina"
+      ],
+      "script": "Hebrew"
+    },
+    {
+      "name": "Hindi",
+      "code": "hi",
+      "aliases": [
+        "हिन्दी",
+        "Hindčina"
+      ],
+      "script": "Devanagari"
+    },
+    {
+      "name": "Hungarian",
+      "code": "hu",
+      "aliases": [
+        "Magyar",
+        "Maďarčina"
+      ],
+      "script": "Latin"
+    },
+    {
+      "name": "Igbo",
+      "code": "ig",
+      "aliases": [
+        "Igbo",
+        "Igbčina"
+      ],
+      "script": "Latin"
+    },
+    {
+      "name": "Indonesian",
+      "code": "id",
+      "aliases": [
+        "Bahasa Indonesia",
+        "Indonézčina"
+      ],
+      "script": "Latin"
+    },
+    {
+      "name": "Italian",
+      "code": "it",
+      "aliases": [
+        "Italiano",
+        "Taliančina"
+      ],
+      "script": "Latin"
+    },
+    {
+      "name": "Japanese",
+      "code": "ja",
+      "aliases": [
+        "日本語",
+        "Japončina"
+      ],
+      "script": "Kanji and Kana"
+    },
+    {
+      "name": "Kannada",
+      "code": "kn",
+      "aliases": [
+        "ಕನ್ನಡ",
+        "Kannaďčina"
+      ],
+      "script": "Kannada"
+    },
+    {
+      "name": "Korean",
+      "code": "ko",
+      "aliases": [
+        "한국어",
+        "Kórejčina"
+      ],
+      "script": "Hangul"
+    },
+    {
+      "name": "Malay",
+      "code": "ms",
+      "aliases": [
+        "Bahasa Melayu",
+        "Malajčina"
+      ],
+      "script": "Latin"
+    },
+    {
+      "name": "Malayalam",
+      "code": "ml",
+      "aliases": [
+        "മലയാളം",
+        "Malayalam"
+      ],
+      "script": "Malayalam"
+    },
+    {
+      "name": "Marathi",
+      "code": "mr",
+      "aliases": [
+        "मराठी",
+        "Maráthčina"
+      ],
+      "script": "Devanagari"
+    },
+    {
+      "name": "Nepali",
+      "code": "ne",
+      "aliases": [
+        "नेपाली",
+        "Nepálčina"
+      ],
+      "script": "Devanagari"
+    },
+    {
+      "name": "Persian",
+      "code": "fa",
+      "aliases": [
+        "فارسی",
+        "Perzština",
+        "Farsi"
+      ],
+      "script": "Perso-Arabic"
+    },
+    {
+      "name": "Polish",
+      "code": "pl",
+      "aliases": [
+        "Polski",
+        "Poľština"
+      ],
+      "script": "Latin"
+    },
+    {
+      "name": "Portuguese",
+      "code": "pt",
+      "aliases": [
+        "Português",
+        "Portugalčina"
+      ],
+      "script": "Latin"
+    },
+    {
+      "name": "Punjabi",
+      "code": "pa",
+      "aliases": [
+        "ਪੰਜਾਬੀ",
+        "Pandžábčina",
+        "Punjabi"
+      ],
+      "script": "Gurmukhi / Perso-Arabic"
+    },
+    {
+      "name": "Romanian",
+      "code": "ro",
+      "aliases": [
+        "Română",
+        "Rumunčina"
+      ],
+      "script": "Latin"
+    },
+    {
+      "name": "Russian",
+      "code": "ru",
+      "aliases": [
+        "Русский",
+        "Ruština"
+      ],
+      "script": "Cyrillic"
+    },
+    {
+      "name": "Serbian",
+      "code": "sr",
+      "aliases": [
+        "Српски",
+        "Srpčina",
+        "Srbčina"
+      ],
+      "script": "Cyrillic and Latin"
+    },
+    {
+      "name": "Slovak",
+      "code": "sk",
+      "aliases": [
+        "Slovenčina",
+        "Slovak"
+      ],
+      "script": "Latin"
+    },
+    {
+      "name": "Slovenian",
+      "code": "sl",
+      "aliases": [
+        "Slovenščina",
+        "Slovenčina"
+      ],
+      "script": "Latin"
+    },
+    {
+      "name": "Spanish",
+      "code": "es",
+      "aliases": [
+        "Español",
+        "Španielčina"
+      ],
+      "script": "Latin"
+    },
+    {
+      "name": "Swahili",
+      "code": "sw",
+      "aliases": [
+        "Kiswahili",
+        "Swahilčina"
+      ],
+      "script": "Latin"
+    },
+    {
+      "name": "Tamil",
+      "code": "ta",
+      "aliases": [
+        "தமிழ்",
+        "Tamilčina"
+      ],
+      "script": "Tamil"
+    },
+    {
+      "name": "Telugu",
+      "code": "te",
+      "aliases": [
+        "తెలుగు",
+        "Telugčina"
+      ],
+      "script": "Telugu"
+    },
+    {
+      "name": "Thai",
+      "code": "th",
+      "aliases": [
+        "ไทย",
+        "Thajčina"
+      ],
+      "script": "Thai"
+    },
+    {
+      "name": "Turkish",
+      "code": "tr",
+      "aliases": [
+        "Türkçe",
+        "Turečtina"
+      ],
+      "script": "Latin"
+    },
+    {
+      "name": "Ukrainian",
+      "code": "uk",
+      "aliases": [
+        "Українська",
+        "Ukrajinčina"
+      ],
+      "script": "Cyrillic"
+    },
+    {
+      "name": "Urdu",
+      "code": "ur",
+      "aliases": [
+        "اردو",
+        "Urdčina"
+      ],
+      "script": "Perso-Arabic"
+    },
+    {
+      "name": "Vietnamese",
+      "code": "vi",
+      "aliases": [
+        "Tiếng Việt",
+        "Vietnamčina"
+      ],
+      "script": "Latin (quốc ngữ)"
+    },
+    {
+      "name": "Yoruba",
+      "code": "yo",
+      "aliases": [
+        "Yorùbá",
+        "Yorubčina"
+      ],
+      "script": "Latin"
+    },
+    {
+      "name": "Zulu",
+      "code": "zu",
+      "aliases": [
+        "isiZulu",
+        "Zulčina"
+      ],
+      "script": "Latin"
+    }
+  ]
+}

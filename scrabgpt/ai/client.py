@@ -201,7 +201,7 @@ class OpenAIClient:
             raise
 
     # ---------------- Rozhodca (batched) ----------------
-    def judge_words(self, words: list[str]) -> JudgeBatchResponse:
+    def judge_words(self, words: list[str], *, language: str) -> JudgeBatchResponse:
         schema = {
             "type": "object",
             "properties": {
@@ -224,12 +224,12 @@ class OpenAIClient:
             "additionalProperties": False,
         }
         sys_prompt = (
-            "You are a strict Scrabble referee for English words. "
-            "Reply with JSON only."
+            f"You are a strict Scrabble referee for {language} words. "
+            "Reply with JSON only and judge legality according to that Scrabble lexicon."
         )
         user_prompt = (
-            "Validate these words for Scrabble play: "
-            f"{words}. Return JSON exactly matching the schema."
+            f"Validate these words for {language} Scrabble play: {words}. "
+            "Return JSON exactly matching the schema."
         )
         raw = self._call_json(
             sys_prompt + "\n" + user_prompt,
@@ -315,7 +315,13 @@ class OpenAIClient:
         return cast(JudgeBatchResponse, {"results": [], "all_valid": False})
 
     # ---------------- AI hrac ----------------
-    def propose_move(self, compact_state: str) -> dict[str, Any]:
+    def propose_move(
+        self,
+        compact_state: str,
+        *,
+        language: str,
+        tile_summary: str | None = None,
+    ) -> dict[str, Any]:
         schema = {
             "type": "object",
             "properties": {
@@ -354,15 +360,15 @@ class OpenAIClient:
             "additionalProperties": False,
         }
         sys_prompt = (
-            "You are an expert Scrabble player. Play to win. Reply with JSON only. "
-            "Do NOT overwrite existing board letters; place only on EMPTY cells. "
-            "Placements must form a single contiguous line with NO GAPS and "
-            "must connect to existing letters after the first move. "
-            "Use only letters from ai_rack; for '?' provide mapping in 'blanks' "
-            "with chosen uppercase letter. "
-            "If no legal move exists, set 'pass' true and leave placements empty. "
-            "No explanations, no thoughts — JSON only."
+            f"You are an expert Scrabble player for the {language} language variant. "
+            "Play to win. Reply with JSON only. Do NOT overwrite existing board letters; "
+            "place only on empty cells. Placements must form a single contiguous line with no gaps "
+            "and must connect to existing letters after the first move. Use only letters from ai_rack; "
+            "for '?' provide mapping in 'blanks' with chosen uppercase letter. If no legal move exists, "
+            "set 'pass' true and leave placements empty."
         )
+        if tile_summary:
+            sys_prompt += f" Tile distribution summary: {tile_summary}."
         user_prompt = (
             "Given this compact state, propose exactly one move with placements in a single line.\n"
             "If you use blanks from your rack, include them in 'blanks' with chosen letter.\n"

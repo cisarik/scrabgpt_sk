@@ -13,7 +13,7 @@ from .rules import (
     placements_in_line,
 )
 from .scoring import apply_premium_consumption, score_words
-from .tiles import TILE_POINTS, TileBag
+from .tiles import TileBag, get_tile_points
 from .types import Placement
 
 
@@ -37,7 +37,8 @@ class PlayerState:
     def rack_points(self) -> int:
         """Obratková hodnota nepoužitých písmen."""
 
-        return sum(TILE_POINTS.get(letter, 0) for letter in self.rack)
+        points = get_tile_points()
+        return sum(points.get(letter, 0) for letter in self.rack)
 
 
 def determine_end_reason(
@@ -186,4 +187,3 @@ class Game:
 
     def scores(self) -> dict[str, int]:
         return {player.name: player.score for player in self.players}
-

@@ -5,7 +5,7 @@ import uuid
 import json
 import logging
 from collections.abc import Callable
-from typing import Any, Literal, Optional, cast
+from typing import Any, Literal, Optional, Sequence, cast
 from pathlib import Path
 from PySide6.QtCore import Qt, QSize, QRectF, QTimer, Signal, QObject, QThread, QPoint, QMimeData
 from PySide6.QtGui import QAction, QPainter, QColor, QPen, QFont, QMouseEvent, QPaintEvent, QIntValidator, QTextCursor, QPixmap, QDrag
@@ -13,7 +13,8 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QToolBar, QLabel, QSplitter, QStatusBar, QMessageBox, QPushButton,
     QDialog, QFormLayout, QLineEdit, QDialogButtonBox, QListWidget, QListWidgetItem,
-    QGridLayout, QGraphicsDropShadowEffect, QListView, QPlainTextEdit, QCheckBox
+    QGridLayout, QGraphicsDropShadowEffect, QListView, QPlainTextEdit, QCheckBox,
+    QComboBox
 )
 from ..logging_setup import configure_logging, TRACE_ID_VAR, default_log_path
 
@@ -36,6 +37,20 @@ from ..ai.player import should_auto_trigger_ai_opening, is_board_empty
 from ..core.state import build_ai_state_dict
 from ..core.rack import consume_rack
 from ..core.state import build_save_state_dict, parse_save_state_dict, restore_board_from_save, restore_bag_from_save
+from ..core.variant_store import (
+    VariantDefinition,
+    get_active_variant_slug,
+    list_installed_variants,
+    load_variant,
+    set_active_variant_slug,
+)
+from ..ai.variants import (
+    LanguageInfo,
+    download_and_store_variant,
+    fetch_supported_languages,
+    get_languages_for_ui,
+    match_language,
+)
 
 ASSETS = str(Path(__file__).parent / ".." / "assets")
 PREMIUMS_PATH = get_premiums_path()
@@ -55,6 +70,65 @@ log = configure_logging()
 
 # ---------- Jednoduché UI prvky ----------
 
+class NewVariantDialog(QDialog):
+    """Dialog na zadanie parametrov pre stiahnutie nového Scrabble variantu."""
+
+    def __init__(
+        self,
+        parent: QWidget | None,
+        languages: Sequence[LanguageInfo],
+        default_language: LanguageInfo | None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Nový variant Scrabble")
+
+        layout = QFormLayout(self)
+
+        self.language_combo = QComboBox(self)
+        self._languages: list[LanguageInfo] = list(languages)
+        for lang in self._languages:
+            self.language_combo.addItem(lang.display_label(), lang)
+        if default_language:
+            for idx, lang in enumerate(self._languages):
+                if lang.name == default_language.name and lang.code == default_language.code:
+                    self.language_combo.setCurrentIndex(idx)
+                    break
+
+        self.query_edit = QLineEdit(self)
+        if default_language:
+            self.query_edit.setText(default_language.name)
+        self.query_edit.setPlaceholderText("Napr. Slovenský Scrabble variant")
+
+        layout.addRow("Jazyk:", self.language_combo)
+        layout.addRow("Popis variantu:", self.query_edit)
+
+        info = QLabel(
+            "Zadaný text sa vloží do promptu pre OpenAI. Pridaj jazyk aj prípadné "
+            "špecifiká (napr. regionálnu verziu)."
+        )
+        info.setWordWrap(True)
+        layout.addRow(info)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
+            parent=self,
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def selected_language(self) -> LanguageInfo | None:
+        data = self.language_combo.currentData()
+        return data if isinstance(data, LanguageInfo) else None
+
+    def query_text(self) -> str:
+        text = self.query_edit.text().strip()
+        if text:
+            return text
+        lang = self.selected_language()
+        return lang.name if lang else ""
+
+
 class SettingsDialog(QDialog):
     """Nastavenia - OpenAI API kľúč a limity výstupných tokenov.
 
@@ -65,6 +139,10 @@ class SettingsDialog(QDialog):
     def __init__(self, parent: QWidget | None = None, *, repro_mode: bool = False, repro_seed: int = 0) -> None:
         super().__init__(parent)
         self.setWindowTitle("Nastavenia")
+        self.selected_variant_slug = get_active_variant_slug()
+        self._installed_variants: list[VariantDefinition] = []
+        self._languages: list[LanguageInfo] = []
+
         lay = QFormLayout(self)
         # Načítaj .env, aby sa predvyplnil API key (ak existuje)
         try:
@@ -72,13 +150,13 @@ class SettingsDialog(QDialog):
             _load_dotenv(ENV_PATH, override=False)
         except Exception:
             pass
+
         self.key_edit = QLineEdit(self)
         self.key_edit.setEchoMode(QLineEdit.EchoMode.Password)
         self.key_edit.setText(os.getenv("OPENAI_API_KEY", ""))
         lay.addRow("OpenAI API key:", self.key_edit)
 
         # --- Limity výstupných tokenov ---
-        # AI move
         self.ai_tokens_edit = QLineEdit(self)
         self.ai_tokens_edit.setValidator(QIntValidator(1, 1_000_000, self))
         self.ai_tokens_edit.setText(os.getenv("AI_MOVE_MAX_OUTPUT_TOKENS", "3600"))
@@ -91,7 +169,6 @@ class SettingsDialog(QDialog):
         ai_row_w.setLayout(ai_row)
         lay.addRow("AI ťah — max výstupných tokenov:", ai_row_w)
 
-        # Judge
         self.judge_tokens_edit = QLineEdit(self)
         self.judge_tokens_edit.setValidator(QIntValidator(1, 1_000_000, self))
         self.judge_tokens_edit.setText(os.getenv("JUDGE_MAX_OUTPUT_TOKENS", "800"))
@@ -104,8 +181,27 @@ class SettingsDialog(QDialog):
         j_row_w.setLayout(j_row)
         lay.addRow("Rozhodca — max výstupných tokenov:", j_row_w)
 
+        # --- Výber variantov ---
+        self.variant_combo = QComboBox(self)
+        self.variant_combo.setEditable(False)
+        self.variant_combo.currentIndexChanged.connect(self._on_variant_changed)
+        lay.addRow("Aktívny Scrabble variant:", self.variant_combo)
+
+        self.languages_combo = QComboBox(self)
+        self.languages_combo.setEditable(False)
+        lang_row = QHBoxLayout()
+        lang_row.addWidget(self.languages_combo, 2)
+        self.refresh_languages_btn = QPushButton("Aktualizovať jazyky", self)
+        self.refresh_languages_btn.clicked.connect(self._refresh_languages)
+        lang_row.addWidget(self.refresh_languages_btn)
+        self.new_variant_btn = QPushButton("Nový variant", self)
+        self.new_variant_btn.clicked.connect(self._on_new_variant)
+        lang_row.addWidget(self.new_variant_btn)
+        lang_container = QWidget(self)
+        lang_container.setLayout(lang_row)
+        lay.addRow("Jazyky OpenAI:", lang_container)
+
         # --- Repro mód (deterministický seed pre TileBag) ---
-        # Uložené iba v runtime (žiadna perzistencia do .env)
         self.repro_check = QCheckBox("Repro mód")
         self.repro_check.setChecked(repro_mode)
         lay.addRow(self.repro_check)
@@ -129,6 +225,9 @@ class SettingsDialog(QDialog):
         btns.rejected.connect(self.reject)
         lay.addWidget(btns)
 
+        self._load_installed_variants(select_slug=self.selected_variant_slug)
+        self._init_languages()
+
     def _update_costs(self) -> None:
         """Prepočet odhadovanej ceny v EUR pre zadaný počet tokenov."""
         def fmt(tokens_text: str) -> str:
@@ -146,6 +245,147 @@ class SettingsDialog(QDialog):
 
         self.ai_tokens_cost.setText(fmt(self.ai_tokens_edit.text()))
         self.judge_tokens_cost.setText(fmt(self.judge_tokens_edit.text()))
+
+    def _load_installed_variants(self, *, select_slug: str | None = None) -> None:
+        variants = sorted(list_installed_variants(), key=lambda v: v.language.lower())
+        self._installed_variants = variants
+        slug_to_select = select_slug or self.selected_variant_slug
+
+        self.variant_combo.blockSignals(True)
+        self.variant_combo.clear()
+        for variant in variants:
+            label = f"{variant.language} ({variant.slug})"
+            self.variant_combo.addItem(label, variant.slug)
+        self.variant_combo.blockSignals(False)
+
+        if slug_to_select:
+            idx = self.variant_combo.findData(slug_to_select)
+            if idx >= 0:
+                self.variant_combo.setCurrentIndex(idx)
+        if self.variant_combo.count() and self.variant_combo.currentIndex() < 0:
+            self.variant_combo.setCurrentIndex(0)
+
+        data = self.variant_combo.currentData()
+        if isinstance(data, str):
+            self.selected_variant_slug = data
+        self._sync_language_with_variant(self.selected_variant_slug)
+
+    def _init_languages(self) -> None:
+        languages = get_languages_for_ui()
+        self._set_languages(languages)
+        self._sync_language_with_variant(self.selected_variant_slug)
+
+    def _set_languages(self, languages: Sequence[LanguageInfo], *, keep_selection: bool = False) -> None:
+        previous = self._current_language() if keep_selection else None
+        self._languages = list(languages)
+        self.languages_combo.blockSignals(True)
+        self.languages_combo.clear()
+        for lang in self._languages:
+            self.languages_combo.addItem(lang.display_label(), lang)
+        self.languages_combo.blockSignals(False)
+        if previous:
+            idx = self._index_for_language(previous)
+            if idx >= 0:
+                self.languages_combo.setCurrentIndex(idx)
+                return
+        if self.languages_combo.count():
+            self.languages_combo.setCurrentIndex(0)
+
+    def _current_language(self) -> LanguageInfo | None:
+        data = self.languages_combo.currentData()
+        return data if isinstance(data, LanguageInfo) else None
+
+    def _index_for_language(self, language: LanguageInfo) -> int:
+        for idx in range(self.languages_combo.count()):
+            data = self.languages_combo.itemData(idx)
+            if not isinstance(data, LanguageInfo):
+                continue
+            if data.name.casefold() == language.name.casefold():
+                code_a = (data.code or "").casefold()
+                code_b = (language.code or "").casefold()
+                if code_a == code_b or not code_b:
+                    return idx
+        return -1
+
+    def _on_variant_changed(self, index: int) -> None:
+        data = self.variant_combo.itemData(index)
+        if isinstance(data, str):
+            self.selected_variant_slug = data
+            self._sync_language_with_variant(data)
+
+    def _sync_language_with_variant(self, slug: str | None) -> None:
+        if not slug:
+            return
+        try:
+            variant = load_variant(slug)
+        except Exception:
+            return
+        match = match_language(variant.language, self._languages)
+        if match:
+            idx = self._index_for_language(match)
+            if idx >= 0:
+                self.languages_combo.setCurrentIndex(idx)
+                return
+        new_lang = LanguageInfo(name=variant.language, code=None)
+        self._languages.append(new_lang)
+        self.languages_combo.addItem(new_lang.display_label(), new_lang)
+        self.languages_combo.setCurrentIndex(self.languages_combo.count() - 1)
+
+    def _refresh_languages(self) -> None:
+        try:
+            client = OpenAIClient()
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "OpenAI", f"Inicializácia klienta zlyhala: {exc}")
+            return
+        try:
+            languages = fetch_supported_languages(client)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("refresh_languages_failed", exc_info=exc)
+            QMessageBox.critical(self, "OpenAI", f"Zlyhalo načítanie jazykov: {exc}")
+            return
+        self._set_languages(languages, keep_selection=True)
+        self._sync_language_with_variant(self.selected_variant_slug)
+        QMessageBox.information(self, "Jazyky", "Zoznam jazykov bol aktualizovaný.")
+
+    def _on_new_variant(self) -> None:
+        current_lang = self._current_language()
+        dialog = NewVariantDialog(self, self._languages or get_languages_for_ui(), current_lang)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        query = dialog.query_text().strip()
+        if not query:
+            QMessageBox.warning(self, "Nový variant", "Zadaj jazyk alebo popis variantu.")
+            return
+        try:
+            client = OpenAIClient()
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "Nový variant", f"OpenAI client sa nepodarilo inicializovať: {exc}")
+            return
+        language_hint = dialog.selected_language()
+        try:
+            definition = download_and_store_variant(
+                client,
+                language_request=query,
+                language_hint=language_hint,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.exception("download_variant_failed", exc_info=exc)
+            QMessageBox.critical(self, "Nový variant", f"Získavanie variantu zlyhalo: {exc}")
+            return
+        self.selected_variant_slug = definition.slug
+        # rozšír jazykový zoznam, ak tam ešte nie je
+        if not match_language(definition.language, self._languages):
+            inferred_code = language_hint.code if language_hint else None
+            new_language = LanguageInfo(name=definition.language, code=inferred_code)
+            self._languages.append(new_language)
+            self.languages_combo.addItem(new_language.display_label(), new_language)
+        self._load_installed_variants(select_slug=definition.slug)
+        self._sync_language_with_variant(definition.slug)
+        QMessageBox.information(
+            self,
+            "Nový variant",
+            f"Variant '{definition.language}' bol uložený (slug {definition.slug}).",
+        )
 
     def test_connection(self) -> None:
         k = self.key_edit.text().strip()
@@ -191,6 +431,18 @@ class SettingsDialog(QDialog):
             _set_key2(ENV_PATH, "JUDGE_MAX_OUTPUT_TOKENS", judge_tokens)
         except Exception:
             pass
+
+        slug_data = self.variant_combo.currentData()
+        if isinstance(slug_data, str) and slug_data:
+            try:
+                variant = set_active_variant_slug(slug_data)
+                self.selected_variant_slug = variant.slug
+                from dotenv import set_key as _set_key_variant
+                _set_key_variant(ENV_PATH, "SCRABBLE_VARIANT", variant.slug)
+            except Exception:
+                # aj pri zlyhaní zápisu do .env necháme aspoň runtime hodnotu
+                os.environ["SCRABBLE_VARIANT"] = slug_data
+        super().accept()
         super().accept()
 
 
@@ -705,8 +957,9 @@ class MainWindow(QMainWindow):
         self.resize(1000, 800)
 
         # Modely
+        self._set_variant(get_active_variant_slug())
         self.board = Board(PREMIUMS_PATH)
-        self.bag = TileBag()
+        self.bag = TileBag(variant=self.variant_definition)
         # na zaciatku prazdny rack; pismena sa zoberu po "Nová hra"
         self.human_rack: list[str] = []
         self.ai_rack: list[str] = []
@@ -844,6 +1097,17 @@ class MainWindow(QMainWindow):
 
         self._reset_to_idle_state()
 
+    def _set_variant(self, slug: str) -> None:
+        try:
+            definition = load_variant(slug)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("variant_load_failed slug=%s error=%s", slug, exc)
+            definition = load_variant(get_active_variant_slug())
+            slug = definition.slug
+        self.variant_slug = slug
+        self.variant_definition = definition
+        self.variant_language = definition.language
+
     @staticmethod
     def _analyze_judge_response(resp: dict[str, object]) -> tuple[bool, list[dict[str, Any]]]:
         """Derive overall validity and normalized entry list from judge response."""
@@ -881,7 +1145,7 @@ class MainWindow(QMainWindow):
         self._set_game_ui_visible(True)
         # Repro: ak je zapnutý, inicializuj tašku s daným seedom, inak náhodne
         seed_to_use: int | None = self.repro_seed if self.repro_mode else None
-        self.bag = TileBag(seed=seed_to_use)
+        self.bag = TileBag(seed=seed_to_use, variant=self.variant_definition)
         self._consecutive_passes = 0
         self._pass_streak = {"HUMAN": 0, "AI": 0}
         self._no_moves_possible = False
@@ -1022,7 +1286,7 @@ class MainWindow(QMainWindow):
         self.board_view.update()
         self.human_rack = []
         self.ai_rack = []
-        self.bag = TileBag()
+        self.bag = TileBag(variant=self.variant_definition)
         self.rack.set_letters(self.human_rack)
         self.human_score = 0
         self.ai_score = 0
@@ -1257,21 +1521,22 @@ class MainWindow(QMainWindow):
         class JudgeWorker(QObject):
             finished: Signal = Signal(dict)
             failed: Signal = Signal(Exception)
-            def __init__(self, client: OpenAIClient, words: list[str], trace_id: str) -> None:
+            def __init__(self, client: OpenAIClient, words: list[str], trace_id: str, language: str) -> None:
                 super().__init__()
                 self.client = client
                 self.words = words
                 self.trace_id = trace_id
+                self.language = language
             def run(self) -> None:
                 try:
                     TRACE_ID_VAR.set(self.trace_id)
-                    resp = self.client.judge_words(self.words)
+                    resp = self.client.judge_words(self.words, language=self.language)
                     self.finished.emit(resp)
                 except Exception as e:  # noqa: BLE001
                     self.failed.emit(e)
 
         self._judge_thread = QThread(self)
-        self._judge_worker = JudgeWorker(self.ai_client, words, TRACE_ID_VAR.get())
+        self._judge_worker = JudgeWorker(self.ai_client, words, TRACE_ID_VAR.get(), self.variant_language)
         self._judge_worker.moveToThread(self._judge_thread)
         self._judge_thread.started.connect(self._judge_worker.run)
         self._judge_worker.finished.connect(self._on_judge_ok)
@@ -1439,22 +1704,27 @@ class MainWindow(QMainWindow):
         class ProposeWorker(QObject):
             finished: Signal = Signal(dict)
             failed: Signal = Signal(Exception)
-            def __init__(self, client: OpenAIClient, state_str: str, trace_id: str) -> None:
+            def __init__(self, client: OpenAIClient, state_str: str, trace_id: str, variant: VariantDefinition) -> None:
                 super().__init__()
                 self.client = client
                 self.state_str = state_str
                 self.trace_id = trace_id
+                self.variant = variant
             def run(self) -> None:
                 try:
                     TRACE_ID_VAR.set(self.trace_id)
                     # Použi vylepšený prompt z ai.player
-                    resp = ai_propose_move(client=self.client, compact_state=self.state_str)
+                    resp = ai_propose_move(
+                        client=self.client,
+                        compact_state=self.state_str,
+                        variant=self.variant,
+                    )
                     self.finished.emit(resp)
                 except Exception as e:  # noqa: BLE001
                     self.failed.emit(e)
 
         self._ai_thread = QThread(self)
-        self._ai_worker = ProposeWorker(self.ai_client, compact, TRACE_ID_VAR.get())
+        self._ai_worker = ProposeWorker(self.ai_client, compact, TRACE_ID_VAR.get(), self.variant_definition)
         self._ai_worker.moveToThread(self._ai_thread)
         self._ai_thread.started.connect(self._ai_worker.run)
         self._ai_worker.finished.connect(self._on_ai_proposal)
@@ -1559,7 +1829,12 @@ class MainWindow(QMainWindow):
             try:
                 # označ, že prebehol retry (pre logovanie výsledku otvorenia)
                 self._ai_retry_used = True
-                proposal = ai_propose_move(self.ai_client, compact_state=compact, retry_hint=hint)
+                proposal = ai_propose_move(
+                    self.ai_client,
+                    compact_state=compact,
+                    variant=self.variant_definition,
+                    retry_hint=hint,
+                )
             except TokenBudgetExceededError:
                 # špeciálna hláška, ale AI iba pasuje, aby sa hra nezasekla
                 self._spinner_timer.stop()
@@ -1705,10 +1980,15 @@ class MainWindow(QMainWindow):
             )
             hint = (
                 f"Your previous move created an invalid glued word '{main_word}' by attaching to existing '{anchor}'. "
-                "Propose a different move that forms a single valid English word; prefer proper hooks or overlaps. Return JSON only."
+                f"Propose a different move that forms a single valid {self.variant_language} word; prefer proper hooks or overlaps. Return JSON only."
             )
             try:
-                new_prop = ai_propose_move(self.ai_client if self.ai_client else OpenAIClient(), compact_state=compact, retry_hint=hint)
+                new_prop = ai_propose_move(
+                    self.ai_client if self.ai_client else OpenAIClient(),
+                    compact_state=compact,
+                    variant=self.variant_definition,
+                    retry_hint=hint,
+                )
             except Exception as e:  # noqa: BLE001
                 self._on_ai_fail(e)
                 return
@@ -1720,15 +2000,16 @@ class MainWindow(QMainWindow):
         class JudgeWorker(QObject):
             finished: Signal = Signal(dict)
             failed: Signal = Signal(Exception)
-            def __init__(self, client: OpenAIClient, words: list[str], trace_id: str) -> None:
+            def __init__(self, client: OpenAIClient, words: list[str], trace_id: str, language: str) -> None:
                 super().__init__()
                 self.client = client
                 self.words = words
                 self.trace_id = trace_id
+                self.language = language
             def run(self) -> None:
                 try:
                     TRACE_ID_VAR.set(self.trace_id)
-                    resp = self.client.judge_words(self.words)
+                    resp = self.client.judge_words(self.words, language=self.language)
                     self.finished.emit(resp)
                 except Exception as e:  # noqa: BLE001
                     self.failed.emit(e)
@@ -1740,7 +2021,12 @@ class MainWindow(QMainWindow):
         self._show_judge_status = True
         self._spinner_timer.start()
         self._ai_judge_thread = QThread(self)
-        self._ai_judge_worker = JudgeWorker(self.ai_client if self.ai_client else OpenAIClient(), words, TRACE_ID_VAR.get())
+        self._ai_judge_worker = JudgeWorker(
+            self.ai_client if self.ai_client else OpenAIClient(),
+            words,
+            TRACE_ID_VAR.get(),
+            self.variant_language,
+        )
         self._ai_judge_worker.moveToThread(self._ai_judge_thread)
         self._ai_judge_thread.started.connect(self._ai_judge_worker.run)
         self._ai_judge_worker.finished.connect(self._on_ai_judge_ok)
@@ -1804,10 +2090,15 @@ class MainWindow(QMainWindow):
                     hint_reason = ""
                 hint = (
                     f"Judge rejected your previous move '{summary_word}'.{hint_reason} "
-                    "Propose a different move that forms a single valid English word; prefer proper hooks or overlaps. Return JSON only."
+                    f"Propose a different move that forms a single valid {self.variant_language} word; prefer proper hooks or overlaps. Return JSON only."
                 )
                 try:
-                    new_prop = ai_propose_move(self.ai_client if self.ai_client else OpenAIClient(), compact_state=compact, retry_hint=hint)
+                    new_prop = ai_propose_move(
+                        self.ai_client if self.ai_client else OpenAIClient(),
+                        compact_state=compact,
+                        variant=self.variant_definition,
+                        retry_hint=hint,
+                    )
                 except Exception as e:  # noqa: BLE001
                     self._on_ai_fail(e)
                     return
@@ -1954,7 +2245,15 @@ class MainWindow(QMainWindow):
             except ValueError:
                 self.repro_seed = 0
 
-            self.status.showMessage("Nastavenia uložené.", 2000)
+            new_variant_slug = getattr(dlg, "selected_variant_slug", self.variant_slug)
+            if isinstance(new_variant_slug, str) and new_variant_slug and new_variant_slug != self.variant_slug:
+                self._set_variant(new_variant_slug)
+                self.status.showMessage(
+                    f"Variant nastavený na {self.variant_language}. Spusti novú hru, aby sa zmena prejavila.",
+                    5000,
+                )
+            else:
+                self.status.showMessage("Nastavenia uložené.", 2000)
 
     def _set_game_ui_visible(self, visible: bool) -> None:
         """Prepína panel so skóre a rackom podľa toho, či je aktívna hra."""
@@ -2042,6 +2341,9 @@ class MainWindow(QMainWindow):
             return
         try:
             # obnov board, bag a hodnoty
+            saved_variant = st.get("variant")
+            if isinstance(saved_variant, str):
+                self._set_variant(saved_variant)
             self.board = restore_board_from_save(st, PREMIUMS_PATH)
             self.board_view.board = self.board
             self.human_rack = list(st.get("human_rack", ""))
