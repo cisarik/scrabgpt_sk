@@ -28,10 +28,7 @@ from ..ai.client import OpenAIClient, TokenBudgetExceededError
 from ..ai.player import propose_move as ai_propose_move
 from ..ai.player import should_auto_trigger_ai_opening, is_board_empty
 from ..core.state import build_ai_state_dict
-from ..config import effective_offline_judge
-from ..core.offline_judge import OfflineJudge, get_default_enable_cache_path, should_use_offline_judge
 from ..core.rack import consume_rack
-from .dialogs import DownloadProgressDialog
 from ..core.state import build_save_state_dict, parse_save_state_dict, restore_board_from_save, restore_bag_from_save
 
 ASSETS = str(Path(__file__).parent / ".." / "assets")
@@ -56,7 +53,7 @@ class SettingsDialog(QDialog):
     - Vpravo priebežne prepočítava odhad ceny v EUR podľa zadaného počtu tokenov.
     - Uloží hodnoty do `.env` v koreňovom adresári projektu a do `os.environ`.
     """
-    def __init__(self, parent: QWidget | None = None, *, repro_mode: bool = False, repro_seed: int = 0, offline_enabled: bool = False) -> None:
+    def __init__(self, parent: QWidget | None = None, *, repro_mode: bool = False, repro_seed: int = 0) -> None:
         super().__init__(parent)
         self.setWindowTitle("Nastavenia")
         lay = QFormLayout(self)
@@ -113,41 +110,6 @@ class SettingsDialog(QDialog):
         self.ai_tokens_edit.textChanged.connect(self._update_costs)
         self.judge_tokens_edit.textChanged.connect(self._update_costs)
         self._update_costs()
-
-        # --- Offline judge (ENABLE) ---
-        self.offline_check = QCheckBox("Offline judge (ENABLE)")
-        # nacitaj zo .env; default OFF ak nie je nastavene
-        self.offline_check.setChecked(bool(os.getenv("OFFLINE_JUDGE_ENABLED", "0").lower() in ("1", "true", "yes")))
-        lay.addRow(self.offline_check)
-        info = QLabel('<a href="https://wordlist.aspell.net/12dicts-readme/#ENABLE">Info</a>')
-        try:
-            info.setOpenExternalLinks(True)
-        except Exception:
-            pass
-        lay.addRow("", info)
-
-        # Sekcia Dictionary Info
-        self.dict_entries = QLabel("Entries: Not downloaded")
-        self.dict_size = QLabel("File size: -")
-        self.dict_mtime = QLabel("Updated: -")
-        self.dict_path = QLabel(get_default_enable_cache_path())
-        self.dict_path.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        lay.addRow("Dictionary Info", QLabel(""))
-        lay.addRow(self.dict_entries)
-        lay.addRow(self.dict_size)
-        lay.addRow(self.dict_mtime)
-        lay.addRow("Path:", self.dict_path)
-
-        self.btn_redownload = QPushButton("Re-download")
-        self.btn_openfolder = QPushButton("Open folder…")
-        btn_row = QHBoxLayout()
-        btn_row.addWidget(self.btn_redownload)
-        btn_row.addWidget(self.btn_openfolder)
-        btn_w = QWidget(self)
-        btn_w.setLayout(btn_row)
-        lay.addRow(btn_w)
-
-        # signály nastavím zvonku (MainWindow), kde máme prístup k judge/paths
 
         self.test_btn = QPushButton("Testovať pripojenie")
         self.test_btn.clicked.connect(self.test_connection)
@@ -220,8 +182,6 @@ class SettingsDialog(QDialog):
             _set_key2(ENV_PATH, "JUDGE_MAX_OUTPUT_TOKENS", judge_tokens)
         except Exception:
             pass
-        # Pozn.: OFFLINE_JUDGE_ENABLED neperzistujeme tu, lebo prvé zapnutie
-        # môže vyžadovať sťahovanie. Ošetruje sa v MainWindow.open_settings().
         super().accept()
 
 
@@ -757,21 +717,6 @@ class MainWindow(QMainWindow):
         # OpenAI klient (lazy init po prvom pouziti ak treba)
         self.ai_client: Optional[OpenAIClient] = None
 
-        # Offline rozhodca nastavenie a cache
-        self.offline_enabled: bool = bool(os.getenv("OFFLINE_JUDGE_ENABLED", "0").lower() in ("1", "true", "yes"))
-        self.offline_judge: Optional[OfflineJudge] = None
-        if self.offline_enabled:
-            try:
-                cache_path = get_default_enable_cache_path()
-                if os.path.exists(cache_path):
-                    self.offline_judge = OfflineJudge.from_path(cache_path)
-                else:
-                    # ak súbor chýba, ponechaj offline zapnutý; wordlist si vyžiada sťahovanie
-                    pass
-            except Exception:
-                # nechaj offline flag; inštanciu vynuluj
-                self.offline_judge = None
-
         # UI
         self.toolbar = QToolBar()
         self.addToolBar(self.toolbar)
@@ -878,9 +823,36 @@ class MainWindow(QMainWindow):
         self._ai_last_anchor: str = ""
         self._pending_words_coords: list[tuple[str, list[tuple[int, int]]]] = []
 
-        # Aplikuj efektívny režim rozhodcu podľa .env a UI togglu ihneď po štarte
-        self._apply_judge_mode(initial=True)
         self._reset_to_idle_state()
+
+    @staticmethod
+    def _analyze_judge_response(resp: dict[str, object]) -> tuple[bool, list[dict[str, Any]]]:
+        """Derive overall validity and normalized entry list from judge response."""
+        entries: list[dict[str, Any]] = []
+        for key in ("results", "words"):
+            value = resp.get(key)
+            if isinstance(value, list):
+                for item in value:
+                    if isinstance(item, dict):
+                        entries.append(item)
+        if not entries:
+            if isinstance(resp.get("word"), str):
+                entries.append(
+                    {
+                        "word": resp.get("word"),
+                        "valid": bool(resp.get("valid", False)),
+                        "reason": resp.get("reason"),
+                    }
+                )
+        all_valid_flag = resp.get("all_valid")
+        computed = all(bool(entry.get("valid", False)) for entry in entries) if entries else None
+        if all_valid_flag is not None:
+            all_valid = bool(all_valid_flag) if computed is None else bool(all_valid_flag) and bool(computed)
+        elif computed is not None:
+            all_valid = bool(computed)
+        else:
+            all_valid = bool(resp.get("valid", False))
+        return all_valid, entries
 
     def new_game(self) -> None:
         # Základný placeholder pre žreb štartéra (MVP skeleton)
@@ -1183,78 +1155,6 @@ class MainWindow(QMainWindow):
         words_found = extract_all_words(self.board, self.pending)
         words_coords = [(wf.word, wf.letters) for wf in words_found]
         words = [wf.word for wf in words_found]
-        # Offline/online rozvetvenie s routerom
-        use_offline = should_use_offline_judge(self.offline_enabled, self.offline_judge is not None)
-        if use_offline and self.offline_judge is not None:
-            hits = sum(1 for w in words if self.offline_judge.contains(w))
-            misses = len(words) - hits
-            try:
-                log.info("judge=offline side=human words=%s hits=%s misses=%s", len(words), hits, misses)
-            except Exception:
-                pass
-            bad_word: Optional[str] = None
-            for w in words:
-                if not self.offline_judge.contains(w):
-                    bad_word = w
-                    break
-            if bad_word is not None:
-                # neplatné: undo a správa (rack ostáva nezmenený)
-                self.board.clear_letters(self.pending)
-                self.pending = []
-                self.rack.set_letters(self.human_rack)
-                self.board_view.set_pending(self.pending)
-                self.status.showMessage("Hrá hráč…")
-                QMessageBox.information(self, "Neplatný ťah", f"Neplatné slovo: {bad_word}")
-                return
-            # všetko validné: pokračuj rovno na scoring a aplikáciu
-            words_coords = words_coords
-            total, _bd = score_words(self.board, self.pending, words_coords)
-            self._last_move_breakdown = [(bd.word, bd.base_points, bd.letter_bonus_points, bd.word_multiplier, bd.total) for bd in _bd]
-            self._last_move_bingo = (len(self.pending) == 7)
-            self.board_view.set_last_move_cells([(p.row, p.col) for p in self.pending])
-            if len(self.pending) == 7:
-                total += 50
-            apply_premium_consumption(self.board, self.pending)
-            self.last_move_points = total
-            self.human_score += total
-            # spotrebuj rack presne o pouzite pismena a dopln z tasky
-            before = "".join(self.human_rack)
-            used = ",".join(p.letter for p in self.pending)
-            new_rack = consume_rack(self.human_rack, self.pending)
-            draw_cnt = max(0, 7 - len(new_rack))
-            drawn = self.bag.draw(draw_cnt) if draw_cnt > 0 else []
-            new_rack.extend(drawn)
-            self.human_rack = new_rack
-            try:
-                log.info(
-                    'rack_update side=human used="%s" before="%s" after="%s" drawn=%s bag_remaining=%s',
-                    used,
-                    before,
-                    "".join(self.human_rack),
-                    len(drawn),
-                    self.bag.remaining(),
-                )
-            except Exception:
-                pass
-            self.pending = []
-            self.board_view.set_pending(self.pending)
-            self.rack.set_letters(self.human_rack)
-            self._update_scores_label()
-            self._start_ai_turn()
-            return
-
-        if self.offline_enabled and not use_offline:
-            # Nevykonavaj tichy fallback na online — zastav a informuj
-            try:
-                log.info("judge_route side=human offline_enabled=true wordlist_loaded=false -> blocked")
-            except Exception:
-                pass
-            # vrat dosku do povodneho stavu
-            self.board.clear_letters(self.pending)
-            self.board_view.set_pending(self.pending)
-            self.status.showMessage("Hrá hráč…")
-            QMessageBox.critical(self, "Offline judge", "Offline režim je zapnutý, ale slovník nie je načítaný. Otvor Nastavenia a stiahni wordlist.")
-            return
         log.info("Rozhodca overuje slová: %s", words)
         # spusti spinner (online judge)
         self._spinner_phase = 0
@@ -1299,23 +1199,25 @@ class MainWindow(QMainWindow):
         self._spinner_timer.stop()
         self._show_judge_status = False
         log.info("Rozhodca výsledok: %s", resp)
-        all_valid = bool(resp.get("all_valid", False))
+        all_valid, entries = self._analyze_judge_response(resp)
         if not all_valid:
-            # najdi prve nevalidne
-            results = resp.get("results", [])
-            bad = None
-            if isinstance(results, list):
-                for it in results:
-                    if isinstance(it, dict) and not bool(it.get("valid", False)):
-                        bad = it.get("word", "")
-                        break
+            bad = ""
+            bad_reason = ""
+            for it in entries:
+                if not bool(it.get("valid", False)):
+                    bad = str(it.get("word", ""))
+                    bad_reason = str(it.get("reason", ""))
+                    break
             # zmaz docasne (rack ostáva nezmenený)
             self.board.clear_letters(self.pending)
             self.pending = []
             self.rack.set_letters(self.human_rack)
             self.board_view.set_pending(self.pending)
             self.status.showMessage("Hrá hráč…")
-            QMessageBox.information(self, "Neplatný ťah", f"Neplatné slovo: {bad}")
+            msg = f"Neplatné slovo: {bad}" if bad else "Neplatný ťah"
+            if bad_reason:
+                msg = f"{msg}\nDôvod: {bad_reason}"
+            QMessageBox.information(self, "Neplatný ťah", msg)
             return
 
         # validne: spocitaj skore + bingo, aplikuj prémie a dopln rack
@@ -1601,6 +1503,7 @@ class MainWindow(QMainWindow):
             return
 
         # aplikuj navrhnute placements (len docasne) a ziskaj slova
+        board_was_empty = not self._has_any_letters()
         placements_obj = proposal.get("placements", [])
         placements_list: list[dict[str, Any]] = cast(list[dict[str, Any]], placements_obj) if isinstance(placements_obj, list) else []
         ps: list[Placement] = [
@@ -1680,11 +1583,12 @@ class MainWindow(QMainWindow):
         self._ai_last_main_word = main_word
         self._ai_last_anchor = anchor
 
-        declared = str(proposal.get("word", ""))
+        declared = str(proposal.get("word", "")).strip()
         if (
             declared
             and main_word
-            and declared != main_word
+            and declared.upper() != main_word.upper()
+            and not board_was_empty
             and not self._ai_retry_used
             and not bool(proposal.get("pass", False))
         ):
@@ -1717,134 +1621,7 @@ class MainWindow(QMainWindow):
             self._on_ai_proposal(new_prop)
             return
 
-        # Offline/online judge vetva pre AI s routerom
-        use_offline_ai = should_use_offline_judge(self.offline_enabled, self.offline_judge is not None)
-        if use_offline_ai and self.offline_judge is not None:
-            # Pred offline validáciou vyčisti dočasné písmená z dosky
-            self.board.clear_letters(ps2)
-            # Priprav payload pre OfflineJudge.validate_move
-            # - smer zistíme z ps (jedna línia)
-            rows = {p.row for p in ps}
-            dir_txt = "ACROSS" if len(rows) == 1 else "DOWN"
-            # - blanks môžu byť v návrhu ako list dictov {row,col,as}; premapuj na dict "r,c": "X"
-            blanks_obj = proposal.get("blanks", None)
-            blanks_mapped: dict[str, str] | None = None
-            if isinstance(blanks_obj, list):
-                blanks_mapped = {}
-                for b in cast(list[dict[str, Any]], blanks_obj):
-                    rr = int(b.get("row", 0))
-                    cc = int(b.get("col", 0))
-                    ch = str(b.get("as", "")).strip()
-                    blanks_mapped[f"{rr},{cc}"] = ch
-            elif isinstance(blanks_obj, dict):
-                blanks_mapped = cast(dict[str, str], blanks_obj)
-            move_payload: dict[str, Any] = {
-                "row": min(p.row for p in ps),
-                "col": min(p.col for p in ps),
-                "direction": dir_txt,
-                "placements": [{"row": p.row, "col": p.col, "letter": p.letter} for p in ps],
-            }
-            if blanks_mapped is not None:
-                move_payload["blanks"] = blanks_mapped
-
-            res = self.offline_judge.validate_move(self.board, self.ai_rack, move_payload)
-            if not res.valid:
-                try:
-                    log.info("judge=offline side=ai result=invalid reason=%s", res.reason)
-                except Exception:
-                    pass
-                # jeden guided retry ak ešte neprebehol
-                if not self._ai_retry_used:
-                    self._ai_retry_used = True
-                    st = build_ai_state_dict(self.board, self.ai_rack, self.human_score, self.ai_score, turn="AI")
-                    compact = (
-                        "grid:\n" + "\n".join(st["grid"]) +
-                        f"\nblanks:{st['blanks']}\n"
-                        f"ai_rack:{st['ai_rack']}\n"
-                        f"scores: H={st['human_score']} AI={st['ai_score']}\nturn:{st['turn']}\n"
-                    )
-                    hint = f"Offline validation failed: {res.reason or 'unknown'}. Propose a different valid move."
-                    try:
-                        new_prop = ai_propose_move(self.ai_client if self.ai_client else OpenAIClient(), compact_state=compact, retry_hint=hint)
-                    except Exception as e:  # noqa: BLE001
-                        self._on_ai_fail(e)
-                        return
-                    self._on_ai_proposal(new_prop)
-                    return
-                # inak: pass
-                self._ai_thinking = False
-                self._enable_human_inputs()
-                self.status.showMessage("AI navrhla neplatný ťah (offline) — pass")
-                self._consecutive_passes += 1
-                if self._ai_opening_active:
-                    try:
-                        log.info("ai_opening done result=%s", "invalid_retry_pass")
-                    except Exception:
-                        pass
-                    self._ai_opening_active = False
-                self._check_endgame()
-                return
-
-            # Valid: aplikuj normalizované placements z validate_move
-            ps_valid = res.placements or []
-            self.board.place_letters(ps_valid)
-            words_found2 = extract_all_words(self.board, ps_valid)
-            words_coords2 = [(wf.word, wf.letters) for wf in words_found2]
-            total, _bd = score_words(self.board, ps_valid, words_coords2)
-            self._last_move_breakdown = [(bd.word, bd.base_points, bd.letter_bonus_points, bd.word_multiplier, bd.total) for bd in _bd]
-            self._last_move_bingo = (len(ps_valid) == 7)
-            self.board_view.set_last_move_cells([(p.row, p.col) for p in ps_valid])
-            if len(ps_valid) == 7:
-                total += 50
-            apply_premium_consumption(self.board, ps_valid)
-            self.ai_score += total
-            # spotrebuj rack AI a doplň z tašky
-            before = "".join(self.ai_rack)
-            used = ",".join(p.letter for p in ps_valid)
-            new_rack = consume_rack(self.ai_rack, ps_valid)
-            draw_cnt = max(0, 7 - len(new_rack))
-            drawn = self.bag.draw(draw_cnt) if draw_cnt > 0 else []
-            new_rack.extend(drawn)
-            self.ai_rack = new_rack
-            try:
-                log.info(
-                    'rack_update side=ai used="%s" before="%s" after="%s" drawn=%s bag_remaining=%s',
-                    used,
-                    before,
-                    "".join(self.ai_rack),
-                    len(drawn),
-                    self.bag.remaining(),
-                )
-            except Exception:
-                pass
-            self._update_scores_label()
-            self._ai_thinking = False
-            self._enable_human_inputs()
-            self.status.showMessage("Hrá hráč…")
-            self._consecutive_passes = 0
-            if self._ai_opening_active:
-                try:
-                    log.info("ai_opening done result=%s", "applied")
-                except Exception:
-                    pass
-                self._ai_opening_active = False
-            self._check_endgame()
-            return
-
-        if self.offline_enabled and not use_offline_ai:
-            # Ziadny tichy fallback na online; zastav AI tah a informuj
-            try:
-                log.info("judge_route side=ai offline_enabled=true wordlist_loaded=false -> blocked")
-            except Exception:
-                pass
-            self.board.clear_letters(ps2)
-            self._ai_thinking = False
-            self._enable_human_inputs()
-            self.status.showMessage("Hrá hráč…")
-            QMessageBox.critical(self, "Offline judge", "Offline režim je zapnutý, ale slovník nie je načítaný. Otvor Nastavenia a stiahni wordlist.")
-            return
-
-        # Online rozhodovanie
+        # Rozhodovanie (online)
         class JudgeWorker(QObject):
             finished: Signal = Signal(dict)
             failed: Signal = Signal(Exception)
@@ -1895,15 +1672,26 @@ class MainWindow(QMainWindow):
     def _on_ai_judge_ok(self, resp: dict[str, object]) -> None:
         self._spinner_timer.stop()
         self._show_judge_status = False
-        all_valid = bool(resp.get("all_valid", False))
+        all_valid, entries = self._analyze_judge_response(resp)
         if not all_valid:
             # guided retry ak ešte neprebehol
             if not self._ai_retry_used:
                 ps2 = getattr(self, "_ai_ps2")
                 self.board.clear_letters(ps2)
                 self._ai_retry_used = True
+                invalid_word = ""
+                invalid_reason = ""
+                for it in entries:
+                    if not bool(it.get("valid", False)):
+                        invalid_word = str(it.get("word", ""))
+                        invalid_reason = str(it.get("reason", ""))
+                        break
                 try:
-                    log.info("ai_retry reason=invalid_glued_word main=%s anchor=%s", self._ai_last_main_word, self._ai_last_anchor)
+                    log.info(
+                        "ai_retry reason=judge_invalid word=%s reason=%s",
+                        invalid_word or self._ai_last_main_word,
+                        invalid_reason,
+                    )
                 except Exception:
                     pass
                 st = build_ai_state_dict(self.board, self.ai_rack, self.human_score, self.ai_score, turn="AI")
@@ -1913,8 +1701,14 @@ class MainWindow(QMainWindow):
                     f"ai_rack:{st['ai_rack']}\n"
                     f"scores: H={st['human_score']} AI={st['ai_score']}\nturn:{st['turn']}\n"
                 )
+                summary_word = invalid_word or self._ai_last_main_word or ""
+                summary_reason = invalid_reason or self._ai_last_anchor or ""
+                if summary_reason:
+                    hint_reason = f" (reason: {summary_reason})"
+                else:
+                    hint_reason = ""
                 hint = (
-                    f"Your previous move created an invalid glued word '{self._ai_last_main_word}' by attaching to existing '{self._ai_last_anchor}'. "
+                    f"Judge rejected your previous move '{summary_word}'.{hint_reason} "
                     "Propose a different move that forms a single valid English word; prefer proper hooks or overlaps. Return JSON only."
                 )
                 try:
@@ -2016,184 +1810,23 @@ class MainWindow(QMainWindow):
             return
 
     def open_settings(self) -> None:
-        dlg = SettingsDialog(self, repro_mode=self.repro_mode, repro_seed=self.repro_seed, offline_enabled=self.offline_enabled)
-        # inicializuj Dictionary Info sekciu
-        cache_path = get_default_enable_cache_path()
-        try:
-            if os.path.exists(cache_path):
-                # zozbieraj meta
-                try:
-                    st = os.stat(cache_path)
-                    size_mb = st.st_size / (1024*1024)
-                    import datetime
-                    from datetime import timezone as _tz
-                    mtime = datetime.datetime.fromtimestamp(st.st_mtime, tz=_tz.utc).strftime("%Y-%m-%d %H:%M")
-                except Exception:
-                    size_mb = 0.0
-                    mtime = "-"
-                # počet entries ak máme načítaný judge
-                entries = "-"
-                try:
-                    if self.offline_judge is None:
-                        # načítaj, ale neprepínaj režim
-                        judge_tmp = OfflineJudge.from_path(cache_path)
-                        entries = str(judge_tmp.count())
-                    else:
-                        entries = str(self.offline_judge.count())
-                except Exception:
-                    entries = "-"
-                dlg.dict_entries.setText(f"Entries: {entries}")
-                dlg.dict_size.setText(f"File size: {size_mb:.2f} MB")
-                dlg.dict_mtime.setText(f"Updated: {mtime}")
-                dlg.dict_path.setText(cache_path)
-            else:
-                dlg.dict_entries.setText("Entries: Not downloaded")
-                dlg.dict_size.setText("File size: -")
-                dlg.dict_mtime.setText("Updated: -")
-                dlg.dict_path.setText(cache_path)
-        except Exception:
-            pass
-
-        # handlery tlačidiel
-        def _open_folder() -> None:
-            folder = os.path.dirname(cache_path)
-            try:
-                import subprocess, platform
-                if platform.system() == "Darwin":
-                    subprocess.Popen(["open", folder])
-                elif platform.system() == "Windows":
-                    subprocess.Popen(["explorer", folder])
-                else:
-                    subprocess.Popen(["xdg-open", folder])
-            except Exception:
-                QMessageBox.information(self, "Open folder", folder)
-
-        def _redo_download() -> None:
-            # spusti modálny download a po úspechu reloadni judge a UI
-            url_env = os.getenv("OFFLINE_JUDGE_URL", "")
-            url_to_use = [u.strip() for u in url_env.split(",") if u.strip()] if url_env else []
-            dlg_dl = DownloadProgressDialog(url_to_use, cache_path, self)
-            dlg_dl.start()
-            dlg_dl.exec()
-            if not dlg_dl.ok:
-                QMessageBox.critical(self, "Sťahovanie zlyhalo", dlg_dl.error or "Neznáma chyba")
-                return
-            # reload judge a meta
-            try:
-                self.offline_judge = OfflineJudge.from_path(cache_path)
-                self.offline_enabled = True
-                log.info("offline_download redo bytes=%s", os.stat(cache_path).st_size)
-                # refresh info
-                st = os.stat(cache_path)
-                size_mb = st.st_size / (1024*1024)
-                import datetime
-                from datetime import timezone as _tz2
-                mtime = datetime.datetime.fromtimestamp(st.st_mtime, tz=_tz2.utc).strftime("%Y-%m-%d %H:%M")
-                dlg.dict_entries.setText(f"Entries: {self.offline_judge.count()}")
-                dlg.dict_size.setText(f"File size: {size_mb:.2f} MB")
-                dlg.dict_mtime.setText(f"Updated: {mtime}")
-                dlg.dict_path.setText(cache_path)
-                dlg.offline_check.setChecked(True)
-                os.environ["OFFLINE_JUDGE_ENABLED"] = "1"
-                try:
-                    from dotenv import set_key as _set_key7
-                    _set_key7(ENV_PATH, "OFFLINE_JUDGE_ENABLED", "1")
-                except Exception:
-                    pass
-            except Exception as e:  # noqa: BLE001
-                QMessageBox.critical(self, "Chyba", f"Načítanie wordlistu zlyhalo: {e}")
-
-        dlg.btn_openfolder.clicked.connect(_open_folder)
-        dlg.btn_redownload.clicked.connect(_redo_download)
+        dlg = SettingsDialog(self, repro_mode=self.repro_mode, repro_seed=self.repro_seed)
         ok = dlg.exec()
         if ok:
-            # po uložení aktualizuj existujúceho klienta, ak je vytvorený
             try:
                 if self.ai_client is not None:
                     self.ai_client.ai_move_max_output_tokens = int(os.getenv("AI_MOVE_MAX_OUTPUT_TOKENS", "3600"))
                     self.ai_client.judge_max_output_tokens = int(os.getenv("JUDGE_MAX_OUTPUT_TOKENS", "800"))
-                # Ulož Repro nastavenia do runtime
-                self.repro_mode = bool(dlg.repro_check.isChecked())
-                try:
-                    self.repro_seed = int(dlg.seed_edit.text().strip() or "0")
-                except ValueError:
-                    self.repro_seed = 0
-                # Offline judge spracovanie: perzistuj presne podľa checkboxu
-                wanted_offline = bool(dlg.offline_check.isChecked())
-                if wanted_offline:
-                    cache_path = get_default_enable_cache_path()
-                    if not os.path.exists(cache_path):
-                        # spusti modálny download s progresom
-                        # povoliť override cez prostredie, ak by default URL menilo polohu
-                        url_env = os.getenv("OFFLINE_JUDGE_URL", "")
-                        # podpora viacerých URL oddelených čiarkou
-                        url_to_use = [u.strip() for u in url_env.split(",") if u.strip()] if url_env else []
-                        dlg_dl = DownloadProgressDialog(url_to_use, cache_path, self)
-                        dlg_dl.start()
-                        dlg_dl.exec()
-                        if not dlg_dl.ok:
-                            from PySide6.QtWidgets import QMessageBox as _QMB
-                            _QMB.critical(self, "Sťahovanie zlyhalo", dlg_dl.error or "Neznáma chyba")
-                            # ponechaj OFF
-                            os.environ["OFFLINE_JUDGE_ENABLED"] = "0"
-                            try:
-                                from dotenv import set_key as _set_key3
-                                _set_key3(ENV_PATH, "OFFLINE_JUDGE_ENABLED", "0")
-                            except Exception:
-                                pass
-                        else:
-                            try:
-                                self.offline_judge = OfflineJudge.from_path(cache_path)
-                                self.offline_enabled = True
-                                os.environ["OFFLINE_JUDGE_ENABLED"] = "1"
-                                try:
-                                    from dotenv import set_key as _set_key4
-                                    _set_key4(ENV_PATH, "OFFLINE_JUDGE_ENABLED", "1")
-                                except Exception:
-                                    pass
-                                self.status.showMessage("Offline judge zapnutý.", 2000)
-                                # Reaplikuj efektívny režim po potvrdení
-                                self._apply_judge_mode(initial=False)
-                            except Exception as e:  # noqa: BLE001
-                                from PySide6.QtWidgets import QMessageBox as _QMB2
-                                _QMB2.critical(self, "Chyba", f"Načítanie wordlistu zlyhalo: {e}")
-                                self.offline_enabled = False
-                                self.offline_judge = None
-                    else:
-                        # načítaj existujúci wordlist
-                        try:
-                            self.offline_judge = OfflineJudge.from_path(cache_path)
-                            self.offline_enabled = True
-                            os.environ["OFFLINE_JUDGE_ENABLED"] = "1"
-                            try:
-                                from dotenv import set_key as _set_key5
-                                _set_key5(ENV_PATH, "OFFLINE_JUDGE_ENABLED", "1")
-                            except Exception:
-                                pass
-                            self.status.showMessage("Offline judge zapnutý.", 2000)
-                            # Reaplikuj efektívny režim po potvrdení
-                            self._apply_judge_mode(initial=False)
-                        except Exception as e:  # noqa: BLE001
-                            from PySide6.QtWidgets import QMessageBox as _QMB3
-                            _QMB3.critical(self, "Chyba", f"Načítanie wordlistu zlyhalo: {e}")
-                            self.offline_enabled = False
-                            self.offline_judge = None
-                else:
-                    # vypni offline mód vždy, ak checkbox je OFF
-                    self.offline_enabled = False
-                    self.offline_judge = None
-                    os.environ["OFFLINE_JUDGE_ENABLED"] = "0"
-                    try:
-                        from dotenv import set_key as _set_key6
-                        _set_key6(ENV_PATH, "OFFLINE_JUDGE_ENABLED", "0")
-                    except Exception:
-                        pass
-                    self.status.showMessage("Offline judge vypnutý.", 2000)
-                    # Reaplikuj efektívny režim po potvrdení
-                    self._apply_judge_mode(initial=False)
             except Exception:
-                # ak by nastal problém pri konverzii
-                self.status.showMessage("Nastavenia uložené (konverzia limitov zlyhala).", 2000)
+                pass
+
+            self.repro_mode = bool(dlg.repro_check.isChecked())
+            try:
+                self.repro_seed = int(dlg.seed_edit.text().strip() or "0")
+            except ValueError:
+                self.repro_seed = 0
+
+            self.status.showMessage("Nastavenia uložené.", 2000)
 
     def _set_game_ui_visible(self, visible: bool) -> None:
         """Prepína panel so skóre a rackom podľa toho, či je aktívna hra."""
@@ -2211,32 +1844,6 @@ class MainWindow(QMainWindow):
             self.rack.hide()
             self.split.setSizes([1, 0])
             self._game_ui_visible = False
-
-    def _apply_judge_mode(self, initial: bool = False) -> None:
-        """Prepne režim rozhodcu podľa efektívnej konfigurácie (.env + UI toggle).
-
-        Poznámka (SK): UI toggle reprezentuje `self.offline_enabled`. Táto metóda
-        vyhodnotí prioritu .env a nastaví `self.offline_enabled` na výsledok.
-        Ak je offline ON a wordlist existuje, lazy načíta `OfflineJudge`.
-        Pri `initial=True` nemení status bar hlášky (UX zachované cez open_settings()).
-        """
-        try:
-            want_offline = effective_offline_judge(bool(self.offline_enabled))
-        except Exception:
-            want_offline = bool(self.offline_enabled)
-
-        if want_offline:
-            self.offline_enabled = True
-            if self.offline_judge is None:
-                try:
-                    cache_path = get_default_enable_cache_path()
-                    if os.path.exists(cache_path):
-                        self.offline_judge = OfflineJudge.from_path(cache_path)
-                except Exception:
-                    self.offline_judge = None
-        else:
-            self.offline_enabled = False
-            self.offline_judge = None
 
     def _on_new_or_surrender(self) -> None:
         if self.act_new.text().startswith("🏳️"):

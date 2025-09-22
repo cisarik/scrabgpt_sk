@@ -2,7 +2,7 @@
 
 Tento modul definuje tolerantný Pydantic model pre AI odpoveď, ktorý
 unifikuje rôzne vstupné varianty (start vs. row/col, rôzne formy blanks)
-na kanonický tvar vhodný pre offline validáciu v `core.offline_judge`.
+na kanonický tvar vhodný pre následnú validáciu.
 
 Poznámka (SK): Používame Pydantic v2, preto `field_validator` namiesto
 historického `validator`.
@@ -96,8 +96,8 @@ def parse_ai_move(text: str) -> MoveModel:
     return MoveModel.model_validate(obj)
 
 
-def to_offline_payload(m: MoveModel) -> dict[str, Any]:
-    """Prekonvertuje `MoveModel` do dictu pre `offline_judge.validate_move`.
+def to_move_payload(m: MoveModel) -> dict[str, Any]:
+    """Prekonvertuje `MoveModel` do kanonického `dict` pre ďalšie spracovanie.
 
     Pozn.: `pass_` mapujeme späť na kľúč `'pass'` kvôli kompatibilite.
     """

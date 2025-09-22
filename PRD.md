@@ -10,7 +10,7 @@
 - **Hlavný výsledok (MVP):**  
   - Spustiteľná desktop app (Windows/macOS/Linux) s hernou doskou 15×15, so skórovaním a prémiovými políčkami (DL, TL, DW, TW).  
   - Hra **1v1**: hráč (človek) vs. **AI hráč (GPT‑5‑mini)**.  
-  - **Rozhodca (GPT‑5‑mini)** overuje **platnosť anglických slov**; dostupný je voliteľný **Offline judge (ENABLE)** (default OFF).  
+  - **Rozhodca (GPT‑5‑mini)** overuje **platnosť anglických slov**.  
   - **TDD** testuje doménové pravidlá výpočtu skóre (vrátane prémií a krížových slov).  
   - **Deterministická náhoda** (seed) pre ťahanie kameňov, aby boli testy opakovateľné.
   - **Ukladanie/obnova hry (Save/Load)** do JSON s `schema_version`.
@@ -44,17 +44,10 @@
    - **prvý ťah** prechádza **H8** (DW),
    - **skóre** sa spočíta lokálne (aj všetky nové krížové slová),
    - **Online mód:** Rozhodca validuje **iba hlavné slovo**; krížové slová **neposielame** na validáciu (zníženie latencie/ceny).  
-   - **Offline mód (ENABLE):** všetky nové slová (**hlavné + krížové**) sa overujú **offline** (bez OpenAI).  
 5. **AI ťah (GPT‑5‑mini):** Aplikácia pošle **stav** (doska + vlastný rack AI + história) a dostane **štruktúrovaný JSON** s návrhom ťahu.  
 6. **Rozhodca (GPT‑5‑mini):** Endpoint na **validáciu hlavného slova** → true/false + stručný dôvod.  
 7. **Skóre & história:** pravý panel so skóre hráča/AI, posledný ťah, tlačidlo **„Undo (1× späť)“** len pre ľudský ťah pred potvrdením.  
 8. **Nastavenia:** seed (voliteľne), prepínač „**Low‑latency judge**“ (skip validačného hovoru pri slove ≥2 a ≤15 s ASCII písmenami → **len lokálne pravidlá**; experimentálny režim pre demo).
-
-9. **Offline judge (ENABLE):**
-   - Prepínač v **Nastaveniach**.
-   - Pri prvom zapnutí sa zobrazí **modal** s **QProgressBar** a percentami; po dosiahnutí **100 %** sa modal **automaticky zavrie**.
-   - Wordlist sa uloží do cache (napr. `~/.scrabgpt/wordlists/enable1.txt`) a režim sa aktivuje.
-   - V offline móde sa **ľudské aj AI** slová validujú **offline** a status‑bar **nezobrazuje** „Rozhoduje rozhodca…“. Pri vypnutom offline móde sa používa **online** rozhodca ako doteraz.
 
 ---
 
@@ -141,7 +134,6 @@ scrabgpt/
 - JSON/„function‑calling“ režim (strict), timeout/reties, jednoduchý rate‑limit.  
 - **Žiadne** volania z testov – v testoch sa **mockuje**.
 
-- **Pozn.:** Pri zapnutom **offline móde** sa volania na **validáciu slov** do OpenAI **nepoužívajú** (Rozhodca sa nevolá).
 
 ---
 
@@ -193,17 +185,12 @@ GameState = {"board": [[" ",...]], "rack_human": str, "rack_ai": str, "scores": 
 - **Reprodukovateľnosť:** seedované ťahanie + „Repro“ mód.  
 - **UX robustnosť:** Undo pred potvrdením; zreteľný highlight nových písmen a skóre.  
 
-- **Pokrytie offline slovníkom:** nie je to oficiálny Scrabble zoznam → možnosť prepnúť späť na **online** rozhodcu.  
-- **Disk/pamäť pre wordlist:** nároky sú mierne; sťahovanie prebehne **iba raz** a s progres barom.
-
 ---
 
 ## 11) Akceptačné kritériá MVP (DoD)
 - `pytest -q` prejde: `test_scoring.py`, `test_premiums.py`, `test_rules.py`, `test_tiles.py`.  
 - Manuálne demo podľa **1.1**: odohrám min. 3 ťahy človek/AI; skóre na UI sedí s logom v konzole.  
 - OpenAI volania sú izolované v `ai/` a konfigurované cez `.env`; testy **bez siete**.  
-
-- **Offline mód:** Zapnutie **Offline judge (ENABLE)** zobrazí **QProgressBar** s percentami a po stiahnutí sa validuje **bez OpenAI**; manuálne demo prejde s **offline validáciou**.
 
 ---
 

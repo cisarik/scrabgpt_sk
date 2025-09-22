@@ -17,24 +17,6 @@ poetry run python -m scrabgpt.ui.app
 
 > All OpenAI requests/responses are pretty-printed to the terminal (key masked).
 
-## Offline judge (ENABLE)
-
-You can validate words offline using the ENABLE word list (public domain).
-
-- Enable in Settings: check "Offline judge (ENABLE)".
-- On first enable, the app downloads the word list with a modal progress bar and saves it to `~/.scrabgpt/wordlists/enable1.txt`.
-- Subsequent runs load it from disk; no further downloads.
-- When offline mode is ON, both human and AI word validations use the local list, and the app does not call OpenAI for judging.
-  Offline mode applies to both human and AI moves; AI still proposes moves, only validation is done locally.
-
-### Dictionary Info & Re-download
-
-In Settings, a Dictionary Info panel shows:
-- Entries count, file size, last update timestamp, and the local path.
-- Buttons: Re-download (fresh download with progress, then auto-reload) and Open folder…
-
-You can override mirrors with `OFFLINE_JUDGE_URL` (comma-separated). The app validates downloads to avoid saving HTML error pages.
-
 ## AI player prompt rules
 
 - The AI must not “glue” its letters to adjacent existing strings unless the entire resulting contiguous main string is a valid English word. Prefer proper hooks/intersections.

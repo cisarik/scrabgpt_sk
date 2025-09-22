@@ -55,7 +55,7 @@ class OpenAIClient:
         json_schema: dict[str, Any],
         *,
         max_output_tokens: int | None = None,
-    ) -> dict[str, Any]:
+    ) -> Any:
         """Volanie API s JSON schema výstupom a bezpečným fallbackom.
 
         Preferuje Responses API s `response_format=json_schema`. Ak lokálna
@@ -144,7 +144,7 @@ class OpenAIClient:
                 content = (chat.choices[0].message.content or "")
             log.info("RESPONSE ← %s", content)
             try:
-                return cast(dict[str, Any], json.loads(content))
+                return json.loads(content)
             except json.JSONDecodeError as e:  # pravdepodobne orezanie JSON-u
                 # ak výstup nevyzerá ako komplet JSON, považuj to za vyčerpanie limitu
                 if not content.strip().endswith("}"):
@@ -231,14 +231,88 @@ class OpenAIClient:
             "Validate these words for Scrabble play: "
             f"{words}. Return JSON exactly matching the schema."
         )
-        return cast(
-            JudgeBatchResponse,
-            self._call_json(
-                sys_prompt + "\n" + user_prompt,
-                schema,
-                max_output_tokens=self.judge_max_output_tokens,
-            ),
+        raw = self._call_json(
+            sys_prompt + "\n" + user_prompt,
+            schema,
+            max_output_tokens=self.judge_max_output_tokens,
         )
+
+        if isinstance(raw, dict):
+            normalized: list[JudgeResult] = []
+
+            results = raw.get("results")
+            if isinstance(results, list):
+                for item in results:
+                    if isinstance(item, dict):
+                        normalized.append(
+                            {
+                                "word": str(item.get("word", "")),
+                                "valid": bool(item.get("valid", False)),
+                                "reason": str(item.get("reason", "")),
+                            }
+                        )
+
+            # Niektoré odpovede vracajú priamo jedno slovo (word/valid/...)
+            if not normalized:
+                single_word = raw.get("word")
+                if isinstance(single_word, str):
+                    reason = raw.get("reason")
+                    if not isinstance(reason, str):
+                        reason = str(raw.get("explanation", ""))
+                    normalized.append(
+                        {
+                            "word": single_word,
+                            "valid": bool(raw.get("valid", False)),
+                            "reason": reason,
+                        }
+                    )
+
+            # openai-python 1.x môže použiť kľúč "words": [...]
+            if not normalized:
+                alt_words = raw.get("words")
+                if isinstance(alt_words, list):
+                    for item in alt_words:
+                        if isinstance(item, dict):
+                            normalized.append(
+                                {
+                                    "word": str(item.get("word", "")),
+                                    "valid": bool(item.get("valid", False)),
+                                    "reason": str(item.get("reason", "")),
+                                }
+                            )
+
+            if normalized:
+                all_valid_raw = raw.get("all_valid")
+                if isinstance(all_valid_raw, bool):
+                    all_valid = bool(all_valid_raw)
+                else:
+                    all_valid = all(entry["valid"] for entry in normalized)
+                if all_valid and not all(entry["valid"] for entry in normalized):
+                    all_valid = False
+                return cast(
+                    JudgeBatchResponse,
+                    {"results": normalized, "all_valid": all_valid},
+                )
+        elif isinstance(raw, list):
+            normalized = []
+            for item in raw:
+                if isinstance(item, dict):
+                    normalized.append(
+                        {
+                            "word": str(item.get("word", "")),
+                            "valid": bool(item.get("valid", False)),
+                            "reason": str(item.get("reason", "")),
+                        }
+                    )
+            if normalized:
+                all_valid = all(entry["valid"] for entry in normalized)
+                return cast(
+                    JudgeBatchResponse,
+                    {"results": normalized, "all_valid": all_valid},
+                )
+
+        # Fallback: create minimal structure
+        return cast(JudgeBatchResponse, {"results": [], "all_valid": False})
 
     # ---------------- AI hrac ----------------
     def propose_move(self, compact_state: str) -> dict[str, Any]:
@@ -294,11 +368,14 @@ class OpenAIClient:
             "If you use blanks from your rack, include them in 'blanks' with chosen letter.\n"
             f"State:\n{compact_state}"
         )
-        return self._call_json(
+        raw = self._call_json(
             sys_prompt + "\n" + user_prompt,
             schema,
             max_output_tokens=self.ai_move_max_output_tokens,
         )
+        if not isinstance(raw, dict):
+            raise RuntimeError("AI move response is not a JSON object")
+        return cast(dict[str, Any], raw)
 
 class TokenBudgetExceededError(RuntimeError):
     """Vyvolané pri pravdepodobnom orezaní výstupu modelu kvôli limitu tokenov."""

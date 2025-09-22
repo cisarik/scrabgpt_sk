@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from scrabgpt.ai.schema import parse_ai_move, to_offline_payload
+from scrabgpt.ai.schema import parse_ai_move, to_move_payload
 
 
 def test_parse_with_start_and_blanks_coords() -> None:
@@ -18,7 +18,7 @@ def test_parse_with_start_and_blanks_coords() -> None:
         "blanks": {"7,7": "A"},
     }
     m = parse_ai_move(json.dumps(payload))
-    can = to_offline_payload(m)
+    can = to_move_payload(m)
     assert can["row"] == 7 and can["col"] == 7
     assert can["direction"] == "ACROSS"
     assert isinstance(can["placements"], list) and len(can["placements"]) == 2
@@ -36,7 +36,7 @@ def test_parse_with_row_col_and_upper_direction() -> None:
         ],
     }
     m = parse_ai_move(json.dumps(payload))
-    can = to_offline_payload(m)
+    can = to_move_payload(m)
     assert can["row"] == 5 and can["col"] == 10
     assert can["direction"] == "DOWN"
 
@@ -64,6 +64,5 @@ def test_invalid_direction_raises_in_canonicalization() -> None:
     }
     m = parse_ai_move(json.dumps(payload))
     with pytest.raises(ValueError) as ei:
-        _ = to_offline_payload(m)
+        _ = to_move_payload(m)
     assert "direction_invalid" in str(ei.value)
-

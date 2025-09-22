@@ -4,7 +4,7 @@ import logging
 import json
 from typing import Any
 
-from ..ai.schema import parse_ai_move, to_offline_payload
+from ..ai.schema import parse_ai_move, to_move_payload
 from ..core.board import Board
 from ..core.assets import get_premiums_path
 from .client import OpenAIClient
@@ -120,16 +120,17 @@ def propose_move(
     """Zavolá OpenAI, parsuje odpoveď lokálne a normalizuje payload.
 
     Komentár (SK): Nepoužívame serverovú JSON schému; spoliehame sa na
-    lokálne pydantic parsovanie `parse_ai_move` a konverziu na formát
-    offline judge. Pri chybných dátach spravíme jeden riadený retry.
-    Výstup obsahuje aj kľúč `exchange` (prázdny zoznam) kvôli UI kompatibilite.
+    lokálne pydantic parsovanie `parse_ai_move` a konverziu na kanonický
+    formát vhodný pre validáciu a UI. Pri chybných dátach spravíme jeden
+    riadený retry. Výstup obsahuje aj kľúč `exchange` (prázdny zoznam)
+    kvôli UI kompatibilite.
     """
 
     prompt = _build_prompt(compact_state, retry_hint)
     raw = client._call_text(prompt, max_output_tokens=client.ai_move_max_output_tokens)
     try:
         model = parse_ai_move(raw)
-        move = to_offline_payload(model)
+        move = to_move_payload(model)
     except Exception as e:  # noqa: BLE001
         log.warning("ai_parse_failed reason=%s raw=%r", e, (raw or "")[:300])
         hint = (
@@ -139,7 +140,7 @@ def propose_move(
         retry_prompt = _build_prompt(compact_state, retry_hint=hint)
         raw2 = client._call_text(retry_prompt, max_output_tokens=client.ai_move_max_output_tokens)
         model = parse_ai_move(raw2)
-        move = to_offline_payload(model)
+        move = to_move_payload(model)
 
     # Kompatibilita s UI – udržiavaj 'exchange' kľúč (prázdny zoznam)
     if "exchange" not in move:
