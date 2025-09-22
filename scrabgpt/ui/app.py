@@ -5,7 +5,7 @@ import uuid
 import json
 import logging
 from collections.abc import Callable
-from typing import Any, Optional, cast
+from typing import Any, Literal, Optional, cast
 from pathlib import Path
 from PySide6.QtCore import Qt, QSize, QRectF, QTimer, Signal, QObject, QThread, QPoint, QMimeData
 from PySide6.QtGui import QAction, QPainter, QColor, QPen, QFont, QMouseEvent, QPaintEvent, QIntValidator, QTextCursor, QPixmap, QDrag
@@ -19,7 +19,13 @@ from ..logging_setup import configure_logging, TRACE_ID_VAR, default_log_path
 
 from ..core.board import Board
 from ..core.assets import get_premiums_path
-from ..core.tiles import TileBag, TILE_POINTS
+from ..core.tiles import TileBag
+from ..core.game import (
+    GameEndReason,
+    PlayerState,
+    apply_final_scoring,
+    determine_end_reason,
+)
 from ..core.rules import placements_in_line  # noqa: F401 (placeholder, will be used in next slices)
 from ..core.rules import first_move_must_cover_center, connected_to_existing, no_gaps_in_line, extract_all_words
 from ..core.scoring import score_words, apply_premium_consumption
@@ -39,6 +45,9 @@ LOG_PATH = default_log_path()
 EUR_PER_TOKEN = 0.00000186  # 1 token ≈ 0.00000186 EUR (zadané majiteľom)
 
 TILE_MIME = "application/x-scrabgpt-tile"
+
+# Typ alias pre strany pri určovaní štartéra
+StarterSide = Literal["HUMAN", "AI"]
 
 # ---------- Logging + trace_id ----------
 # Použi centralizovanú konfiguráciu (zabráni duplicitám handlerov)
@@ -780,12 +789,16 @@ class MainWindow(QMainWindow):
         shadow_last.setColor(QColor(0, 0, 0, 130))
         self.lbl_last_breakdown.setGraphicsEffect(shadow_last)
         spv.addWidget(self.lbl_last_breakdown)
+        self.btn_reroll = QPushButton("Opakovať žreb")
+        self.btn_reroll.clicked.connect(self._on_repeat_starter_draw)
+        spv.addWidget(self.btn_reroll)
         self.btn_confirm = QPushButton("Potvrdiť ťah")
         self.btn_confirm.clicked.connect(self.confirm_move)
         spv.addWidget(self.btn_confirm)
         self.btn_exchange = QPushButton("Vymeniť")
         self.btn_exchange.clicked.connect(self.exchange_human)
         spv.addWidget(self.btn_exchange)
+        self.btn_reroll.hide()
         spv.addStretch(1)
         self.split.addWidget(self.score_panel)
         self.split.setSizes([700, 300])
@@ -813,6 +826,10 @@ class MainWindow(QMainWindow):
         # Guard pre otvárací ťah AI (zabraňuje dvojitému volaniu pri štarte)
         self._ai_opening_active: bool = False
         self._consecutive_passes: int = 0
+        self._pass_streak: dict[StarterSide, int] = {"HUMAN": 0, "AI": 0}
+        self._no_moves_possible: bool = False
+        self._game_over: bool = False
+        self._game_end_reason: GameEndReason | None = None
         # interny stav pre AI judge callbacky
         self._ai_judge_words_coords: list[tuple[str, list[tuple[int, int]]]] = []
         self._ai_ps2: list[Placement] = []
@@ -822,6 +839,8 @@ class MainWindow(QMainWindow):
         self._ai_last_main_word: str = ""
         self._ai_last_anchor: str = ""
         self._pending_words_coords: list[tuple[str, list[tuple[int, int]]]] = []
+        self._starter_side: StarterSide | None = None
+        self._starter_decided: bool = False
 
         self._reset_to_idle_state()
 
@@ -863,6 +882,11 @@ class MainWindow(QMainWindow):
         # Repro: ak je zapnutý, inicializuj tašku s daným seedom, inak náhodne
         seed_to_use: int | None = self.repro_seed if self.repro_mode else None
         self.bag = TileBag(seed=seed_to_use)
+        self._consecutive_passes = 0
+        self._pass_streak = {"HUMAN": 0, "AI": 0}
+        self._no_moves_possible = False
+        self._game_over = False
+        self._game_end_reason = None
         # zaloguj spustenie hry s nastaveniami repro (presny format pre acceptance)
         try:
             log.info("game_start seed=%s repro=%s", str(self.repro_seed if self.repro_mode else "-") , "true" if self.repro_mode else "false")
@@ -871,18 +895,8 @@ class MainWindow(QMainWindow):
         # žreb štartéra
         a = self.bag.draw(1)[0]
         b = self.bag.draw(1)[0]
-        self.bag.put_back([a,b])
-        starter = "hráč"
-        if a == "?" and b != "?":
-            starter = "hráč"
-        elif b == "?" and a != "?":
-            starter = "AI"
-        elif a == b:
-            starter = "remíza — opakuj žreb"
-        else:
-            starter = "hráč" if a < b else "AI"
-        # zobraz do status baru namiesto popupu
-        self.status.showMessage(f"Hráč má {a}, AI má {b} → začína {starter}.")
+        self.bag.put_back([a, b])
+        start_message, starter_side = self._evaluate_starting_draw(a, b)
         self.human_rack = self.bag.draw(7)
         self.ai_rack = self.bag.draw(7)
         self.rack.set_letters(self.human_rack)
@@ -894,12 +908,70 @@ class MainWindow(QMainWindow):
         self.board_view.set_last_move_cells([])
         self._update_scores_label()
         self.act_new.setText("🏳️ Vzdať sa")
-        self._enable_human_inputs()
+        self._apply_starting_draw_result(start_message, starter_side)
 
-        # Auto-trigger AI na prázdnej doske ak začína AI
+    def _evaluate_starting_draw(self, human_tile: str, ai_tile: str) -> tuple[str, StarterSide | None]:
+        starter_label = "hráč"
+        starter_side: StarterSide | None = "HUMAN"
+        if human_tile == "?" and ai_tile != "?":
+            starter_label = "hráč"
+            starter_side = "HUMAN"
+        elif ai_tile == "?" and human_tile != "?":
+            starter_label = "AI"
+            starter_side = "AI"
+        elif human_tile == ai_tile:
+            starter_label = "remíza — opakuj žreb"
+            starter_side = None
+        else:
+            if human_tile < ai_tile:
+                starter_label = "hráč"
+                starter_side = "HUMAN"
+            else:
+                starter_label = "AI"
+                starter_side = "AI"
+        message = f"Hráč má {human_tile}, AI má {ai_tile} → začína {starter_label}."
+        return message, starter_side
+
+    def _apply_starting_draw_result(self, message: str, starter_side: StarterSide | None) -> None:
+        self.status.showMessage(message)
+        self._ai_opening_active = False
+        if starter_side is None:
+            self._starter_side = None
+            self._starter_decided = False
+            self._set_starter_controls(decided=False)
+            self._disable_human_inputs()
+            return
+        self._starter_side = starter_side
+        self._starter_decided = True
+        self._set_starter_controls(decided=True)
+        if starter_side == "HUMAN":
+            self._enable_human_inputs()
+        else:
+            self._disable_human_inputs()
+            self._maybe_trigger_ai_opening()
+
+    def _handle_starting_draw(self) -> None:
+        human_tile = self.bag.draw(1)[0]
+        ai_tile = self.bag.draw(1)[0]
+        self.bag.put_back([human_tile, ai_tile])
+        message, starter_side = self._evaluate_starting_draw(human_tile, ai_tile)
+        self._apply_starting_draw_result(message, starter_side)
+
+    def _on_repeat_starter_draw(self) -> None:
+        if self._starter_decided:
+            return
+        self._handle_starting_draw()
+
+    def _set_starter_controls(self, *, decided: bool) -> None:
+        self.btn_reroll.setVisible(not decided)
+        self.btn_reroll.setEnabled(not decided)
+        self.btn_confirm.setVisible(decided)
+        self.btn_exchange.setVisible(decided)
+
+    def _maybe_trigger_ai_opening(self) -> None:
         try:
             empty = is_board_empty(self.board)
-            auto = should_auto_trigger_ai_opening("AI" if starter == "AI" else "HUMAN", empty)
+            auto = should_auto_trigger_ai_opening("AI", empty)
         except Exception:
             empty = False
             auto = False
@@ -924,6 +996,8 @@ class MainWindow(QMainWindow):
         self._show_judge_status = False
         self._ai_thinking = False
         self._ai_opening_active = False
+        self._starter_side = None
+        self._starter_decided = False
         self._ai_judge_words_coords = []
         self._ai_ps2 = []
         self._ai_retry_used = False
@@ -957,12 +1031,17 @@ class MainWindow(QMainWindow):
         self._last_move_bingo = False
         self._pending_words_coords = []
         self._consecutive_passes = 0
+        self._pass_streak = {"HUMAN": 0, "AI": 0}
+        self._no_moves_possible = False
+        self._game_over = False
+        self._game_end_reason = None
         self.lbl_last_breakdown.setText("")
         self._update_scores_label()
         self.status.showMessage("")
         self.act_new.setText("🆕 Nová hra")
         self._set_game_ui_visible(False)
         self._disable_human_inputs()
+        self._set_starter_controls(decided=True)
 
     def _update_scores_label(self) -> None:
         self.lbl_scores.setText(
@@ -1124,6 +1203,15 @@ class MainWindow(QMainWindow):
                     return True
         return False
 
+    def _register_scoreless_turn(self, side: StarterSide) -> None:
+        self._pass_streak[side] = self._pass_streak.get(side, 0) + 1
+        self._consecutive_passes += 1
+
+    def _register_scoring_turn(self, side: StarterSide) -> None:
+        self._pass_streak[side] = 0
+        self._consecutive_passes = 0
+        self._no_moves_possible = False
+
     def _validate_move(self) -> Optional[str]:
         """Overi pravidla tahu, vrati chybovu spravu alebo None ak je OK."""
         if not self.pending:
@@ -1257,6 +1345,10 @@ class MainWindow(QMainWindow):
         self.board_view.set_pending(self.pending)
         self.rack.set_letters(self.human_rack)
         self._update_scores_label()
+        self._register_scoring_turn("HUMAN")
+        self._check_endgame()
+        if self._game_over:
+            return
         # spusti AI tah
         self._start_ai_turn()
 
@@ -1314,8 +1406,11 @@ class MainWindow(QMainWindow):
         self.rack.set_letters(self.human_rack)
         self._update_scores_label()
         # vymena konci kolo ako pass
-        self._consecutive_passes += 1
+        self._register_scoreless_turn("HUMAN")
         self._check_endgame()
+        if self._game_over:
+            self._disable_human_inputs()
+            return
         # spusti AI tah
         self._start_ai_turn()
 
@@ -1470,7 +1565,7 @@ class MainWindow(QMainWindow):
                 self._spinner_timer.stop()
                 self._ai_thinking = False
                 self._enable_human_inputs()
-                self._consecutive_passes += 1
+                self._register_scoreless_turn("AI")
                 self.status.showMessage("AI minula tokeny — pasuje")
                 if self._ai_opening_active:
                     try:
@@ -1491,7 +1586,7 @@ class MainWindow(QMainWindow):
             self._spinner_timer.stop()
             self._ai_thinking = False
             self._enable_human_inputs()
-            self._consecutive_passes += 1
+            self._register_scoreless_turn("AI")
             self.status.showMessage("AI pasuje")
             if self._ai_opening_active:
                 try:
@@ -1660,7 +1755,7 @@ class MainWindow(QMainWindow):
         self._enable_human_inputs()
         log.exception("AI navrh zlyhal: %s", e)
         self.status.showMessage("AI pasuje (chyba)")
-        self._consecutive_passes += 1
+        self._register_scoreless_turn("AI")
         if self._ai_opening_active:
             try:
                 log.info("ai_opening done result=%s", "invalid_retry_pass" if self._ai_retry_used else "pass")
@@ -1723,7 +1818,7 @@ class MainWindow(QMainWindow):
             self._ai_thinking = False
             self._enable_human_inputs()
             self.status.showMessage("AI navrhla neplatné slovo — pass")
-            self._consecutive_passes += 1
+            self._register_scoreless_turn("AI")
             self._check_endgame()
             return
         # validne: spocitaj, aplikuj prémie, refill
@@ -1761,7 +1856,7 @@ class MainWindow(QMainWindow):
         self._ai_thinking = False
         self._enable_human_inputs()
         self.status.showMessage("Hrá hráč…")
-        self._consecutive_passes = 0
+        self._register_scoring_turn("AI")
         if self._ai_opening_active:
             try:
                 log.info("ai_opening done result=%s", "applied")
@@ -1778,7 +1873,7 @@ class MainWindow(QMainWindow):
         self._ai_thinking = False
         self._enable_human_inputs()
         self.status.showMessage("AI pasuje (chyba rozhodcu)")
-        self._consecutive_passes += 1
+        self._register_scoreless_turn("AI")
         if self._ai_opening_active:
             try:
                 log.info("ai_opening done result=%s", "invalid_retry_pass" if self._ai_retry_used else "pass")
@@ -1788,26 +1883,59 @@ class MainWindow(QMainWindow):
         self._check_endgame()
 
     def _check_endgame(self) -> None:
-        # 2x pas oboch pri prazdnej taske
-        if self.bag.remaining() == 0 and self._consecutive_passes >= 2:
-            QMessageBox.information(self, "Koniec", "Obaja pasovali 2×. Koniec hry.")
+        if self._game_over:
             return
-        # niekto vylozil vsetky kamene a taska je prazdna => koniec s odpoctami
-        if self.bag.remaining() == 0 and (len(self.human_rack) == 0 or len(self.ai_rack) == 0):
-            human_left = sum(TILE_POINTS.get(ch, 0) for ch in self.human_rack)
-            ai_left = sum(TILE_POINTS.get(ch, 0) for ch in self.ai_rack)
-            if len(self.human_rack) == 0:
-                # clovek skoncil: AI odcita, clovek pripočíta
-                self.ai_score -= ai_left
-                self.human_score += ai_left
+        reason = determine_end_reason(
+            bag_remaining=self.bag.remaining(),
+            racks={"HUMAN": self.human_rack, "AI": self.ai_rack},
+            pass_streaks=self._pass_streak,
+            no_moves_available=self._no_moves_possible,
+        )
+        if reason is None:
+            return
+
+        players = [
+            PlayerState("HUMAN", self.human_rack.copy(), self.human_score),
+            PlayerState("AI", self.ai_rack.copy(), self.ai_score),
+        ]
+        leftover = apply_final_scoring(players)
+        human_state = next(p for p in players if p.name == "HUMAN")
+        ai_state = next(p for p in players if p.name == "AI")
+        self.human_score = human_state.score
+        self.ai_score = ai_state.score
+        self._update_scores_label()
+        self._game_over = True
+        self._game_end_reason = reason
+        self._disable_human_inputs()
+        self._ai_thinking = False
+
+        if reason == GameEndReason.BAG_EMPTY_AND_PLAYER_OUT:
+            if not self.human_rack and self.ai_rack:
                 winner = "Hráč"
-            else:
-                self.human_score -= human_left
-                self.ai_score += human_left
+            elif not self.ai_rack and self.human_rack:
                 winner = "AI"
-            self._update_scores_label()
-            QMessageBox.information(self, "Koniec", f"Koniec hry. Víťaz: {winner}")
-            return
+            else:
+                winner = None
+            if winner is not None:
+                msg = f"Koniec hry. Víťaz: {winner}."
+            else:
+                msg = "Koniec hry."
+        elif reason == GameEndReason.NO_MOVES_AVAILABLE:
+            msg = "Koniec hry. Ďalší ťah nie je možný."
+        else:
+            msg = "Koniec hry. Obaja hráči dvakrát po sebe pasovali."
+
+        def _format_leftover() -> str:
+            parts = []
+            human_left = leftover.get("HUMAN", 0)
+            ai_left = leftover.get("AI", 0)
+            if human_left:
+                parts.append(f"Hráč -{human_left}")
+            if ai_left:
+                parts.append(f"AI -{ai_left}")
+            return " " + " | ".join(parts) if parts else ""
+
+        QMessageBox.information(self, "Koniec", msg + _format_leftover())
 
     def open_settings(self) -> None:
         dlg = SettingsDialog(self, repro_mode=self.repro_mode, repro_seed=self.repro_seed)
@@ -1880,6 +2008,10 @@ class MainWindow(QMainWindow):
                 last_move_cells=getattr(self.board_view, "_last_move_cells", []),
                 last_move_points=self.last_move_points,
                 consecutive_passes=self._consecutive_passes,
+                human_pass_streak=self._pass_streak.get("HUMAN", 0),
+                ai_pass_streak=self._pass_streak.get("AI", 0),
+                game_over=self._game_over,
+                game_end_reason=(self._game_end_reason.name if self._game_end_reason else ""),
                 repro=self.repro_mode,
                 seed=self.repro_seed,
             )
@@ -1922,6 +2054,17 @@ class MainWindow(QMainWindow):
             lm = [(pos["row"], pos["col"]) for pos in st.get("last_move_cells", [])]
             self.board_view.set_last_move_cells(lm)
             self._consecutive_passes = int(st.get("consecutive_passes", 0))
+            self._pass_streak = {
+                "HUMAN": int(st.get("human_pass_streak", 0)),
+                "AI": int(st.get("ai_pass_streak", 0)),
+            }
+            self._game_over = bool(st.get("game_over", False))
+            self._no_moves_possible = False
+            reason_name = st.get("game_end_reason", "")
+            try:
+                self._game_end_reason = GameEndReason[reason_name] if reason_name else None
+            except KeyError:
+                self._game_end_reason = None
             # zruš pending
             self.pending = []
             self.board_view.set_pending(self.pending)
@@ -1933,6 +2076,8 @@ class MainWindow(QMainWindow):
             self._set_game_ui_visible(True)
             self._update_scores_label()
             self.status.showMessage("Hra načítaná.", 2000)
+            if self._game_over:
+                self._disable_human_inputs()
             log.info("game_load path=%s schema=1", path)
         except Exception as e:  # noqa: BLE001
             log.exception("Load failed: %s", e)

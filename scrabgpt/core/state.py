@@ -121,6 +121,9 @@ class SaveGameState(TypedDict, total=False):
     - last_move_cells: pozície posledného ťahu na zvýraznenie
     - last_move_points: body získané v poslednom ťahu (pre info panel)
     - consecutive_passes: počítadlo po sebe idúcich passov
+    - human_pass_streak, ai_pass_streak: per-hráč počítadlá passov
+    - game_over: či bola partia ukončená
+    - game_end_reason: meno enum hodnoty `GameEndReason`
     - repro: bool (iba informačné)
     - seed: int (posledný seed pre Repro; iba informačné)
     """
@@ -138,6 +141,10 @@ class SaveGameState(TypedDict, total=False):
     last_move_cells: list[_Pos]
     last_move_points: int
     consecutive_passes: int
+    human_pass_streak: int
+    ai_pass_streak: int
+    game_over: bool
+    game_end_reason: str
     repro: bool
     seed: int
 
@@ -154,6 +161,10 @@ def build_save_state_dict(
     last_move_cells: list[tuple[int, int]] | None = None,
     last_move_points: int = 0,
     consecutive_passes: int = 0,
+    human_pass_streak: int = 0,
+    ai_pass_streak: int = 0,
+    game_over: bool = False,
+    game_end_reason: str | None = None,
     repro: bool = False,
     seed: int = 0,
 ) -> SaveGameState:
@@ -192,6 +203,10 @@ def build_save_state_dict(
         last_move_cells=[{"row": r, "col": c} for (r, c) in (last_move_cells or [])],
         last_move_points=last_move_points,
         consecutive_passes=consecutive_passes,
+        human_pass_streak=human_pass_streak,
+        ai_pass_streak=ai_pass_streak,
+        game_over=game_over,
+        game_end_reason=game_end_reason or "",
         repro=repro,
         seed=seed,
     )
@@ -245,6 +260,14 @@ def parse_save_state_dict(data: dict[str, Any]) -> SaveGameState:
     assert isinstance(last_move_points, int)
     consecutive_passes = data.get("consecutive_passes", 0)
     assert isinstance(consecutive_passes, int)
+    human_pass_streak = data.get("human_pass_streak", 0)
+    ai_pass_streak = data.get("ai_pass_streak", 0)
+    assert isinstance(human_pass_streak, int)
+    assert isinstance(ai_pass_streak, int)
+    game_over = data.get("game_over", False)
+    assert isinstance(game_over, bool)
+    game_end_reason = data.get("game_end_reason", "")
+    assert isinstance(game_end_reason, str)
     repro = data.get("repro", False)
     assert isinstance(repro, bool)
     seed = data.get("seed", 0)
@@ -264,6 +287,10 @@ def parse_save_state_dict(data: dict[str, Any]) -> SaveGameState:
         last_move_cells=last_move_cells,
         last_move_points=last_move_points,
         consecutive_passes=consecutive_passes,
+        human_pass_streak=human_pass_streak,
+        ai_pass_streak=ai_pass_streak,
+        game_over=game_over,
+        game_end_reason=game_end_reason,
         repro=repro,
         seed=seed,
     )
