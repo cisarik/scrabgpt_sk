@@ -1,0 +1,9 @@
+# Secrets / environment
+.env
+poetry.lock
+scrabgpt.log
+# Python bytecode a cache
+__pycache__/
+*.py[cod]
+*$py.class
+.DS_Store

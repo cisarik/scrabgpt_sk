@@ -1,0 +1,41 @@
+[tool.poetry]
+name = "scrabgpt"
+version = "0.1.0"
+description = "Play Scrabble against GPT-5-mini with structured OpenAI calls. Cross-platform PySide6 GUI."
+authors = ["Michal <you@example.com>"]
+readme = "README.md"
+packages = [{ include = "scrabgpt" }]
+scripts = { scrabgpt = "scrabgpt.__main__:main" }
+
+[tool.poetry.dependencies]
+python = ">=3.10,<3.14"
+pydantic = "^2.7.0"
+python-dotenv = "^1.0.1"
+rich = "^13.7.0"
+PySide6 = "^6.7.0"
+# OpenAI official client (>=1.0)
+openai = "^1.35.10"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.2.0"
+ruff = "^0.5.0"
+mypy = "^1.10.0"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_return_any = true
+plugins = []
+
+[tool.pytest.ini_options]
+addopts = "-q"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"

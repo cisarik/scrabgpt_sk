@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10"]
+
+    env:
+      QT_QPA_PLATFORM: offscreen
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install Poetry
+        run: |
+          pip install poetry==1.8.3
+
+      - name: Configure Poetry cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pypoetry
+          key: ${{ runner.os }}-poetry-${{ hashFiles('**/poetry.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-poetry-
+
+      - name: Install dependencies
+        run: |
+          poetry install --with dev
+
+      - name: Lint (ruff)
+        run: |
+          poetry run ruff check .
+
+      - name: Type-check (mypy)
+        run: |
+          poetry run mypy scrabgpt
+
+      - name: Test (pytest)
+        env:
+          # Žiadna sieť v CI: nezapínať sťahovanie
+          OFFLINE_JUDGE_ENABLED: "0"
+          SCRABGPT_ENABLE_DOWNLOADS: "0"
+        run: |
+          poetry run pytest -q
+
+

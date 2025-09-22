@@ -1,0 +1,2352 @@
+from __future__ import annotations
+import os
+import sys
+import uuid
+import json
+import logging
+from collections.abc import Callable
+from typing import Any, Optional, cast
+from pathlib import Path
+from PySide6.QtCore import Qt, QSize, QRectF, QTimer, Signal, QObject, QThread, QPoint, QMimeData
+from PySide6.QtGui import QAction, QPainter, QColor, QPen, QFont, QMouseEvent, QPaintEvent, QIntValidator, QTextCursor, QPixmap, QDrag
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QToolBar, QLabel, QSplitter, QStatusBar, QMessageBox, QPushButton,
+    QDialog, QFormLayout, QLineEdit, QDialogButtonBox, QListWidget, QListWidgetItem,
+    QGridLayout, QGraphicsDropShadowEffect, QListView, QPlainTextEdit, QCheckBox
+)
+from ..logging_setup import configure_logging, TRACE_ID_VAR, default_log_path
+
+from ..core.board import Board
+from ..core.assets import get_premiums_path
+from ..core.tiles import TileBag, TILE_POINTS
+from ..core.rules import placements_in_line  # noqa: F401 (placeholder, will be used in next slices)
+from ..core.rules import first_move_must_cover_center, connected_to_existing, no_gaps_in_line, extract_all_words
+from ..core.scoring import score_words, apply_premium_consumption
+from ..core.types import Placement, Premium
+from ..ai.client import OpenAIClient, TokenBudgetExceededError
+from ..ai.player import propose_move as ai_propose_move
+from ..ai.player import should_auto_trigger_ai_opening, is_board_empty
+from ..core.state import build_ai_state_dict
+from ..config import effective_offline_judge
+from ..core.offline_judge import OfflineJudge, get_default_enable_cache_path, should_use_offline_judge
+from ..core.rack import consume_rack
+from .dialogs import DownloadProgressDialog
+from ..core.state import build_save_state_dict, parse_save_state_dict, restore_board_from_save, restore_bag_from_save
+
+ASSETS = str(Path(__file__).parent / ".." / "assets")
+PREMIUMS_PATH = get_premiums_path()
+ROOT_DIR = Path(__file__).resolve().parents[2]
+ENV_PATH = str(ROOT_DIR / ".env")
+LOG_PATH = default_log_path()
+EUR_PER_TOKEN = 0.00000186  # 1 token ≈ 0.00000186 EUR (zadané majiteľom)
+
+TILE_MIME = "application/x-scrabgpt-tile"
+
+# ---------- Logging + trace_id ----------
+# Použi centralizovanú konfiguráciu (zabráni duplicitám handlerov)
+log = configure_logging()
+
+# ---------- Jednoduché UI prvky ----------
+
+class SettingsDialog(QDialog):
+    """Nastavenia - OpenAI API kľúč a limity výstupných tokenov.
+
+    - Umožňuje zadať `AI_MOVE_MAX_OUTPUT_TOKENS` a `JUDGE_MAX_OUTPUT_TOKENS`.
+    - Vpravo priebežne prepočítava odhad ceny v EUR podľa zadaného počtu tokenov.
+    - Uloží hodnoty do `.env` v koreňovom adresári projektu a do `os.environ`.
+    """
+    def __init__(self, parent: QWidget | None = None, *, repro_mode: bool = False, repro_seed: int = 0, offline_enabled: bool = False) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Nastavenia")
+        lay = QFormLayout(self)
+        # Načítaj .env, aby sa predvyplnil API key (ak existuje)
+        try:
+            from dotenv import load_dotenv as _load_dotenv  # lokálny import
+            _load_dotenv(ENV_PATH, override=False)
+        except Exception:
+            pass
+        self.key_edit = QLineEdit(self)
+        self.key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.key_edit.setText(os.getenv("OPENAI_API_KEY", ""))
+        lay.addRow("OpenAI API key:", self.key_edit)
+
+        # --- Limity výstupných tokenov ---
+        # AI move
+        self.ai_tokens_edit = QLineEdit(self)
+        self.ai_tokens_edit.setValidator(QIntValidator(1, 1_000_000, self))
+        self.ai_tokens_edit.setText(os.getenv("AI_MOVE_MAX_OUTPUT_TOKENS", "3600"))
+        self.ai_tokens_cost = QLabel("")
+        self.ai_tokens_cost.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        ai_row = QHBoxLayout()
+        ai_row.addWidget(self.ai_tokens_edit, 2)
+        ai_row.addWidget(self.ai_tokens_cost, 1)
+        ai_row_w = QWidget(self)
+        ai_row_w.setLayout(ai_row)
+        lay.addRow("AI ťah — max výstupných tokenov:", ai_row_w)
+
+        # Judge
+        self.judge_tokens_edit = QLineEdit(self)
+        self.judge_tokens_edit.setValidator(QIntValidator(1, 1_000_000, self))
+        self.judge_tokens_edit.setText(os.getenv("JUDGE_MAX_OUTPUT_TOKENS", "800"))
+        self.judge_tokens_cost = QLabel("")
+        self.judge_tokens_cost.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        j_row = QHBoxLayout()
+        j_row.addWidget(self.judge_tokens_edit, 2)
+        j_row.addWidget(self.judge_tokens_cost, 1)
+        j_row_w = QWidget(self)
+        j_row_w.setLayout(j_row)
+        lay.addRow("Rozhodca — max výstupných tokenov:", j_row_w)
+
+        # --- Repro mód (deterministický seed pre TileBag) ---
+        # Uložené iba v runtime (žiadna perzistencia do .env)
+        self.repro_check = QCheckBox("Repro mód")
+        self.repro_check.setChecked(repro_mode)
+        lay.addRow(self.repro_check)
+
+        self.seed_edit = QLineEdit(self)
+        self.seed_edit.setValidator(QIntValidator(0, 2_147_483_647, self))
+        self.seed_edit.setText(str(repro_seed))
+        lay.addRow("Seed:", self.seed_edit)
+
+        # Live prepočet EUR pri zmene
+        self.ai_tokens_edit.textChanged.connect(self._update_costs)
+        self.judge_tokens_edit.textChanged.connect(self._update_costs)
+        self._update_costs()
+
+        # --- Offline judge (ENABLE) ---
+        self.offline_check = QCheckBox("Offline judge (ENABLE)")
+        # nacitaj zo .env; default OFF ak nie je nastavene
+        self.offline_check.setChecked(bool(os.getenv("OFFLINE_JUDGE_ENABLED", "0").lower() in ("1", "true", "yes")))
+        lay.addRow(self.offline_check)
+        info = QLabel('<a href="https://wordlist.aspell.net/12dicts-readme/#ENABLE">Info</a>')
+        try:
+            info.setOpenExternalLinks(True)
+        except Exception:
+            pass
+        lay.addRow("", info)
+
+        # Sekcia Dictionary Info
+        self.dict_entries = QLabel("Entries: Not downloaded")
+        self.dict_size = QLabel("File size: -")
+        self.dict_mtime = QLabel("Updated: -")
+        self.dict_path = QLabel(get_default_enable_cache_path())
+        self.dict_path.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        lay.addRow("Dictionary Info", QLabel(""))
+        lay.addRow(self.dict_entries)
+        lay.addRow(self.dict_size)
+        lay.addRow(self.dict_mtime)
+        lay.addRow("Path:", self.dict_path)
+
+        self.btn_redownload = QPushButton("Re-download")
+        self.btn_openfolder = QPushButton("Open folder…")
+        btn_row = QHBoxLayout()
+        btn_row.addWidget(self.btn_redownload)
+        btn_row.addWidget(self.btn_openfolder)
+        btn_w = QWidget(self)
+        btn_w.setLayout(btn_row)
+        lay.addRow(btn_w)
+
+        # signály nastavím zvonku (MainWindow), kde máme prístup k judge/paths
+
+        self.test_btn = QPushButton("Testovať pripojenie")
+        self.test_btn.clicked.connect(self.test_connection)
+        lay.addWidget(self.test_btn)
+
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        lay.addWidget(btns)
+
+    def _update_costs(self) -> None:
+        """Prepočet odhadovanej ceny v EUR pre zadaný počet tokenov."""
+        def fmt(tokens_text: str) -> str:
+            try:
+                t = int(tokens_text)
+                if t <= 0:
+                    return ""
+                eur = t * EUR_PER_TOKEN
+                # jednoduché formátovanie so 6 des. miestami pre malé čiastky
+                if eur < 0.01:
+                    return f"≈ {eur:.6f} €"
+                return f"≈ {eur:.2f} €"
+            except ValueError:
+                return ""
+
+        self.ai_tokens_cost.setText(fmt(self.ai_tokens_edit.text()))
+        self.judge_tokens_cost.setText(fmt(self.judge_tokens_edit.text()))
+
+    def test_connection(self) -> None:
+        k = self.key_edit.text().strip()
+        if not k:
+            QMessageBox.warning(self, "Test", "Zadaj API key.")
+            return
+        os.environ["OPENAI_API_KEY"] = k
+        try:
+            _ = OpenAIClient()
+            # Skus trivialne zavolat judge na bezpecne slovo (bez platenia? real call) - radsej nevolat tu.
+            QMessageBox.information(self, "Test", "Kľúč uložený do prostredia. Reálne volanie sa vykoná počas hry.")
+        except Exception as e:
+            QMessageBox.critical(self, "Test zlyhal", str(e))
+
+    def accept(self) -> None:
+        # Ulož do prostredia aj do .env (len ak nezadané prázdne)
+        key_str = self.key_edit.text().strip()
+        # zaisti existenciu .env v koreňovom adresári
+        try:
+            if not os.path.exists(ENV_PATH):
+                from pathlib import Path as _Path
+                _Path(ENV_PATH).open("a", encoding="utf-8").close()
+        except Exception:
+            # ak sa nepodarí vytvoriť, pokračuj len s os.environ
+            pass
+        if key_str:
+            os.environ["OPENAI_API_KEY"] = key_str
+            try:
+                from dotenv import set_key as _set_key  # lokálny import, aby UI nemalo tvrdú závislosť na module pri import-time
+                _set_key(ENV_PATH, "OPENAI_API_KEY", key_str)
+            except Exception:
+                # tiché zlyhanie zápisu do .env je akceptovateľné (kľúč ostane v procese)
+                pass
+
+        # limity tokenov
+        ai_tokens = self.ai_tokens_edit.text().strip() or "3600"
+        judge_tokens = self.judge_tokens_edit.text().strip() or "800"
+        os.environ["AI_MOVE_MAX_OUTPUT_TOKENS"] = ai_tokens
+        os.environ["JUDGE_MAX_OUTPUT_TOKENS"] = judge_tokens
+        try:
+            from dotenv import set_key as _set_key2
+            _set_key2(ENV_PATH, "AI_MOVE_MAX_OUTPUT_TOKENS", ai_tokens)
+            _set_key2(ENV_PATH, "JUDGE_MAX_OUTPUT_TOKENS", judge_tokens)
+        except Exception:
+            pass
+        # Pozn.: OFFLINE_JUDGE_ENABLED neperzistujeme tu, lebo prvé zapnutie
+        # môže vyžadovať sťahovanie. Ošetruje sa v MainWindow.open_settings().
+        super().accept()
+
+
+class LogViewerDialog(QDialog):
+    """Jednoduchý prehliadač logu s hľadaním.
+
+    Zobrazí posledných N riadkov zo `scrabgpt.log`. Text je len na čítanie.
+    """
+    def __init__(self, parent: QWidget | None = None, max_lines: int = 500) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Log — posledné záznamy")
+        self.resize(900, 600)
+        lay = QVBoxLayout(self)
+        # vyhľadávanie
+        search_row = QHBoxLayout()
+        self.search_edit = QLineEdit(self)
+        self.search_edit.setPlaceholderText("Hľadať…")
+        self.search_edit.returnPressed.connect(self._find_next)
+        self.find_btn = QPushButton("Hľadať")
+        self.find_btn.clicked.connect(self._find_next)
+        search_row.addWidget(self.search_edit)
+        search_row.addWidget(self.find_btn)
+        search_w = QWidget(self)
+        search_w.setLayout(search_row)
+        lay.addWidget(search_w)
+
+        self.text = QPlainTextEdit(self)
+        self.text.setReadOnly(True)
+        lay.addWidget(self.text)
+
+        # načítaj obsah
+        self._load_tail(LOG_PATH, max_lines)
+
+        close_btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        close_btns.rejected.connect(self.reject)
+        close_btns.accepted.connect(self.accept)
+        lay.addWidget(close_btns)
+
+        self._last_find_pos: int = 0
+
+    def _load_tail(self, path: str, max_lines: int) -> None:
+        try:
+            from pathlib import Path as _Path
+            with _Path(path).open(encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
+            tail = "".join(lines[-max_lines:])
+        except Exception:
+            tail = "(Žiadne logy alebo súbor neexistuje.)"
+        self.text.setPlainText(tail)
+        # scroll na koniec
+        # posun kurzor na koniec dokumentu
+        try:
+            self.text.moveCursor(QTextCursor.MoveOperation.End)
+        except Exception:
+            # kompatibilita, ak by sa API lisilo
+            cursor = self.text.textCursor()
+            self.text.setTextCursor(cursor)
+
+    def _find_next(self) -> None:
+        term = self.search_edit.text().strip()
+        if not term:
+            return
+        doc = self.text.document()
+        # vyhľadávanie od poslednej pozície
+        pos = self._last_find_pos
+        found = doc.find(term, pos)
+        if not found.isNull():
+            self.text.setTextCursor(found)
+            self._last_find_pos = found.position()
+        else:
+            # od začiatku
+            found2 = doc.find(term, 0)
+            if not found2.isNull():
+                self.text.setTextCursor(found2)
+                self._last_find_pos = found2.position()
+
+class BoardView(QWidget):
+    """Vykreslovanie 15x15 dosky s premiami, pismenami a klik interakciou."""
+    cellClicked: Signal = Signal(int, int)  # noqa: N815
+
+    def __init__(self, board: Board, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.board = board
+        self.setMinimumSize(QSize(600, 600))
+        self.setAcceptDrops(True)
+        self._pending: list[Placement] = []
+        # posledne potvrdene bunky pre jemne zvyraznenie pocas nasledujuceho tahu
+        self._last_move_cells: list[tuple[int, int]] = []
+        self._anim_cell: Optional[tuple[int, int]] = None
+        self._anim_phase: float = 0.0
+        self._anim_timer = QTimer(self)
+        self._anim_timer.setInterval(16)  # ~60 FPS
+        self._anim_timer.timeout.connect(self._on_anim_tick)
+        self._drop_handler: Optional[Callable[[int, int, dict[str, Any]], bool]] = None
+        self._pending_drag_handler: Optional[Callable[[dict[str, Any], Qt.DropAction], None]] = None
+        self._drag_candidate: Optional[Placement] = None
+        self._drag_start_pos: Optional[QPoint] = None
+
+    def set_pending(self, placements: list[Placement]) -> None:
+        """Nastavi docasne polozene pismena na prekreslenie."""
+        self._pending = placements
+        self.update()
+
+    def flash_cell(self, row: int, col: int) -> None:
+        """Spusti kratku animaciu zvyraznenia bunky pri polozenej kocke."""
+        self._anim_cell = (row, col)
+        self._anim_phase = 0.0
+        self._anim_timer.start()
+
+    def set_last_move_cells(self, cells: list[tuple[int, int]]) -> None:
+        """Nastavi bunky posledneho tahu na trvale zvyraznenie do dalsieho tahu."""
+        self._last_move_cells = cells
+        self.update()
+
+    def _on_anim_tick(self) -> None:
+        self._anim_phase += 0.08
+        if self._anim_phase >= 1.0:
+            self._anim_timer.stop()
+        self.update()
+
+    def _grid_geometry(self) -> tuple[float, float, float]:
+        """Vypocita lavy horny roh a velkost stvorca bunky pre vycentrovanu mriezku."""
+        w = float(self.width())
+        h = float(self.height())
+        cell = min(w, h) / 15.0
+        x0 = (w - 15.0 * cell) / 2.0
+        y0 = (h - 15.0 * cell) / 2.0
+        return x0, y0, cell
+
+    def paintEvent(self, ev: QPaintEvent) -> None:  # noqa: N802
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        x0, y0, cell = self._grid_geometry()
+
+        # pozadie
+        # tmave pozadie okolo dosky (poziadavka: cierna plocha okolo mriezky)
+        p.fillRect(self.rect(), QColor(0, 0, 0))
+
+        # vykresli bunky s premiami
+        for r in range(15):
+            for c in range(15):
+                rect = QRectF(x0 + c * cell, y0 + r * cell, cell, cell)
+                # premium farba
+                premium = self.board.cells[r][c].premium
+                color = QColor(240, 240, 240)
+                if premium == Premium.DL:
+                    color = QColor(153, 204, 255)
+                elif premium == Premium.TL:
+                    color = QColor(51, 153, 255)
+                elif premium == Premium.DW:
+                    color = QColor(255, 153, 204)
+                elif premium == Premium.TW:
+                    color = QColor(255, 102, 102)
+                p.fillRect(rect, color)
+                # mriezka
+                p.setPen(QPen(QColor(200, 200, 200)))
+                p.drawRect(rect)
+
+        # hviezda v strede
+        star_rect = QRectF(x0 + 7 * cell, y0 + 7 * cell, cell, cell)
+        p.setPen(QPen(QColor(120, 120, 120)))
+        font = QFont()
+        font.setPointSizeF(cell * 0.4)
+        p.setFont(font)
+        p.drawText(star_rect, int(Qt.AlignmentFlag.AlignCenter), "★")
+
+        # existujuce pismena
+        for r in range(15):
+            for c in range(15):
+                ch = self.board.cells[r][c].letter
+                if not ch:
+                    continue
+                rect = QRectF(x0 + c * cell, y0 + r * cell, cell, cell)
+                # odlis blank
+                if self.board.cells[r][c].is_blank:
+                    p.fillRect(rect.adjusted(cell*0.1, cell*0.1, -cell*0.1, -cell*0.1), QColor(255, 255, 255))
+                    p.setPen(QPen(QColor(160, 160, 160)))
+                    p.drawEllipse(rect.center(), cell*0.06, cell*0.06)
+                p.setPen(QPen(QColor(0, 0, 0)))
+                f = QFont()
+                f.setBold(True)
+                f.setPointSizeF(cell * 0.45)
+                p.setFont(f)
+                p.drawText(rect, int(Qt.AlignmentFlag.AlignCenter), ch)
+
+        # pending pismena (prekrytie, jemny tien)
+        for pl in self._pending:
+            r, c = pl.row, pl.col
+            rect = QRectF(x0 + c * cell, y0 + r * cell, cell, cell)
+            p.fillRect(rect.adjusted(cell*0.1, cell*0.1, -cell*0.1, -cell*0.1), QColor(255, 255, 224))
+            p.setPen(QPen(QColor(0, 0, 0)))
+            f = QFont()
+            f.setBold(True)
+            f.setPointSizeF(cell * 0.45)
+            p.setFont(f)
+            txt = pl.blank_as if (pl.letter == "?" and pl.blank_as) else pl.letter
+            p.drawText(rect, int(Qt.AlignmentFlag.AlignCenter), txt)
+
+        # zvyraznenie poslednych poloziek tahu (jemny halo/obrys)
+        if self._last_move_cells:
+            for (r, c) in self._last_move_cells:
+                rect = QRectF(x0 + c * cell, y0 + r * cell, cell, cell)
+                # jemny vonkajsi halo
+                halo = QColor(255, 215, 0, 90)  # zlaty priesvitny
+                p.fillRect(rect, halo)
+                # obrys
+                p.setPen(QPen(QColor(255, 180, 0, 180), max(1, int(cell * 0.06))))
+                p.drawRect(rect.adjusted(cell*0.05, cell*0.05, -cell*0.05, -cell*0.05))
+
+        # anim highlight
+        if self._anim_cell is not None and self._anim_phase < 1.0:
+            r, c = self._anim_cell
+            rect = QRectF(x0 + c * cell, y0 + r * cell, cell, cell)
+            alpha = int(150 * (1.0 - self._anim_phase))
+            p.fillRect(rect, QColor(0, 200, 0, alpha))
+
+    def set_tile_drop_handler(self, handler: Callable[[int, int, dict[str, Any]], bool]) -> None:
+        self._drop_handler = handler
+
+    def set_pending_drag_handler(self, handler: Callable[[dict[str, Any], Qt.DropAction], None]) -> None:
+        self._pending_drag_handler = handler
+
+    def dragEnterEvent(self, event):  # type: ignore[no-untyped-def]  # noqa: N802
+        if self._accepts_mime(event.mimeData()):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):  # type: ignore[no-untyped-def]  # noqa: N802
+        if self._accepts_mime(event.mimeData()):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):  # type: ignore[no-untyped-def]  # noqa: N802
+        payload = self._decode_payload(event.mimeData())
+        if payload is None or payload.get("origin") != "rack":
+            event.ignore()
+            return
+        x0, y0, cell = self._grid_geometry()
+        pos = event.position()
+        x = pos.x()
+        y = pos.y()
+        if x < x0 or y < y0:
+            event.ignore()
+            return
+        col = int((x - x0) // cell)
+        row = int((y - y0) // cell)
+        if not (0 <= row < 15 and 0 <= col < 15):
+            event.ignore()
+            return
+        if self._drop_handler is None:
+            event.ignore()
+            return
+        if self._drop_handler(row, col, payload):
+            event.setDropAction(Qt.DropAction.MoveAction)
+            event.accept()
+            self.flash_cell(row, col)
+        else:
+            event.ignore()
+
+    def mousePressEvent(self, ev: QMouseEvent) -> None:  # noqa: N802
+        x0, y0, cell = self._grid_geometry()
+        x = ev.position().x()
+        y = ev.position().y()
+        if x < x0 or y < y0:
+            return
+        col = int((x - x0) // cell)
+        row = int((y - y0) // cell)
+        if not (0 <= row < 15 and 0 <= col < 15):
+            return
+        if ev.button() == Qt.MouseButton.LeftButton:
+            for placement in reversed(self._pending):
+                if placement.row == row and placement.col == col:
+                    self._drag_candidate = placement
+                    self._drag_start_pos = ev.position().toPoint()
+                    return
+        self.cellClicked.emit(row, col)
+
+    def mouseMoveEvent(self, ev: QMouseEvent) -> None:  # noqa: N802
+        if (
+            self._drag_candidate is not None
+            and ev.buttons() & Qt.MouseButton.LeftButton
+            and self._drag_start_pos is not None
+            and (ev.position().toPoint() - self._drag_start_pos).manhattanLength() >= QApplication.startDragDistance()
+        ):
+            self._start_drag_from_board()
+            return
+        super().mouseMoveEvent(ev)
+
+    def mouseReleaseEvent(self, ev: QMouseEvent) -> None:  # noqa: N802
+        self._drag_candidate = None
+        self._drag_start_pos = None
+        super().mouseReleaseEvent(ev)
+
+    def _start_drag_from_board(self) -> None:
+        if self._drag_candidate is None:
+            return
+        payload = {
+            "origin": "board",
+            "row": self._drag_candidate.row,
+            "col": self._drag_candidate.col,
+            "letter": self._drag_candidate.letter,
+            "blank_as": self._drag_candidate.blank_as,
+        }
+        mime = QMimeData()
+        try:
+            encoded = json.dumps(payload, ensure_ascii=True).encode("ascii")
+        except Exception:
+            self._drag_candidate = None
+            self._drag_start_pos = None
+            return
+        mime.setData(TILE_MIME, encoded)
+        drag = QDrag(self)
+        drag.setMimeData(mime)
+        size = QSize(44, 44)
+        pixmap = QPixmap(size)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setBrush(QColor(11, 61, 11))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawRoundedRect(pixmap.rect(), 6, 6)
+        painter.setPen(QColor(255, 255, 255))
+        font = painter.font()
+        font.setBold(True)
+        font.setPointSize(24)
+        painter.setFont(font)
+        display_val = payload.get("blank_as") if payload.get("blank_as") and payload.get("letter") == "?" else payload.get("letter", "")
+        display = "" if display_val is None else str(display_val)
+        painter.drawText(pixmap.rect(), int(Qt.AlignmentFlag.AlignCenter), display)
+        painter.end()
+        drag.setPixmap(pixmap)
+        drag.setHotSpot(pixmap.rect().center())
+        result = drag.exec(Qt.DropAction.MoveAction)
+        if self._pending_drag_handler is not None:
+            self._pending_drag_handler(payload, result)
+        self._drag_candidate = None
+        self._drag_start_pos = None
+
+    @staticmethod
+    def _decode_payload(mime: QMimeData) -> Optional[dict[str, Any]]:
+        if not mime.hasFormat(TILE_MIME):
+            return None
+        try:
+            raw = mime.data(TILE_MIME)
+            raw_bytes = cast(bytes, raw.data())
+            text = raw_bytes.decode("ascii")
+            data = json.loads(text)
+        except Exception:
+            return None
+        if isinstance(data, dict):
+            return cast(dict[str, Any], data)
+        return None
+
+    def _accepts_mime(self, mime: QMimeData) -> bool:
+        payload = self._decode_payload(mime)
+        return bool(payload and payload.get("origin") == "rack")
+
+
+class RackListWidget(QListWidget):
+    """List widget prispôsobený pre drag & drop kameňov."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
+        self.setDragEnabled(True)
+        self.viewport().setAcceptDrops(True)
+        self.setAcceptDrops(True)
+        self.setDropIndicatorShown(False)
+        self.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.setDragDropMode(QListWidget.DragDropMode.DragOnly)
+
+    def startDrag(self, supported_actions: Any) -> None:  # noqa: N802
+        item = self.currentItem()
+        if item is None:
+            return
+        payload = {
+            "origin": "rack",
+            "letter": item.text(),
+            "rack_index": self.currentRow(),
+        }
+        mime = QMimeData()
+        try:
+            encoded = json.dumps(payload, ensure_ascii=True).encode("ascii")
+        except Exception:
+            return
+        mime.setData(TILE_MIME, encoded)
+        drag = QDrag(self)
+        drag.setMimeData(mime)
+        size = self.iconSize()
+        if size.isEmpty():
+            size = QSize(44, 44)
+        pixmap = QPixmap(size)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setBrush(QColor(11, 61, 11))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawRoundedRect(pixmap.rect(), 6, 6)
+        painter.setPen(QColor(255, 255, 255))
+        font = painter.font()
+        font.setBold(True)
+        font.setPointSize(max(10, int(size.height() * 0.6)))
+        painter.setFont(font)
+        painter.drawText(pixmap.rect(), int(Qt.AlignmentFlag.AlignCenter), item.text())
+        painter.end()
+        drag.setPixmap(pixmap)
+        drag.setHotSpot(pixmap.rect().center())
+        drag.exec(Qt.DropAction.MoveAction)
+
+    def dragEnterEvent(self, event):  # type: ignore[no-untyped-def]  # noqa: N802
+        if self._accepts_payload(event.mimeData()):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):  # type: ignore[no-untyped-def]  # noqa: N802
+        if self._accepts_payload(event.mimeData()):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):  # type: ignore[no-untyped-def]  # noqa: N802
+        if self._accepts_payload(event.mimeData()):
+            event.setDropAction(Qt.DropAction.MoveAction)
+            event.accept()
+        else:
+            event.ignore()
+
+    @staticmethod
+    def _accepts_payload(mime: QMimeData) -> bool:
+        if not mime.hasFormat(TILE_MIME):
+            return False
+        try:
+            raw = mime.data(TILE_MIME)
+            raw_bytes = cast(bytes, raw.data())
+            text = raw_bytes.decode("ascii")
+            data = json.loads(text)
+        except Exception:
+            return False
+        if not isinstance(data, dict):
+            return False
+        return data.get("origin") == "board"
+
+
+
+class RackView(QWidget):
+    """Jednoduchy rack bez DnD - klik na pismenko a potom na dosku (MVP zatial bez prekliku)."""
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        # nizsi pas racku; bude presne sirky na 7 pismen
+        h = QHBoxLayout(self)
+        h.setContentsMargins(0, 6, 0, 0)
+        h.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        self.list = RackListWidget()
+        self.list.setViewMode(QListWidget.ViewMode.IconMode)
+        self.list.setResizeMode(QListWidget.ResizeMode.Adjust)
+        # nastavenie velkosti jednej dlazdice
+        self._tile_px = 44
+        self._spacing_px = 6
+        self.list.setIconSize(QSize(self._tile_px, self._tile_px))
+        self.list.setGridSize(QSize(self._tile_px, self._tile_px))
+        self.list.setSpacing(self._spacing_px)
+        self.list.setWrapping(False)
+        self.list.setFlow(QListView.Flow.LeftToRight)
+        self.list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.list.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.list.setFixedHeight(self._tile_px)
+        # tmavozelene pozadie racku
+        self.list.setStyleSheet(
+            "QListWidget{background-color:#0b3d0b;border:0;} "
+            "QListWidget::item{color:white;}"
+        )
+        # pseudo-3D tieň
+        shadow = QGraphicsDropShadowEffect(self)
+        shadow.setBlurRadius(12)
+        shadow.setOffset(0, 2)
+        shadow.setColor(QColor(0, 0, 0, 80))
+        self.list.setGraphicsEffect(shadow)
+        h.addWidget(self.list)
+        total_height = self._tile_px + h.contentsMargins().top() + h.contentsMargins().bottom()
+        self.setFixedHeight(total_height)
+
+    def set_letters(self, letters: list[str]) -> None:
+        self.list.clear()
+        for ch in letters:
+            item = QListWidgetItem(ch)
+            font = item.font()
+            font.setPointSize(18)
+            font.setBold(True)
+            item.setFont(font)
+            self.list.addItem(item)
+        # sirka presne na 7 pismen (bez ohladu na obsah)
+        width_px = 7 * self._tile_px + 6 * self._spacing_px
+        self.list.setFixedWidth(width_px)
+
+    def take_selected(self) -> Optional[str]:
+        it = self.list.currentItem()
+        if it is None:
+            return None
+        ch = it.text()
+        row = self.list.row(it)
+        self.list.takeItem(row)
+        return ch
+
+
+class MainWindow(QMainWindow):
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWindowTitle("ScrabGPT")
+        self.resize(1000, 800)
+
+        # Modely
+        self.board = Board(PREMIUMS_PATH)
+        self.bag = TileBag()
+        # na zaciatku prazdny rack; pismena sa zoberu po "Nová hra"
+        self.human_rack: list[str] = []
+        self.ai_rack: list[str] = []
+        self.pending: list[Placement] = []
+        self.human_score: int = 0
+        self.ai_score: int = 0
+        self.last_move_points: int = 0
+        # uloz rozpis posledneho tahu a bingo flag pre UI
+        self._last_move_breakdown: list[tuple[str, int, int, int, int]] = []  # (word, base, letter_bonus, word_mult, total)
+        self._last_move_bingo: bool = False
+
+        # Repro mód nastavenia (iba runtime)
+        # Pozn.: Nastavuje sa v dialógu Nastavenia a používa pri "Nová hra".
+        self.repro_mode: bool = False
+        self.repro_seed: int = 0
+
+        # OpenAI klient (lazy init po prvom pouziti ak treba)
+        self.ai_client: Optional[OpenAIClient] = None
+
+        # Offline rozhodca nastavenie a cache
+        self.offline_enabled: bool = bool(os.getenv("OFFLINE_JUDGE_ENABLED", "0").lower() in ("1", "true", "yes"))
+        self.offline_judge: Optional[OfflineJudge] = None
+        if self.offline_enabled:
+            try:
+                cache_path = get_default_enable_cache_path()
+                if os.path.exists(cache_path):
+                    self.offline_judge = OfflineJudge.from_path(cache_path)
+                else:
+                    # ak súbor chýba, ponechaj offline zapnutý; wordlist si vyžiada sťahovanie
+                    pass
+            except Exception:
+                # nechaj offline flag; inštanciu vynuluj
+                self.offline_judge = None
+
+        # UI
+        self.toolbar = QToolBar()
+        self.addToolBar(self.toolbar)
+
+        self.act_new = QAction("🆕 Nová hra", self)
+        self.act_new.triggered.connect(self._on_new_or_surrender)
+        self.toolbar.addAction(self.act_new)
+
+        self.act_settings = QAction("⚙️ Nastavenia", self)
+        self.act_settings.triggered.connect(self.open_settings)
+        self.toolbar.addAction(self.act_settings)
+
+        self.act_log = QAction("📜 Zobraziť log…", self)
+        self.act_log.triggered.connect(self.show_log)
+        self.toolbar.addAction(self.act_log)
+
+        # Save/Load
+        self.act_save = QAction("💾 Uložiť…", self)
+        self.act_save.triggered.connect(self.save_game_dialog)
+        self.toolbar.addAction(self.act_save)
+        self.act_open = QAction("📂 Otvoriť…", self)
+        self.act_open.triggered.connect(self.open_game_dialog)
+        self.toolbar.addAction(self.act_open)
+
+        central = QWidget()
+        self.setCentralWidget(central)
+        v = QVBoxLayout(central)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(0)
+
+        self.split = QSplitter(Qt.Orientation.Horizontal)
+        v.addWidget(self.split)
+
+        self.board_view = BoardView(self.board)
+        self.board_view.cellClicked.connect(self.on_board_clicked)
+        self.board_view.set_tile_drop_handler(self._handle_tile_drop_from_rack)
+        self.board_view.set_pending_drag_handler(self._handle_pending_drag_finished)
+        self.split.addWidget(self.board_view)
+
+        # Pravý panel skóre
+        self.score_panel = QWidget()
+        spv = QVBoxLayout(self.score_panel)
+        self.lbl_scores = QLabel()
+        self.lbl_scores.setStyleSheet(
+            "QLabel{font-size:20px;font-weight:600;color:#f0f0f0;}"
+        )
+        shadow_scores = QGraphicsDropShadowEffect(self.score_panel)
+        shadow_scores.setBlurRadius(12)
+        shadow_scores.setOffset(0, 2)
+        shadow_scores.setColor(QColor(0, 0, 0, 150))
+        self.lbl_scores.setGraphicsEffect(shadow_scores)
+        spv.addWidget(self.lbl_scores)
+        self.lbl_last_breakdown = QLabel("")
+        self.lbl_last_breakdown.setWordWrap(True)
+        self.lbl_last_breakdown.setStyleSheet(
+            "QLabel{font-size:17px;color:#fafafa;}"
+        )
+        shadow_last = QGraphicsDropShadowEffect(self.score_panel)
+        shadow_last.setBlurRadius(10)
+        shadow_last.setOffset(0, 2)
+        shadow_last.setColor(QColor(0, 0, 0, 130))
+        self.lbl_last_breakdown.setGraphicsEffect(shadow_last)
+        spv.addWidget(self.lbl_last_breakdown)
+        self.btn_confirm = QPushButton("Potvrdiť ťah")
+        self.btn_confirm.clicked.connect(self.confirm_move)
+        spv.addWidget(self.btn_confirm)
+        self.btn_exchange = QPushButton("Vymeniť")
+        self.btn_exchange.clicked.connect(self.exchange_human)
+        spv.addWidget(self.btn_exchange)
+        spv.addStretch(1)
+        self.split.addWidget(self.score_panel)
+        self.split.setSizes([700, 300])
+        self._stored_split_sizes: list[int] = self.split.sizes()
+        self._game_ui_visible: bool = True
+
+        # Spodný pás: rack + status
+        self.rack = RackView()
+        v.addWidget(self.rack)
+        self.status = QStatusBar()
+        self.setStatusBar(self.status)
+        # start: prazdny status bar
+        self.status.showMessage("")
+
+        # zobrazi prazdny rack, kym sa nespusti nova hra
+        self.rack.set_letters(self.human_rack)
+
+        # status spinner pri rozhodcovi
+        self._spinner_timer = QTimer(self)
+        self._spinner_timer.setInterval(300)
+        self._spinner_timer.timeout.connect(self._on_spinner_tick)
+        self._spinner_phase = 0
+        self._show_judge_status: bool = False
+        self._ai_thinking: bool = False
+        # Guard pre otvárací ťah AI (zabraňuje dvojitému volaniu pri štarte)
+        self._ai_opening_active: bool = False
+        self._consecutive_passes: int = 0
+        # interny stav pre AI judge callbacky
+        self._ai_judge_words_coords: list[tuple[str, list[tuple[int, int]]]] = []
+        self._ai_ps2: list[Placement] = []
+        # flag jednorazového retry pre AI návrh
+        self._ai_retry_used: bool = False
+        # pomocné uloženie hlavného slova a anchoru pre retry po judge
+        self._ai_last_main_word: str = ""
+        self._ai_last_anchor: str = ""
+        self._pending_words_coords: list[tuple[str, list[tuple[int, int]]]] = []
+
+        # Aplikuj efektívny režim rozhodcu podľa .env a UI togglu ihneď po štarte
+        self._apply_judge_mode(initial=True)
+        self._reset_to_idle_state()
+
+    def new_game(self) -> None:
+        # Základný placeholder pre žreb štartéra (MVP skeleton)
+        from ..core.tiles import TileBag
+        self.board = Board(PREMIUMS_PATH)
+        self.board_view.board = self.board
+        self._set_game_ui_visible(True)
+        # Repro: ak je zapnutý, inicializuj tašku s daným seedom, inak náhodne
+        seed_to_use: int | None = self.repro_seed if self.repro_mode else None
+        self.bag = TileBag(seed=seed_to_use)
+        # zaloguj spustenie hry s nastaveniami repro (presny format pre acceptance)
+        try:
+            log.info("game_start seed=%s repro=%s", str(self.repro_seed if self.repro_mode else "-") , "true" if self.repro_mode else "false")
+        except Exception:
+            pass
+        # žreb štartéra
+        a = self.bag.draw(1)[0]
+        b = self.bag.draw(1)[0]
+        self.bag.put_back([a,b])
+        starter = "hráč"
+        if a == "?" and b != "?":
+            starter = "hráč"
+        elif b == "?" and a != "?":
+            starter = "AI"
+        elif a == b:
+            starter = "remíza — opakuj žreb"
+        else:
+            starter = "hráč" if a < b else "AI"
+        # zobraz do status baru namiesto popupu
+        self.status.showMessage(f"Hráč má {a}, AI má {b} → začína {starter}.")
+        self.human_rack = self.bag.draw(7)
+        self.ai_rack = self.bag.draw(7)
+        self.rack.set_letters(self.human_rack)
+        self.human_score = 0
+        self.ai_score = 0
+        self.last_move_points = 0
+        self._last_move_breakdown = []
+        self._last_move_bingo = False
+        self.board_view.set_last_move_cells([])
+        self._update_scores_label()
+        self.act_new.setText("🏳️ Vzdať sa")
+        self._enable_human_inputs()
+
+        # Auto-trigger AI na prázdnej doske ak začína AI
+        try:
+            empty = is_board_empty(self.board)
+            auto = should_auto_trigger_ai_opening("AI" if starter == "AI" else "HUMAN", empty)
+        except Exception:
+            empty = False
+            auto = False
+        if auto and not self._ai_thinking and not self._ai_opening_active:
+            self._ai_opening_active = True
+            try:
+                log.info("ai_opening start board_empty=%s", "true" if empty else "false")
+            except Exception:
+                pass
+            self._start_ai_turn()
+
+    def surrender(self) -> None:
+        # okamzity koniec so zapisom vitaza
+        winner = "AI" if self.human_score < self.ai_score else "Hráč"
+        QMessageBox.information(self, "Koniec", f"{winner} vyhráva (vzdané).")
+        self._reset_to_idle_state()
+
+    def _reset_to_idle_state(self) -> None:
+        """Vráti aplikáciu do východzieho stavu pred spustením hry."""
+        # zastav animácie/spinner a ukonči rozbehnuté vlákna
+        self._spinner_timer.stop()
+        self._show_judge_status = False
+        self._ai_thinking = False
+        self._ai_opening_active = False
+        self._ai_judge_words_coords = []
+        self._ai_ps2 = []
+        self._ai_retry_used = False
+        self._ai_last_main_word = ""
+        self._ai_last_anchor = ""
+        for attr in ("_judge_thread", "_ai_thread", "_ai_judge_thread"):
+            thread = getattr(self, attr, None)
+            if isinstance(thread, QThread):
+                try:
+                    thread.requestInterruption()
+                except Exception:
+                    pass
+                thread.quit()
+                thread.wait(500)
+            setattr(self, attr, None)
+        # reset modelov
+        self.board = Board(PREMIUMS_PATH)
+        self.board_view.board = self.board
+        self.pending = []
+        self.board_view.set_pending(self.pending)
+        self.board_view.set_last_move_cells([])
+        self.board_view.update()
+        self.human_rack = []
+        self.ai_rack = []
+        self.bag = TileBag()
+        self.rack.set_letters(self.human_rack)
+        self.human_score = 0
+        self.ai_score = 0
+        self.last_move_points = 0
+        self._last_move_breakdown = []
+        self._last_move_bingo = False
+        self._pending_words_coords = []
+        self._consecutive_passes = 0
+        self.lbl_last_breakdown.setText("")
+        self._update_scores_label()
+        self.status.showMessage("")
+        self.act_new.setText("🆕 Nová hra")
+        self._set_game_ui_visible(False)
+        self._disable_human_inputs()
+
+    def _update_scores_label(self) -> None:
+        self.lbl_scores.setText(
+            f"<div>Skóre — Hráč: <b>{self.human_score}</b> | AI: <b>{self.ai_score}</b></div>"
+            f"<div>Taška: {self.bag.remaining()}</div>"
+        )
+        self._update_last_move_breakdown_ui()
+
+    def _update_last_move_breakdown_ui(self) -> None:
+        """Aktualizuje panel rozpisu 'Posledný ťah'."""
+        if not self._last_move_breakdown and not self._last_move_bingo:
+            self.lbl_last_breakdown.setText("<div style='margin-bottom:6px'>Posledný ťah: -</div>")
+            return
+        lines: list[str] = []
+        for (w, base, lb, mult, total) in self._last_move_breakdown:
+            line = (
+                f"<span style='font-weight:bold'>{w}</span>: základ {base}, "
+                f"písmená +{lb}, násobok ×{mult} → <span style='font-weight:bold'>{total}</span>"
+            )
+            lines.append(line)
+        if self._last_move_bingo:
+            lines.append("<span style='color:#9cff9c'>+50 bingo</span>")
+        html = "<br/>".join(lines)
+        prefix = f"Posledný ťah: +{self.last_move_points}" if self.last_move_points else "Posledný ťah:"
+        self.lbl_last_breakdown.setText(f"<div style='margin-bottom:6px'>{prefix}</div>{html}")
+
+    def _append_pending_tile(self, placement: Placement) -> None:
+        """Pridá dočasne položené písmeno a refreshne UI."""
+        self.pending.append(placement)
+        self.board_view.set_pending(self.pending)
+        self.board_view.flash_cell(placement.row, placement.col)
+        self._update_ghost_score()
+
+    def _handle_tile_drop_from_rack(self, row: int, col: int, payload: dict[str, Any]) -> bool:
+        if self.board.cells[row][col].letter:
+            self.status.showMessage("Pole je obsadené.", 2000)
+            return False
+        if any(p.row == row and p.col == col for p in self.pending):
+            self.status.showMessage("Pole už obsahuje dočasné písmeno.", 2000)
+            return False
+        letter = str(payload.get("letter", ""))
+        rack_index = int(payload.get("rack_index", -1))
+        idx_to_use: Optional[int] = None
+        if 0 <= rack_index < len(self.human_rack) and self.human_rack[rack_index] == letter:
+            idx_to_use = rack_index
+        else:
+            for i, ch in enumerate(self.human_rack):
+                if ch == letter:
+                    idx_to_use = i
+                    break
+        if idx_to_use is None:
+            return False
+        blank_as: Optional[str] = None
+        if letter == "?":
+            blank_as = self._choose_blank_letter()
+            if blank_as is None:
+                return False
+        placement = Placement(row=row, col=col, letter=letter, blank_as=blank_as)
+        self._append_pending_tile(placement)
+        self.human_rack.pop(idx_to_use)
+        self.rack.set_letters(self.human_rack)
+        return True
+
+    def _handle_pending_drag_finished(self, payload: dict[str, Any], action: Qt.DropAction) -> None:
+        del action  # action slúži len ako informatívny údaj, spracovanie je rovnaké
+        row = int(payload.get("row", -1))
+        col = int(payload.get("col", -1))
+        removed: Optional[Placement] = None
+        for idx, placement in enumerate(self.pending):
+            if placement.row == row and placement.col == col:
+                removed = self.pending.pop(idx)
+                break
+        if removed is None:
+            return
+        self.board_view.set_pending(self.pending)
+        self.board_view.update()
+        self.human_rack.append(removed.letter)
+        self.rack.set_letters(self.human_rack)
+        self._update_ghost_score()
+
+    def on_board_clicked(self, row: int, col: int) -> None:
+        """Klik na dosku: ak je vybrate pismeno v racku a bunka je prazdna, poloz ho."""
+        # existujuca alebo pending obsadena bunka?
+        if self.board.cells[row][col].letter:
+            return
+        if any(p.row == row and p.col == col for p in self.pending):
+            return
+        ch = self.rack.take_selected()
+        if ch is None:
+            self.status.showMessage("Vyber písmeno v racku…", 2000)
+            return
+        blank_as: Optional[str] = None
+        if ch == "?":
+            sel = self._choose_blank_letter()
+            if sel is None:
+                # vrat pismenko do racku ak zrusil
+                self.human_rack.append("?")
+                self.rack.set_letters(self.human_rack)
+                return
+            blank_as = sel
+        placement = Placement(row=row, col=col, letter=ch, blank_as=blank_as)
+        self._append_pending_tile(placement)
+        try:
+            self.human_rack.remove(ch)
+        except ValueError:
+            pass
+        self.rack.set_letters(self.human_rack)
+
+    def _choose_blank_letter(self) -> Optional[str]:
+        """Zobrazi popup s volbou A–Z pre blank a vrati vybrane pismeno."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Vyber písmeno pre blank")
+        grid = QGridLayout(dlg)
+        letters = [chr(ord('A') + i) for i in range(26)]
+        selected: dict[str, str] = {}
+        def on_click(ch: str) -> None:
+            selected['v'] = ch
+            dlg.accept()
+        for i, ch in enumerate(letters):
+            btn = QPushButton(ch)
+            btn.clicked.connect(lambda _=False, c=ch: on_click(c))
+            r = i // 8
+            c = i % 8
+            grid.addWidget(btn, r, c)
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
+        btns.rejected.connect(dlg.reject)
+        grid.addWidget(btns, 4, 0, 1, 8)
+        ok = dlg.exec()
+        if ok and 'v' in selected:
+            return selected['v']
+        return None
+
+    def _update_ghost_score(self) -> None:
+        """Spocita a zobrazi ghost skore pre docasne pismena (vratane krizov)."""
+        if not self.pending:
+            self.status.showMessage("Hrá hráč…")
+            return
+        # docasne poloz na dosku
+        self.board.place_letters(self.pending)
+        # ziskaj slova
+        words_found = extract_all_words(self.board, self.pending)
+        words_coords = [(wf.word, wf.letters) for wf in words_found]
+        score, _ = score_words(self.board, self.pending, words_coords)
+        # vycisti docasne
+        self.board.clear_letters(self.pending)
+        self.status.showMessage(f"Ghost skóre: {score}")
+
+    def _on_spinner_tick(self) -> None:
+        dots = "." * (1 + (self._spinner_phase % 3))
+        # Zobraz text rozhodcu iba ak prebieha online rozhodovanie
+        if self._show_judge_status:
+            self.status.showMessage(f"Rozhoduje rozhodca{dots}")
+        self._spinner_phase += 1
+
+    def _has_any_letters(self) -> bool:
+        for r in range(15):
+            for c in range(15):
+                if self.board.cells[r][c].letter:
+                    return True
+        return False
+
+    def _validate_move(self) -> Optional[str]:
+        """Overi pravidla tahu, vrati chybovu spravu alebo None ak je OK."""
+        if not self.pending:
+            return "Najprv polož aspoň jedno písmeno."
+        dir_ = placements_in_line(self.pending)
+        if dir_ is None:
+            return "Písmená musia byť v jednej línii."
+        if not no_gaps_in_line(self.board, self.pending, dir_):
+            return "V hlavnej línii sú diery."
+        if not self._has_any_letters():
+            if not first_move_must_cover_center(self.pending):
+                return "Prvý ťah musí prechádzať stredom (★)."
+        else:
+            if not connected_to_existing(self.board, self.pending):
+                return "Ťah musí nadväzovať na existujúce písmená."
+        return None
+
+    def confirm_move(self) -> None:
+        """Potvrdí ťah: validácia, rozhodca, aplikácia ťahu (alebo chybová hláška)."""
+        # prirad trace_id pre tento ľudský ťah
+        TRACE_ID_VAR.set(str(uuid.uuid4())[:8])
+        log.info("[HUMAN] start turn")
+        err = self._validate_move()
+        if err is not None:
+            QMessageBox.warning(self, "Pravidlá", err)
+            return
+        # docasne poloz, ziskaj slova a drz ich pre scoring
+        self.board.place_letters(self.pending)
+        words_found = extract_all_words(self.board, self.pending)
+        words_coords = [(wf.word, wf.letters) for wf in words_found]
+        words = [wf.word for wf in words_found]
+        # Offline/online rozvetvenie s routerom
+        use_offline = should_use_offline_judge(self.offline_enabled, self.offline_judge is not None)
+        if use_offline and self.offline_judge is not None:
+            hits = sum(1 for w in words if self.offline_judge.contains(w))
+            misses = len(words) - hits
+            try:
+                log.info("judge=offline side=human words=%s hits=%s misses=%s", len(words), hits, misses)
+            except Exception:
+                pass
+            bad_word: Optional[str] = None
+            for w in words:
+                if not self.offline_judge.contains(w):
+                    bad_word = w
+                    break
+            if bad_word is not None:
+                # neplatné: undo a správa (rack ostáva nezmenený)
+                self.board.clear_letters(self.pending)
+                self.pending = []
+                self.rack.set_letters(self.human_rack)
+                self.board_view.set_pending(self.pending)
+                self.status.showMessage("Hrá hráč…")
+                QMessageBox.information(self, "Neplatný ťah", f"Neplatné slovo: {bad_word}")
+                return
+            # všetko validné: pokračuj rovno na scoring a aplikáciu
+            words_coords = words_coords
+            total, _bd = score_words(self.board, self.pending, words_coords)
+            self._last_move_breakdown = [(bd.word, bd.base_points, bd.letter_bonus_points, bd.word_multiplier, bd.total) for bd in _bd]
+            self._last_move_bingo = (len(self.pending) == 7)
+            self.board_view.set_last_move_cells([(p.row, p.col) for p in self.pending])
+            if len(self.pending) == 7:
+                total += 50
+            apply_premium_consumption(self.board, self.pending)
+            self.last_move_points = total
+            self.human_score += total
+            # spotrebuj rack presne o pouzite pismena a dopln z tasky
+            before = "".join(self.human_rack)
+            used = ",".join(p.letter for p in self.pending)
+            new_rack = consume_rack(self.human_rack, self.pending)
+            draw_cnt = max(0, 7 - len(new_rack))
+            drawn = self.bag.draw(draw_cnt) if draw_cnt > 0 else []
+            new_rack.extend(drawn)
+            self.human_rack = new_rack
+            try:
+                log.info(
+                    'rack_update side=human used="%s" before="%s" after="%s" drawn=%s bag_remaining=%s',
+                    used,
+                    before,
+                    "".join(self.human_rack),
+                    len(drawn),
+                    self.bag.remaining(),
+                )
+            except Exception:
+                pass
+            self.pending = []
+            self.board_view.set_pending(self.pending)
+            self.rack.set_letters(self.human_rack)
+            self._update_scores_label()
+            self._start_ai_turn()
+            return
+
+        if self.offline_enabled and not use_offline:
+            # Nevykonavaj tichy fallback na online — zastav a informuj
+            try:
+                log.info("judge_route side=human offline_enabled=true wordlist_loaded=false -> blocked")
+            except Exception:
+                pass
+            # vrat dosku do povodneho stavu
+            self.board.clear_letters(self.pending)
+            self.board_view.set_pending(self.pending)
+            self.status.showMessage("Hrá hráč…")
+            QMessageBox.critical(self, "Offline judge", "Offline režim je zapnutý, ale slovník nie je načítaný. Otvor Nastavenia a stiahni wordlist.")
+            return
+        log.info("Rozhodca overuje slová: %s", words)
+        # spusti spinner (online judge)
+        self._spinner_phase = 0
+        self._show_judge_status = True
+        self._spinner_timer.start()
+
+        # lazy init klienta
+        if self.ai_client is None:
+            self.ai_client = OpenAIClient()
+
+        # worker v pozadi na rozhodcu
+        class JudgeWorker(QObject):
+            finished: Signal = Signal(dict)
+            failed: Signal = Signal(Exception)
+            def __init__(self, client: OpenAIClient, words: list[str], trace_id: str) -> None:
+                super().__init__()
+                self.client = client
+                self.words = words
+                self.trace_id = trace_id
+            def run(self) -> None:
+                try:
+                    TRACE_ID_VAR.set(self.trace_id)
+                    resp = self.client.judge_words(self.words)
+                    self.finished.emit(resp)
+                except Exception as e:  # noqa: BLE001
+                    self.failed.emit(e)
+
+        self._judge_thread = QThread(self)
+        self._judge_worker = JudgeWorker(self.ai_client, words, TRACE_ID_VAR.get())
+        self._judge_worker.moveToThread(self._judge_thread)
+        self._judge_thread.started.connect(self._judge_worker.run)
+        self._judge_worker.finished.connect(self._on_judge_ok)
+        self._judge_worker.failed.connect(self._on_judge_fail)
+        # uklon thread po dokonceni
+        self._judge_worker.finished.connect(self._judge_thread.quit)
+        self._judge_worker.failed.connect(self._judge_thread.quit)
+        # uchovaj pre neskor pouzitie pri skore
+        self._pending_words_coords = words_coords
+        self._judge_thread.start()
+
+    def _on_judge_ok(self, resp: dict[str, object]) -> None:
+        self._spinner_timer.stop()
+        self._show_judge_status = False
+        log.info("Rozhodca výsledok: %s", resp)
+        all_valid = bool(resp.get("all_valid", False))
+        if not all_valid:
+            # najdi prve nevalidne
+            results = resp.get("results", [])
+            bad = None
+            if isinstance(results, list):
+                for it in results:
+                    if isinstance(it, dict) and not bool(it.get("valid", False)):
+                        bad = it.get("word", "")
+                        break
+            # zmaz docasne (rack ostáva nezmenený)
+            self.board.clear_letters(self.pending)
+            self.pending = []
+            self.rack.set_letters(self.human_rack)
+            self.board_view.set_pending(self.pending)
+            self.status.showMessage("Hrá hráč…")
+            QMessageBox.information(self, "Neplatný ťah", f"Neplatné slovo: {bad}")
+            return
+
+        # validne: spocitaj skore + bingo, aplikuj prémie a dopln rack
+        words_coords = getattr(self, "_pending_words_coords")
+        total, _bd = score_words(self.board, self.pending, words_coords)
+        # uloz rozpis pre UI
+        self._last_move_breakdown = [(bd.word, bd.base_points, bd.letter_bonus_points, bd.word_multiplier, bd.total) for bd in _bd]
+        self._last_move_bingo = (len(self.pending) == 7)
+        # zvyrazni posledne polozene bunky
+        self.board_view.set_last_move_cells([(p.row, p.col) for p in self.pending])
+        if len(self.pending) == 7:
+            total += 50
+        apply_premium_consumption(self.board, self.pending)
+        self.last_move_points = total
+        self.human_score += total
+        # spotrebuj rack presne o pouzite pismena a dopln z tasky
+        before = "".join(self.human_rack)
+        used = ",".join(p.letter for p in self.pending)
+        new_rack = consume_rack(self.human_rack, self.pending)
+        draw_cnt = max(0, 7 - len(new_rack))
+        drawn = self.bag.draw(draw_cnt) if draw_cnt > 0 else []
+        new_rack.extend(drawn)
+        self.human_rack = new_rack
+        try:
+            log.info(
+                'rack_update side=human used="%s" before="%s" after="%s" drawn=%s bag_remaining=%s',
+                used,
+                before,
+                "".join(self.human_rack),
+                len(drawn),
+                self.bag.remaining(),
+            )
+        except Exception:
+            pass
+        # vycisti pending a UI
+        self.pending = []
+        self.board_view.set_pending(self.pending)
+        self.rack.set_letters(self.human_rack)
+        self._update_scores_label()
+        # spusti AI tah
+        self._start_ai_turn()
+
+    def _on_judge_fail(self, e: Exception) -> None:
+        self._spinner_timer.stop()
+        self._show_judge_status = False
+        log.exception("Rozhodca zlyhal: %s", e)
+        # vrat dosku do stavu pred potvrdenim (rack ostáva nezmenený)
+        self.board.clear_letters(self.pending)
+        self.pending = []
+        self.rack.set_letters(self.human_rack)
+        self.board_view.set_pending(self.pending)
+        self.status.showMessage("Hrá hráč…")
+        QMessageBox.critical(self, "Chyba rozhodcu", str(e))
+
+    # ---------- AI tah ----------
+    def _disable_human_inputs(self) -> None:
+        self.btn_confirm.setEnabled(False)
+        self.board_view.setEnabled(False)
+        self.rack.setEnabled(False)
+        self.btn_exchange.setEnabled(False)
+
+    def _enable_human_inputs(self) -> None:
+        self.btn_confirm.setEnabled(True)
+        self.board_view.setEnabled(True)
+        self.rack.setEnabled(True)
+        self.btn_exchange.setEnabled(True)
+
+    def exchange_human(self) -> None:
+        """Vymena vybranych kamienkov v racku (ak taska ma >=7)."""
+        if self._ai_thinking:
+            return
+        # ťah hráča (výmena) – vlastné trace_id
+        TRACE_ID_VAR.set(str(uuid.uuid4())[:8])
+        log.info("[HUMAN] start exchange")
+        if self.bag.remaining() < 7:
+            QMessageBox.information(self, "Vymeniť", "Taška má menej ako 7 kameňov – výmena nie je povolená.")
+            return
+        # pozbieraj vybrane polozky
+        selected: list[str] = [it.text() for it in self.rack.list.selectedItems()]
+        if not selected:
+            QMessageBox.information(self, "Vymeniť", "Vyber aspoň jeden kameň na výmenu.")
+            return
+        # Odober z racku presne tieto znaky (podla poradia selectu) a vymen
+        tmp_rack = self.human_rack.copy()
+        for ch in selected:
+            if ch in tmp_rack:
+                tmp_rack.remove(ch)
+            else:
+                QMessageBox.warning(self, "Vymeniť", "Vybraný kameň sa nenašiel v racku.")
+                return
+        self.status.showMessage("Hráč vymieňa…")
+        new_tiles = self.bag.exchange(selected)
+        self.human_rack = tmp_rack + new_tiles
+        self.rack.set_letters(self.human_rack)
+        self._update_scores_label()
+        # vymena konci kolo ako pass
+        self._consecutive_passes += 1
+        self._check_endgame()
+        # spusti AI tah
+        self._start_ai_turn()
+
+    def _start_ai_turn(self) -> None:
+        self._ai_thinking = True
+        self._disable_human_inputs()
+        self.status.showMessage("Hrá AI…")
+        # reset flagu pre nový ťah
+        self._ai_retry_used = False
+        # priraď trace_id pre AI ťah
+        TRACE_ID_VAR.set(str(uuid.uuid4())[:8])
+        log.info("[AI] start turn")
+        if self.ai_client is None:
+            self.ai_client = OpenAIClient()
+        # priprav stav
+        st = build_ai_state_dict(
+            self.board, self.ai_rack, self.human_score, self.ai_score, turn="AI"
+        )
+        compact = (
+            "grid:\n" + "\n".join(st["grid"]) +
+            f"\nblanks:{st['blanks']}\n"
+            f"ai_rack:{st['ai_rack']}\n"
+            f"scores: H={st['human_score']} AI={st['ai_score']}\nturn:{st['turn']}\n"
+        )
+
+        class ProposeWorker(QObject):
+            finished: Signal = Signal(dict)
+            failed: Signal = Signal(Exception)
+            def __init__(self, client: OpenAIClient, state_str: str, trace_id: str) -> None:
+                super().__init__()
+                self.client = client
+                self.state_str = state_str
+                self.trace_id = trace_id
+            def run(self) -> None:
+                try:
+                    TRACE_ID_VAR.set(self.trace_id)
+                    # Použi vylepšený prompt z ai.player
+                    resp = ai_propose_move(client=self.client, compact_state=self.state_str)
+                    self.finished.emit(resp)
+                except Exception as e:  # noqa: BLE001
+                    self.failed.emit(e)
+
+        self._ai_thread = QThread(self)
+        self._ai_worker = ProposeWorker(self.ai_client, compact, TRACE_ID_VAR.get())
+        self._ai_worker.moveToThread(self._ai_thread)
+        self._ai_thread.started.connect(self._ai_worker.run)
+        self._ai_worker.finished.connect(self._on_ai_proposal)
+        self._ai_worker.failed.connect(self._on_ai_fail)
+        self._ai_worker.finished.connect(self._ai_thread.quit)
+        self._ai_worker.failed.connect(self._ai_thread.quit)
+        self._ai_thread.start()
+
+    def _validate_ai_move(self, proposal: dict[str, object]) -> Optional[str]:
+        # zakladna validacia schema a rack
+        if bool(proposal.get("exchange")):
+            return "AI navrhla exchange — odmietame v tomto slici."
+        if bool(proposal.get("pass", False)):
+            return None  # pass povoleny
+        placements_obj = proposal.get("placements", [])
+        if not isinstance(placements_obj, list) or not placements_obj:
+            return "Žiadne placements v návrhu."
+        # validacia rozsahu a linie
+        try:
+            placements_list: list[dict[str, Any]] = cast(list[dict[str, Any]], placements_obj)
+            ps: list[Placement] = [
+                Placement(int(p["row"]), int(p["col"]), str(p["letter"]))
+                for p in placements_list
+            ]
+        except Exception:
+            return "Placements nemajú správny tvar."
+        # nesmie prepisovať existujúce písmená
+        for p in ps:
+            if self.board.cells[p.row][p.col].letter:
+                return "AI sa pokúsila položiť na obsadené pole."
+        dir_ = placements_in_line(ps)
+        if dir_ is None:
+            return "AI ťah nie je v jednej línii."
+        # dopln blank_as z response ak je
+        blanks = proposal.get("blanks", [])
+        blank_map: dict[tuple[int,int], str] = {}
+        if isinstance(blanks, list):
+            for b in blanks:
+                if not ("row" in b and "col" in b and "as" in b):
+                    return "Blanks položky majú zlý formát."
+                rr = int(b["row"])
+                cc = int(b["col"])
+                ch = str(b["as"])
+                blank_map[(rr, cc)] = ch
+        # skontroluj diery s ohladom na existujuce pismena
+        if not no_gaps_in_line(self.board, ps, dir_):
+            return "AI ťah má diery."
+        # po prvom tahu over spojitost
+        if not self._has_any_letters():
+            if not first_move_must_cover_center(ps):
+                return "AI prvý ťah nejde cez stred."
+        else:
+            if not connected_to_existing(self.board, ps):
+                return "AI ťah nenadväzuje."
+        # skontroluj rack AI (pocet a pouzitie blankov)
+        # Pozn.: AI moze poslat v placements realne pismeno (napr. 'E')
+        # a zaroven v `blanks` uviesť, ze na daných súradniciach ide o blank
+        # mapovaný na 'E'. V takom prípade musíme spotrebovať '?' z racku,
+        # nie písmeno 'E'.
+        rack_copy = self.ai_rack.copy()
+        for p in ps:
+            consume_as_blank = (p.row, p.col) in blank_map
+            if p.letter == "?" or consume_as_blank:
+                if "?" in rack_copy:
+                    rack_copy.remove("?")
+                else:
+                    return "AI použila viac blankov než má."
+            else:
+                if p.letter in rack_copy:
+                    rack_copy.remove(p.letter)
+                else:
+                    return "AI použila písmeno, ktoré nemá."
+        # ak blanky, musia mat mapovanie
+        for p in ps:
+            if p.letter == "?" and (p.row, p.col) not in blank_map:
+                return "AI použila blank bez 'blanks' mapovania."
+        return None
+
+    def _on_ai_proposal(self, proposal: dict[str, object]) -> None:
+        log.info("AI navrhla: %s", proposal)
+        # validacia / retry / pass
+        err = self._validate_ai_move(proposal)
+        if err is not None and not bool(proposal.get("pass", False)):
+            # jeden retry s hintom
+            self.status.showMessage("AI návrh neplatný, skúša znova…")
+            self._spinner_phase = 0
+            self._spinner_timer.start()
+            if self.ai_client is None:
+                self.ai_client = OpenAIClient()
+            # Špecifický hint pre porušenie center-star pravidla pri prvom ťahu
+            if (not self._has_any_letters()) and ("stred" in err or "center" in err or err.startswith("AI prvý ťah")):
+                hint = "Opening rule: your first move must cross the center star at H8. Propose a different move."
+            else:
+                hint = f"Previous error: {err}. Ensure single line, no gaps, valid rack."
+            st = build_ai_state_dict(self.board, self.ai_rack, self.human_score, self.ai_score, turn="AI")
+            compact = (
+                "grid:\n" + "\n".join(st["grid"]) +
+                f"\nblanks:{st['blanks']}\n"
+                f"ai_rack:{st['ai_rack']}\n"
+                f"scores: H={st['human_score']} AI={st['ai_score']}\nturn:{st['turn']}\n"
+            )
+            try:
+                # označ, že prebehol retry (pre logovanie výsledku otvorenia)
+                self._ai_retry_used = True
+                proposal = ai_propose_move(self.ai_client, compact_state=compact, retry_hint=hint)
+            except TokenBudgetExceededError:
+                # špeciálna hláška, ale AI iba pasuje, aby sa hra nezasekla
+                self._spinner_timer.stop()
+                self._ai_thinking = False
+                self._enable_human_inputs()
+                self._consecutive_passes += 1
+                self.status.showMessage("AI minula tokeny — pasuje")
+                if self._ai_opening_active:
+                    try:
+                        log.info("ai_opening done result=%s", "invalid_retry_pass" if self._ai_retry_used else "pass")
+                    except Exception:
+                        pass
+                    self._ai_opening_active = False
+                self._check_endgame()
+                return
+            except Exception as e:  # noqa: BLE001
+                self._on_ai_fail(e)
+                return
+            err = self._validate_ai_move(proposal)
+            if err is not None and not bool(proposal.get("pass", False)):
+                proposal = {"pass": True}
+
+        if bool(proposal.get("pass", False)):
+            self._spinner_timer.stop()
+            self._ai_thinking = False
+            self._enable_human_inputs()
+            self._consecutive_passes += 1
+            self.status.showMessage("AI pasuje")
+            if self._ai_opening_active:
+                try:
+                    log.info("ai_opening done result=%s", "invalid_retry_pass" if self._ai_retry_used else "pass")
+                except Exception:
+                    pass
+                self._ai_opening_active = False
+            self._check_endgame()
+            return
+
+        # aplikuj navrhnute placements (len docasne) a ziskaj slova
+        placements_obj = proposal.get("placements", [])
+        placements_list: list[dict[str, Any]] = cast(list[dict[str, Any]], placements_obj) if isinstance(placements_obj, list) else []
+        ps: list[Placement] = [
+            Placement(int(p["row"]), int(p["col"]), str(p["letter"]))
+            for p in placements_list
+        ]
+        blanks = proposal.get("blanks", [])
+        blank_map: dict[tuple[int, int], str] = {}
+        if isinstance(blanks, list):
+            for b in cast(list[dict[str, Any]], blanks):
+                rr = int(b["row"])
+                cc = int(b["col"])
+                ch = str(b["as"])
+                blank_map[(rr, cc)] = ch
+        # nastav blank_as; ak AI oznacila v `blanks`, prekonvertuj na '?'
+        ps2: list[Placement] = []
+        for p in ps:
+            if (p.row, p.col) in blank_map:
+                ps2.append(Placement(p.row, p.col, "?", blank_as=blank_map[(p.row,p.col)]))
+            else:
+                ps2.append(p)
+        self.board.place_letters(ps2)
+        words_found = extract_all_words(self.board, ps2)
+        words_coords = [(wf.word, wf.letters) for wf in words_found]
+        words = [wf.word for wf in words_found]
+        log.info("AI slová na overenie: %s", words)
+
+        # --- Kontrola zlepeného hlavného slova vs. deklarované 'word' ---
+        def _infer_main_and_anchor() -> tuple[str, str]:
+            """Zistí hlavné slovo a anchor (existujúci prefix/sufix).
+
+            Komentár (SK): Vyberieme to slovo z `words_found`, ktoré obsahuje
+            všetky nové súradnice v jednej osi. Anchor určíme ako existujúcu
+            časť na začiatku alebo konci (písmená mimo `ps2`).
+            """
+            placements_set = {(p.row, p.col) for p in ps2}
+            # hľadaj slovo, ktoré pokrýva všetky nové pozície
+            main_word = ""
+            main_coords: list[tuple[int, int]] = []
+            for wf in words_found:
+                coords = [(r, c) for (r, c) in wf.letters]
+                if all((r, c) in coords for (r, c) in placements_set):
+                    main_word = wf.word
+                    main_coords = coords
+                    break
+            if not main_word and words_found:
+                # fallback: vyber najdlhšie slovo
+                wf = max(words_found, key=lambda x: len(x.word))
+                main_word = wf.word
+                main_coords = [(r, c) for (r, c) in wf.letters]
+            # anchor = existujúce písmená na krajoch
+            prefix = []
+            suffix = []
+            for _idx, (r, c) in enumerate(main_coords):
+                if (r, c) not in placements_set:
+                    prefix.append((r, c))
+                else:
+                    break
+            for idx in range(len(main_coords) - 1, -1, -1):
+                rc = main_coords[idx]
+                if rc not in placements_set:
+                    suffix.append(rc)
+                else:
+                    break
+            # premen na texty
+            def letter_at(rc: tuple[int, int]) -> str:
+                return self.board.cells[rc[0]][rc[1]].letter or ""
+            anchor_text = ""
+            if prefix:
+                anchor_text = "".join(letter_at(rc) for rc in prefix)
+            if suffix:
+                suf_txt = "".join(letter_at(rc) for rc in reversed(suffix))
+                anchor_text = anchor_text + ("+" if anchor_text and suf_txt else "") + suf_txt
+            return main_word, anchor_text
+
+        main_word, anchor = _infer_main_and_anchor()
+        self._ai_last_main_word = main_word
+        self._ai_last_anchor = anchor
+
+        declared = str(proposal.get("word", ""))
+        if (
+            declared
+            and main_word
+            and declared != main_word
+            and not self._ai_retry_used
+            and not bool(proposal.get("pass", False))
+        ):
+            # Mismatch = pravdepodobné lepenie na existujúci reťazec
+            self.board.clear_letters(ps2)
+            self._spinner_phase = 0
+            self._spinner_timer.start()
+            self._ai_retry_used = True
+            try:
+                log.info("ai_retry reason=invalid_glued_word main=%s anchor=%s", main_word, anchor)
+            except Exception:
+                pass
+            st = build_ai_state_dict(self.board, self.ai_rack, self.human_score, self.ai_score, turn="AI")
+            compact = (
+                "grid:\n" + "\n".join(st["grid"]) +
+                f"\nblanks:{st['blanks']}\n"
+                f"ai_rack:{st['ai_rack']}\n"
+                f"scores: H={st['human_score']} AI={st['ai_score']}\nturn:{st['turn']}\n"
+            )
+            hint = (
+                f"Your previous move created an invalid glued word '{main_word}' by attaching to existing '{anchor}'. "
+                "Propose a different move that forms a single valid English word; prefer proper hooks or overlaps. Return JSON only."
+            )
+            try:
+                new_prop = ai_propose_move(self.ai_client if self.ai_client else OpenAIClient(), compact_state=compact, retry_hint=hint)
+            except Exception as e:  # noqa: BLE001
+                self._on_ai_fail(e)
+                return
+            # Re-validate and continue with new proposal
+            self._on_ai_proposal(new_prop)
+            return
+
+        # Offline/online judge vetva pre AI s routerom
+        use_offline_ai = should_use_offline_judge(self.offline_enabled, self.offline_judge is not None)
+        if use_offline_ai and self.offline_judge is not None:
+            # Pred offline validáciou vyčisti dočasné písmená z dosky
+            self.board.clear_letters(ps2)
+            # Priprav payload pre OfflineJudge.validate_move
+            # - smer zistíme z ps (jedna línia)
+            rows = {p.row for p in ps}
+            dir_txt = "ACROSS" if len(rows) == 1 else "DOWN"
+            # - blanks môžu byť v návrhu ako list dictov {row,col,as}; premapuj na dict "r,c": "X"
+            blanks_obj = proposal.get("blanks", None)
+            blanks_mapped: dict[str, str] | None = None
+            if isinstance(blanks_obj, list):
+                blanks_mapped = {}
+                for b in cast(list[dict[str, Any]], blanks_obj):
+                    rr = int(b.get("row", 0))
+                    cc = int(b.get("col", 0))
+                    ch = str(b.get("as", "")).strip()
+                    blanks_mapped[f"{rr},{cc}"] = ch
+            elif isinstance(blanks_obj, dict):
+                blanks_mapped = cast(dict[str, str], blanks_obj)
+            move_payload: dict[str, Any] = {
+                "row": min(p.row for p in ps),
+                "col": min(p.col for p in ps),
+                "direction": dir_txt,
+                "placements": [{"row": p.row, "col": p.col, "letter": p.letter} for p in ps],
+            }
+            if blanks_mapped is not None:
+                move_payload["blanks"] = blanks_mapped
+
+            res = self.offline_judge.validate_move(self.board, self.ai_rack, move_payload)
+            if not res.valid:
+                try:
+                    log.info("judge=offline side=ai result=invalid reason=%s", res.reason)
+                except Exception:
+                    pass
+                # jeden guided retry ak ešte neprebehol
+                if not self._ai_retry_used:
+                    self._ai_retry_used = True
+                    st = build_ai_state_dict(self.board, self.ai_rack, self.human_score, self.ai_score, turn="AI")
+                    compact = (
+                        "grid:\n" + "\n".join(st["grid"]) +
+                        f"\nblanks:{st['blanks']}\n"
+                        f"ai_rack:{st['ai_rack']}\n"
+                        f"scores: H={st['human_score']} AI={st['ai_score']}\nturn:{st['turn']}\n"
+                    )
+                    hint = f"Offline validation failed: {res.reason or 'unknown'}. Propose a different valid move."
+                    try:
+                        new_prop = ai_propose_move(self.ai_client if self.ai_client else OpenAIClient(), compact_state=compact, retry_hint=hint)
+                    except Exception as e:  # noqa: BLE001
+                        self._on_ai_fail(e)
+                        return
+                    self._on_ai_proposal(new_prop)
+                    return
+                # inak: pass
+                self._ai_thinking = False
+                self._enable_human_inputs()
+                self.status.showMessage("AI navrhla neplatný ťah (offline) — pass")
+                self._consecutive_passes += 1
+                if self._ai_opening_active:
+                    try:
+                        log.info("ai_opening done result=%s", "invalid_retry_pass")
+                    except Exception:
+                        pass
+                    self._ai_opening_active = False
+                self._check_endgame()
+                return
+
+            # Valid: aplikuj normalizované placements z validate_move
+            ps_valid = res.placements or []
+            self.board.place_letters(ps_valid)
+            words_found2 = extract_all_words(self.board, ps_valid)
+            words_coords2 = [(wf.word, wf.letters) for wf in words_found2]
+            total, _bd = score_words(self.board, ps_valid, words_coords2)
+            self._last_move_breakdown = [(bd.word, bd.base_points, bd.letter_bonus_points, bd.word_multiplier, bd.total) for bd in _bd]
+            self._last_move_bingo = (len(ps_valid) == 7)
+            self.board_view.set_last_move_cells([(p.row, p.col) for p in ps_valid])
+            if len(ps_valid) == 7:
+                total += 50
+            apply_premium_consumption(self.board, ps_valid)
+            self.ai_score += total
+            # spotrebuj rack AI a doplň z tašky
+            before = "".join(self.ai_rack)
+            used = ",".join(p.letter for p in ps_valid)
+            new_rack = consume_rack(self.ai_rack, ps_valid)
+            draw_cnt = max(0, 7 - len(new_rack))
+            drawn = self.bag.draw(draw_cnt) if draw_cnt > 0 else []
+            new_rack.extend(drawn)
+            self.ai_rack = new_rack
+            try:
+                log.info(
+                    'rack_update side=ai used="%s" before="%s" after="%s" drawn=%s bag_remaining=%s',
+                    used,
+                    before,
+                    "".join(self.ai_rack),
+                    len(drawn),
+                    self.bag.remaining(),
+                )
+            except Exception:
+                pass
+            self._update_scores_label()
+            self._ai_thinking = False
+            self._enable_human_inputs()
+            self.status.showMessage("Hrá hráč…")
+            self._consecutive_passes = 0
+            if self._ai_opening_active:
+                try:
+                    log.info("ai_opening done result=%s", "applied")
+                except Exception:
+                    pass
+                self._ai_opening_active = False
+            self._check_endgame()
+            return
+
+        if self.offline_enabled and not use_offline_ai:
+            # Ziadny tichy fallback na online; zastav AI tah a informuj
+            try:
+                log.info("judge_route side=ai offline_enabled=true wordlist_loaded=false -> blocked")
+            except Exception:
+                pass
+            self.board.clear_letters(ps2)
+            self._ai_thinking = False
+            self._enable_human_inputs()
+            self.status.showMessage("Hrá hráč…")
+            QMessageBox.critical(self, "Offline judge", "Offline režim je zapnutý, ale slovník nie je načítaný. Otvor Nastavenia a stiahni wordlist.")
+            return
+
+        # Online rozhodovanie
+        class JudgeWorker(QObject):
+            finished: Signal = Signal(dict)
+            failed: Signal = Signal(Exception)
+            def __init__(self, client: OpenAIClient, words: list[str], trace_id: str) -> None:
+                super().__init__()
+                self.client = client
+                self.words = words
+                self.trace_id = trace_id
+            def run(self) -> None:
+                try:
+                    TRACE_ID_VAR.set(self.trace_id)
+                    resp = self.client.judge_words(self.words)
+                    self.finished.emit(resp)
+                except Exception as e:  # noqa: BLE001
+                    self.failed.emit(e)
+
+        self._ai_judge_words_coords = words_coords
+        self._ai_ps2 = ps2
+        # spusti spinner pre online rozhodovanie AI
+        self._spinner_phase = 0
+        self._show_judge_status = True
+        self._spinner_timer.start()
+        self._ai_judge_thread = QThread(self)
+        self._ai_judge_worker = JudgeWorker(self.ai_client if self.ai_client else OpenAIClient(), words, TRACE_ID_VAR.get())
+        self._ai_judge_worker.moveToThread(self._ai_judge_thread)
+        self._ai_judge_thread.started.connect(self._ai_judge_worker.run)
+        self._ai_judge_worker.finished.connect(self._on_ai_judge_ok)
+        self._ai_judge_worker.failed.connect(self._on_ai_judge_fail)
+        self._ai_judge_worker.finished.connect(self._ai_judge_thread.quit)
+        self._ai_judge_worker.failed.connect(self._ai_judge_thread.quit)
+        self._ai_judge_thread.start()
+
+    def _on_ai_fail(self, e: Exception) -> None:
+        self._spinner_timer.stop()
+        self._ai_thinking = False
+        self._enable_human_inputs()
+        log.exception("AI navrh zlyhal: %s", e)
+        self.status.showMessage("AI pasuje (chyba)")
+        self._consecutive_passes += 1
+        if self._ai_opening_active:
+            try:
+                log.info("ai_opening done result=%s", "invalid_retry_pass" if self._ai_retry_used else "pass")
+            except Exception:
+                pass
+            self._ai_opening_active = False
+        self._check_endgame()
+
+    def _on_ai_judge_ok(self, resp: dict[str, object]) -> None:
+        self._spinner_timer.stop()
+        self._show_judge_status = False
+        all_valid = bool(resp.get("all_valid", False))
+        if not all_valid:
+            # guided retry ak ešte neprebehol
+            if not self._ai_retry_used:
+                ps2 = getattr(self, "_ai_ps2")
+                self.board.clear_letters(ps2)
+                self._ai_retry_used = True
+                try:
+                    log.info("ai_retry reason=invalid_glued_word main=%s anchor=%s", self._ai_last_main_word, self._ai_last_anchor)
+                except Exception:
+                    pass
+                st = build_ai_state_dict(self.board, self.ai_rack, self.human_score, self.ai_score, turn="AI")
+                compact = (
+                    "grid:\n" + "\n".join(st["grid"]) +
+                    f"\nblanks:{st['blanks']}\n"
+                    f"ai_rack:{st['ai_rack']}\n"
+                    f"scores: H={st['human_score']} AI={st['ai_score']}\nturn:{st['turn']}\n"
+                )
+                hint = (
+                    f"Your previous move created an invalid glued word '{self._ai_last_main_word}' by attaching to existing '{self._ai_last_anchor}'. "
+                    "Propose a different move that forms a single valid English word; prefer proper hooks or overlaps. Return JSON only."
+                )
+                try:
+                    new_prop = ai_propose_move(self.ai_client if self.ai_client else OpenAIClient(), compact_state=compact, retry_hint=hint)
+                except Exception as e:  # noqa: BLE001
+                    self._on_ai_fail(e)
+                    return
+                self._on_ai_proposal(new_prop)
+                return
+            # inak: pass
+            self.board.clear_letters(getattr(self, "_ai_ps2"))
+            self._ai_thinking = False
+            self._enable_human_inputs()
+            self.status.showMessage("AI navrhla neplatné slovo — pass")
+            self._consecutive_passes += 1
+            self._check_endgame()
+            return
+        # validne: spocitaj, aplikuj prémie, refill
+        words_coords = self._ai_judge_words_coords
+        ps2 = self._ai_ps2
+        total, _bd = score_words(self.board, ps2, words_coords)
+        # rozpis pre UI (posledny tah = AI tah)
+        self._last_move_breakdown = [(bd.word, bd.base_points, bd.letter_bonus_points, bd.word_multiplier, bd.total) for bd in _bd]
+        self._last_move_bingo = (len(ps2) == 7)
+        self.board_view.set_last_move_cells([(p.row, p.col) for p in ps2])
+        if len(ps2) == 7:
+            total += 50
+        apply_premium_consumption(self.board, ps2)
+        self.ai_score += total
+        # spotrebuj rack AI a doplň z tašky
+        before = "".join(self.ai_rack)
+        used = ",".join(p.letter for p in ps2)
+        new_rack = consume_rack(self.ai_rack, ps2)
+        draw_cnt = max(0, 7 - len(new_rack))
+        drawn = self.bag.draw(draw_cnt) if draw_cnt > 0 else []
+        new_rack.extend(drawn)
+        self.ai_rack = new_rack
+        try:
+            log.info(
+                'rack_update side=ai used="%s" before="%s" after="%s" drawn=%s bag_remaining=%s',
+                used,
+                before,
+                "".join(self.ai_rack),
+                len(drawn),
+                self.bag.remaining(),
+            )
+        except Exception:
+            pass
+        self._update_scores_label()
+        self._ai_thinking = False
+        self._enable_human_inputs()
+        self.status.showMessage("Hrá hráč…")
+        self._consecutive_passes = 0
+        if self._ai_opening_active:
+            try:
+                log.info("ai_opening done result=%s", "applied")
+            except Exception:
+                pass
+            self._ai_opening_active = False
+        self._check_endgame()
+
+    def _on_ai_judge_fail(self, e: Exception) -> None:
+        self._spinner_timer.stop()
+        self._show_judge_status = False
+        log.exception("AI judge zlyhal: %s", e)
+        self.board.clear_letters(getattr(self, "_ai_ps2", []))
+        self._ai_thinking = False
+        self._enable_human_inputs()
+        self.status.showMessage("AI pasuje (chyba rozhodcu)")
+        self._consecutive_passes += 1
+        if self._ai_opening_active:
+            try:
+                log.info("ai_opening done result=%s", "invalid_retry_pass" if self._ai_retry_used else "pass")
+            except Exception:
+                pass
+            self._ai_opening_active = False
+        self._check_endgame()
+
+    def _check_endgame(self) -> None:
+        # 2x pas oboch pri prazdnej taske
+        if self.bag.remaining() == 0 and self._consecutive_passes >= 2:
+            QMessageBox.information(self, "Koniec", "Obaja pasovali 2×. Koniec hry.")
+            return
+        # niekto vylozil vsetky kamene a taska je prazdna => koniec s odpoctami
+        if self.bag.remaining() == 0 and (len(self.human_rack) == 0 or len(self.ai_rack) == 0):
+            human_left = sum(TILE_POINTS.get(ch, 0) for ch in self.human_rack)
+            ai_left = sum(TILE_POINTS.get(ch, 0) for ch in self.ai_rack)
+            if len(self.human_rack) == 0:
+                # clovek skoncil: AI odcita, clovek pripočíta
+                self.ai_score -= ai_left
+                self.human_score += ai_left
+                winner = "Hráč"
+            else:
+                self.human_score -= human_left
+                self.ai_score += human_left
+                winner = "AI"
+            self._update_scores_label()
+            QMessageBox.information(self, "Koniec", f"Koniec hry. Víťaz: {winner}")
+            return
+
+    def open_settings(self) -> None:
+        dlg = SettingsDialog(self, repro_mode=self.repro_mode, repro_seed=self.repro_seed, offline_enabled=self.offline_enabled)
+        # inicializuj Dictionary Info sekciu
+        cache_path = get_default_enable_cache_path()
+        try:
+            if os.path.exists(cache_path):
+                # zozbieraj meta
+                try:
+                    st = os.stat(cache_path)
+                    size_mb = st.st_size / (1024*1024)
+                    import datetime
+                    from datetime import timezone as _tz
+                    mtime = datetime.datetime.fromtimestamp(st.st_mtime, tz=_tz.utc).strftime("%Y-%m-%d %H:%M")
+                except Exception:
+                    size_mb = 0.0
+                    mtime = "-"
+                # počet entries ak máme načítaný judge
+                entries = "-"
+                try:
+                    if self.offline_judge is None:
+                        # načítaj, ale neprepínaj režim
+                        judge_tmp = OfflineJudge.from_path(cache_path)
+                        entries = str(judge_tmp.count())
+                    else:
+                        entries = str(self.offline_judge.count())
+                except Exception:
+                    entries = "-"
+                dlg.dict_entries.setText(f"Entries: {entries}")
+                dlg.dict_size.setText(f"File size: {size_mb:.2f} MB")
+                dlg.dict_mtime.setText(f"Updated: {mtime}")
+                dlg.dict_path.setText(cache_path)
+            else:
+                dlg.dict_entries.setText("Entries: Not downloaded")
+                dlg.dict_size.setText("File size: -")
+                dlg.dict_mtime.setText("Updated: -")
+                dlg.dict_path.setText(cache_path)
+        except Exception:
+            pass
+
+        # handlery tlačidiel
+        def _open_folder() -> None:
+            folder = os.path.dirname(cache_path)
+            try:
+                import subprocess, platform
+                if platform.system() == "Darwin":
+                    subprocess.Popen(["open", folder])
+                elif platform.system() == "Windows":
+                    subprocess.Popen(["explorer", folder])
+                else:
+                    subprocess.Popen(["xdg-open", folder])
+            except Exception:
+                QMessageBox.information(self, "Open folder", folder)
+
+        def _redo_download() -> None:
+            # spusti modálny download a po úspechu reloadni judge a UI
+            url_env = os.getenv("OFFLINE_JUDGE_URL", "")
+            url_to_use = [u.strip() for u in url_env.split(",") if u.strip()] if url_env else []
+            dlg_dl = DownloadProgressDialog(url_to_use, cache_path, self)
+            dlg_dl.start()
+            dlg_dl.exec()
+            if not dlg_dl.ok:
+                QMessageBox.critical(self, "Sťahovanie zlyhalo", dlg_dl.error or "Neznáma chyba")
+                return
+            # reload judge a meta
+            try:
+                self.offline_judge = OfflineJudge.from_path(cache_path)
+                self.offline_enabled = True
+                log.info("offline_download redo bytes=%s", os.stat(cache_path).st_size)
+                # refresh info
+                st = os.stat(cache_path)
+                size_mb = st.st_size / (1024*1024)
+                import datetime
+                from datetime import timezone as _tz2
+                mtime = datetime.datetime.fromtimestamp(st.st_mtime, tz=_tz2.utc).strftime("%Y-%m-%d %H:%M")
+                dlg.dict_entries.setText(f"Entries: {self.offline_judge.count()}")
+                dlg.dict_size.setText(f"File size: {size_mb:.2f} MB")
+                dlg.dict_mtime.setText(f"Updated: {mtime}")
+                dlg.dict_path.setText(cache_path)
+                dlg.offline_check.setChecked(True)
+                os.environ["OFFLINE_JUDGE_ENABLED"] = "1"
+                try:
+                    from dotenv import set_key as _set_key7
+                    _set_key7(ENV_PATH, "OFFLINE_JUDGE_ENABLED", "1")
+                except Exception:
+                    pass
+            except Exception as e:  # noqa: BLE001
+                QMessageBox.critical(self, "Chyba", f"Načítanie wordlistu zlyhalo: {e}")
+
+        dlg.btn_openfolder.clicked.connect(_open_folder)
+        dlg.btn_redownload.clicked.connect(_redo_download)
+        ok = dlg.exec()
+        if ok:
+            # po uložení aktualizuj existujúceho klienta, ak je vytvorený
+            try:
+                if self.ai_client is not None:
+                    self.ai_client.ai_move_max_output_tokens = int(os.getenv("AI_MOVE_MAX_OUTPUT_TOKENS", "3600"))
+                    self.ai_client.judge_max_output_tokens = int(os.getenv("JUDGE_MAX_OUTPUT_TOKENS", "800"))
+                # Ulož Repro nastavenia do runtime
+                self.repro_mode = bool(dlg.repro_check.isChecked())
+                try:
+                    self.repro_seed = int(dlg.seed_edit.text().strip() or "0")
+                except ValueError:
+                    self.repro_seed = 0
+                # Offline judge spracovanie: perzistuj presne podľa checkboxu
+                wanted_offline = bool(dlg.offline_check.isChecked())
+                if wanted_offline:
+                    cache_path = get_default_enable_cache_path()
+                    if not os.path.exists(cache_path):
+                        # spusti modálny download s progresom
+                        # povoliť override cez prostredie, ak by default URL menilo polohu
+                        url_env = os.getenv("OFFLINE_JUDGE_URL", "")
+                        # podpora viacerých URL oddelených čiarkou
+                        url_to_use = [u.strip() for u in url_env.split(",") if u.strip()] if url_env else []
+                        dlg_dl = DownloadProgressDialog(url_to_use, cache_path, self)
+                        dlg_dl.start()
+                        dlg_dl.exec()
+                        if not dlg_dl.ok:
+                            from PySide6.QtWidgets import QMessageBox as _QMB
+                            _QMB.critical(self, "Sťahovanie zlyhalo", dlg_dl.error or "Neznáma chyba")
+                            # ponechaj OFF
+                            os.environ["OFFLINE_JUDGE_ENABLED"] = "0"
+                            try:
+                                from dotenv import set_key as _set_key3
+                                _set_key3(ENV_PATH, "OFFLINE_JUDGE_ENABLED", "0")
+                            except Exception:
+                                pass
+                        else:
+                            try:
+                                self.offline_judge = OfflineJudge.from_path(cache_path)
+                                self.offline_enabled = True
+                                os.environ["OFFLINE_JUDGE_ENABLED"] = "1"
+                                try:
+                                    from dotenv import set_key as _set_key4
+                                    _set_key4(ENV_PATH, "OFFLINE_JUDGE_ENABLED", "1")
+                                except Exception:
+                                    pass
+                                self.status.showMessage("Offline judge zapnutý.", 2000)
+                                # Reaplikuj efektívny režim po potvrdení
+                                self._apply_judge_mode(initial=False)
+                            except Exception as e:  # noqa: BLE001
+                                from PySide6.QtWidgets import QMessageBox as _QMB2
+                                _QMB2.critical(self, "Chyba", f"Načítanie wordlistu zlyhalo: {e}")
+                                self.offline_enabled = False
+                                self.offline_judge = None
+                    else:
+                        # načítaj existujúci wordlist
+                        try:
+                            self.offline_judge = OfflineJudge.from_path(cache_path)
+                            self.offline_enabled = True
+                            os.environ["OFFLINE_JUDGE_ENABLED"] = "1"
+                            try:
+                                from dotenv import set_key as _set_key5
+                                _set_key5(ENV_PATH, "OFFLINE_JUDGE_ENABLED", "1")
+                            except Exception:
+                                pass
+                            self.status.showMessage("Offline judge zapnutý.", 2000)
+                            # Reaplikuj efektívny režim po potvrdení
+                            self._apply_judge_mode(initial=False)
+                        except Exception as e:  # noqa: BLE001
+                            from PySide6.QtWidgets import QMessageBox as _QMB3
+                            _QMB3.critical(self, "Chyba", f"Načítanie wordlistu zlyhalo: {e}")
+                            self.offline_enabled = False
+                            self.offline_judge = None
+                else:
+                    # vypni offline mód vždy, ak checkbox je OFF
+                    self.offline_enabled = False
+                    self.offline_judge = None
+                    os.environ["OFFLINE_JUDGE_ENABLED"] = "0"
+                    try:
+                        from dotenv import set_key as _set_key6
+                        _set_key6(ENV_PATH, "OFFLINE_JUDGE_ENABLED", "0")
+                    except Exception:
+                        pass
+                    self.status.showMessage("Offline judge vypnutý.", 2000)
+                    # Reaplikuj efektívny režim po potvrdení
+                    self._apply_judge_mode(initial=False)
+            except Exception:
+                # ak by nastal problém pri konverzii
+                self.status.showMessage("Nastavenia uložené (konverzia limitov zlyhala).", 2000)
+
+    def _set_game_ui_visible(self, visible: bool) -> None:
+        """Prepína panel so skóre a rackom podľa toho, či je aktívna hra."""
+        if visible == self._game_ui_visible:
+            return
+        if visible:
+            self.score_panel.show()
+            self.rack.show()
+            if self._stored_split_sizes:
+                self.split.setSizes(self._stored_split_sizes)
+            self._game_ui_visible = True
+        else:
+            self._stored_split_sizes = self.split.sizes()
+            self.score_panel.hide()
+            self.rack.hide()
+            self.split.setSizes([1, 0])
+            self._game_ui_visible = False
+
+    def _apply_judge_mode(self, initial: bool = False) -> None:
+        """Prepne režim rozhodcu podľa efektívnej konfigurácie (.env + UI toggle).
+
+        Poznámka (SK): UI toggle reprezentuje `self.offline_enabled`. Táto metóda
+        vyhodnotí prioritu .env a nastaví `self.offline_enabled` na výsledok.
+        Ak je offline ON a wordlist existuje, lazy načíta `OfflineJudge`.
+        Pri `initial=True` nemení status bar hlášky (UX zachované cez open_settings()).
+        """
+        try:
+            want_offline = effective_offline_judge(bool(self.offline_enabled))
+        except Exception:
+            want_offline = bool(self.offline_enabled)
+
+        if want_offline:
+            self.offline_enabled = True
+            if self.offline_judge is None:
+                try:
+                    cache_path = get_default_enable_cache_path()
+                    if os.path.exists(cache_path):
+                        self.offline_judge = OfflineJudge.from_path(cache_path)
+                except Exception:
+                    self.offline_judge = None
+        else:
+            self.offline_enabled = False
+            self.offline_judge = None
+
+    def _on_new_or_surrender(self) -> None:
+        if self.act_new.text().startswith("🏳️"):
+            self.surrender()
+        else:
+            self.new_game()
+
+    def show_log(self) -> None:
+        dlg = LogViewerDialog(self, max_lines=500)
+        dlg.exec()
+
+    # ---------- Save/Load ----------
+    def save_game_dialog(self) -> None:
+        from PySide6.QtWidgets import QFileDialog
+        # zruš pending placements (neukladáme dočasné zmeny)
+        if self.pending:
+            self.board.clear_letters(self.pending)
+            self.pending = []
+            self.board_view.set_pending(self.pending)
+            self.rack.set_letters(self.human_rack)
+        from pathlib import Path
+        path, _ = QFileDialog.getSaveFileName(self, "Uložiť hru", str(Path.home()), "JSON (*.json)")
+        if not path:
+            return
+        try:
+            st = build_save_state_dict(
+                board=self.board,
+                human_rack=self.human_rack,
+                ai_rack=self.ai_rack,
+                bag=self.bag,
+                human_score=self.human_score,
+                ai_score=self.ai_score,
+                turn=("AI" if self._ai_thinking else "HUMAN"),
+                last_move_cells=getattr(self.board_view, "_last_move_cells", []),
+                last_move_points=self.last_move_points,
+                consecutive_passes=self._consecutive_passes,
+                repro=self.repro_mode,
+                seed=self.repro_seed,
+            )
+            import json
+            from pathlib import Path
+            with Path(path).open("w", encoding="utf-8") as f:
+                json.dump(st, f, ensure_ascii=False, indent=2)
+            log.info("game_save path=%s schema=1", path)
+            self.status.showMessage("Hra uložená.", 2000)
+        except Exception as e:  # noqa: BLE001
+            log.exception("Save failed: %s", e)
+            QMessageBox.critical(self, "Uložiť", f"Chyba ukladania: {e}")
+
+    def open_game_dialog(self) -> None:
+        from PySide6.QtWidgets import QFileDialog
+        from pathlib import Path
+        path, _ = QFileDialog.getOpenFileName(self, "Otvoriť hru", str(Path.home()), "JSON (*.json)")
+        if not path:
+            return
+        import json
+        from pathlib import Path
+        try:
+            with Path(path).open(encoding="utf-8") as f:
+                data = json.load(f)
+            st = parse_save_state_dict(data)
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.critical(self, "Otvoriť", f"Neplatný súbor: {e}")
+            return
+        try:
+            # obnov board, bag a hodnoty
+            self.board = restore_board_from_save(st, PREMIUMS_PATH)
+            self.board_view.board = self.board
+            self.human_rack = list(st.get("human_rack", ""))
+            self.ai_rack = list(st.get("ai_rack", ""))
+            self.bag = restore_bag_from_save(st)
+            self.human_score = int(st.get("human_score", 0))
+            self.ai_score = int(st.get("ai_score", 0))
+            self.last_move_points = int(st.get("last_move_points", 0))
+            # last move highlight
+            lm = [(pos["row"], pos["col"]) for pos in st.get("last_move_cells", [])]
+            self.board_view.set_last_move_cells(lm)
+            self._consecutive_passes = int(st.get("consecutive_passes", 0))
+            # zruš pending
+            self.pending = []
+            self.board_view.set_pending(self.pending)
+            # repro info
+            self.repro_mode = bool(st.get("repro", False))
+            self.repro_seed = int(st.get("seed", 0))
+            # UI refresh
+            self.rack.set_letters(self.human_rack)
+            self._set_game_ui_visible(True)
+            self._update_scores_label()
+            self.status.showMessage("Hra načítaná.", 2000)
+            log.info("game_load path=%s schema=1", path)
+        except Exception as e:  # noqa: BLE001
+            log.exception("Load failed: %s", e)
+            QMessageBox.critical(self, "Otvoriť", f"Zlyhalo načítanie: {e}")
+
+def main() -> None:
+    app = QApplication(sys.argv)
+
+    # Globálny excepthook: log + toast
+    def _excepthook(exc_type, exc, tb):  # type: ignore[no-untyped-def]
+        from contextlib import suppress
+        with suppress(Exception):
+            logging.getLogger("scrabgpt").exception("Unhandled exception", exc_info=(exc_type, exc, tb))
+        # jednoduchý toast
+        with suppress(Exception):
+            QMessageBox.critical(None, "Neošetrená výnimka", str(exc))
+    sys.excepthook = _excepthook
+
+    w = MainWindow()
+    w.show()
+    sys.exit(app.exec())
+
+if __name__ == "__main__":
+    main()
