@@ -122,6 +122,7 @@ class SaveGameState(TypedDict, total=False):
     Voliteľné:
     - last_move_cells: pozície posledného ťahu na zvýraznenie
     - last_move_points: body získané v poslednom ťahu (pre info panel)
+    - last_move_reason: textový dôvod rozhodcu pre posledný ťah
     - consecutive_passes: počítadlo po sebe idúcich passov
     - human_pass_streak, ai_pass_streak: per-hráč počítadlá passov
     - game_over: či bola partia ukončená
@@ -143,6 +144,7 @@ class SaveGameState(TypedDict, total=False):
     variant: str
     last_move_cells: list[_Pos]
     last_move_points: int
+    last_move_reason: str
     consecutive_passes: int
     human_pass_streak: int
     ai_pass_streak: int
@@ -163,6 +165,7 @@ def build_save_state_dict(
     turn: Literal["HUMAN", "AI"],
     last_move_cells: list[tuple[int, int]] | None = None,
     last_move_points: int = 0,
+    last_move_reason: str = "",
     consecutive_passes: int = 0,
     human_pass_streak: int = 0,
     ai_pass_streak: int = 0,
@@ -209,6 +212,7 @@ def build_save_state_dict(
         variant=str(variant),
         last_move_cells=[{"row": r, "col": c} for (r, c) in (last_move_cells or [])],
         last_move_points=last_move_points,
+        last_move_reason=str(last_move_reason),
         consecutive_passes=consecutive_passes,
         human_pass_streak=human_pass_streak,
         ai_pass_streak=ai_pass_streak,
@@ -268,6 +272,8 @@ def parse_save_state_dict(data: dict[str, Any]) -> SaveGameState:
     last_move_cells = _parse_pos_list("last_move_cells")
     last_move_points = data.get("last_move_points", 0)
     assert isinstance(last_move_points, int)
+    last_move_reason = data.get("last_move_reason", "")
+    assert isinstance(last_move_reason, str)
     consecutive_passes = data.get("consecutive_passes", 0)
     assert isinstance(consecutive_passes, int)
     human_pass_streak = data.get("human_pass_streak", 0)
@@ -297,6 +303,7 @@ def parse_save_state_dict(data: dict[str, Any]) -> SaveGameState:
         variant=variant,
         last_move_cells=last_move_cells,
         last_move_points=last_move_points,
+        last_move_reason=last_move_reason,
         consecutive_passes=consecutive_passes,
         human_pass_streak=human_pass_streak,
         ai_pass_streak=ai_pass_streak,

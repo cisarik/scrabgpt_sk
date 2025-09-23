@@ -92,6 +92,7 @@ def test_round_trip_save_load_preserves_state_and_bag_order() -> None:
     assert st2["turn"] == "HUMAN"
     assert st2["variant"] == bag.variant_slug
     assert st2["last_move_points"] == last_move_points
+    assert st2["last_move_reason"] == ""
     assert st2["consecutive_passes"] == consecutive_passes
     # zvýraznenie posledného ťahu
     lm = {(p.row, p.col) for p in placements}

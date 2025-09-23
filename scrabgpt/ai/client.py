@@ -239,7 +239,8 @@ class OpenAIClient:
                 "Before rejecting a word, actively look for its use in idioms, sayings, "
                 "imperatives, or other fixed Slovak expressions. If you can produce a "
                 "credible natural sentence that uses the exact form as an independent word, "
-                "declare it valid and cite that sentence in the reason. Only label a word "
+                "declare it valid and cite that sentence in the reason. Always return the "
+                "'reason' text strictly in Slovak, even when citing evidence. Only label a word "
                 "invalid when you are confident no such natural usage exists."
             )
         user_prompt = (

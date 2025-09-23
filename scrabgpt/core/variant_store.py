@@ -121,6 +121,14 @@ def _load_variant_from_path(path: Path) -> VariantDefinition:
         if letter in seen:
             log.warning("variant_letter_duplicate path=%s letter=%s", path, letter)
             continue
+        if letter != "?" and len(letter) != 1:
+            log.warning(
+                "variant_letter_multichar path=%s letter=%s len=%s",
+                path,
+                letter,
+                len(letter),
+            )
+            continue
         try:
             count = int(raw.get("count"))
             points = int(raw.get("points"))

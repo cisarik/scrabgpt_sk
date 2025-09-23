@@ -4,6 +4,7 @@ import sys
 import uuid
 import json
 import logging
+import html
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal, Optional, Sequence, cast
@@ -15,7 +16,7 @@ from PySide6.QtWidgets import (
     QToolBar, QLabel, QSplitter, QStatusBar, QMessageBox, QPushButton,
     QDialog, QFormLayout, QLineEdit, QDialogButtonBox, QListWidget, QListWidgetItem,
     QGridLayout, QGraphicsDropShadowEffect, QListView, QPlainTextEdit, QCheckBox,
-    QComboBox
+    QComboBox, QSizePolicy
 )
 from ..logging_setup import configure_logging, TRACE_ID_VAR, default_log_path
 
@@ -984,6 +985,7 @@ class MainWindow(QMainWindow):
         # uloz rozpis posledneho tahu a bingo flag pre UI
         self._last_move_breakdown: list[tuple[str, int, int, int, int]] = []  # (word, base, letter_bonus, word_mult, total)
         self._last_move_bingo: bool = False
+        self._last_move_reason: str = ""
 
         # Repro mód nastavenia (iba runtime)
         # Pozn.: Nastavuje sa v dialógu Nastavenia a používa pri "Nová hra".
@@ -1056,17 +1058,33 @@ class MainWindow(QMainWindow):
         shadow_last.setColor(QColor(0, 0, 0, 130))
         self.lbl_last_breakdown.setGraphicsEffect(shadow_last)
         spv.addWidget(self.lbl_last_breakdown)
+        self.lbl_last_reason = QLabel("")
+        self.lbl_last_reason.setWordWrap(True)
+        self.lbl_last_reason.setStyleSheet(
+            "QLabel{font-size:15px;color:#e8e8e8;}"
+        )
+        self.lbl_last_reason.hide()
+        spv.addWidget(self.lbl_last_reason)
         self.btn_reroll = QPushButton("Opakovať žreb")
         self.btn_reroll.clicked.connect(self._on_repeat_starter_draw)
         spv.addWidget(self.btn_reroll)
-        self.btn_confirm = QPushButton("Potvrdiť ťah")
-        self.btn_confirm.clicked.connect(self.confirm_move)
-        spv.addWidget(self.btn_confirm)
+        spv.addStretch(1)
+        actions_row = QHBoxLayout()
+        actions_row.setContentsMargins(0, 0, 0, 0)
+        actions_row.setSpacing(6)
         self.btn_exchange = QPushButton("Vymeniť")
         self.btn_exchange.clicked.connect(self.exchange_human)
-        spv.addWidget(self.btn_exchange)
+        self.btn_exchange.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        actions_row.addWidget(self.btn_exchange)
+        self.btn_confirm = QPushButton("Potvrdiť ťah")
+        self.btn_confirm.clicked.connect(self.confirm_move)
+        self.btn_confirm.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.btn_confirm.setMinimumHeight(40)
+        actions_row.addWidget(self.btn_confirm)
+        self.actions_container = QWidget(self.score_panel)
+        self.actions_container.setLayout(actions_row)
+        spv.addWidget(self.actions_container)
         self.btn_reroll.hide()
-        spv.addStretch(1)
         self.split.addWidget(self.score_panel)
         self.split.setSizes([700, 300])
         self._stored_split_sizes: list[int] = self.split.sizes()
@@ -1184,6 +1202,7 @@ class MainWindow(QMainWindow):
         self.last_move_points = 0
         self._last_move_breakdown = []
         self._last_move_bingo = False
+        self._last_move_reason = ""
         self.board_view.set_last_move_cells([])
         self._update_scores_label()
         self.act_new.setText("🏳️ Vzdať sa")
@@ -1307,6 +1326,7 @@ class MainWindow(QMainWindow):
         self.last_move_points = 0
         self._last_move_breakdown = []
         self._last_move_bingo = False
+        self._last_move_reason = ""
         self._pending_words_coords = []
         self._consecutive_passes = 0
         self._pass_streak = {"HUMAN": 0, "AI": 0}
@@ -1323,28 +1343,77 @@ class MainWindow(QMainWindow):
 
     def _update_scores_label(self) -> None:
         self.lbl_scores.setText(
-            f"<div>Skóre — Hráč: <b>{self.human_score}</b> | AI: <b>{self.ai_score}</b></div>"
-            f"<div>Taška: {self.bag.remaining()}</div>"
+            f"<div>Hráč: <b>{self.human_score}</b> | AI: <b>{self.ai_score}</b></div><br/>"
         )
         self._update_last_move_breakdown_ui()
+        self._update_last_move_reason_ui()
 
     def _update_last_move_breakdown_ui(self) -> None:
         """Aktualizuje panel rozpisu 'Posledný ťah'."""
         if not self._last_move_breakdown and not self._last_move_bingo:
-            self.lbl_last_breakdown.setText("<div style='margin-bottom:6px'>Posledný ťah: -</div>")
+            self.lbl_last_breakdown.setText("")
             return
         lines: list[str] = []
         for (w, base, lb, mult, total) in self._last_move_breakdown:
             line = (
-                f"<span style='font-weight:bold'>{w}</span>: základ {base}, "
+                f"<span style='font-weight:bold'>{w}</span>: <br/>základ {base}, "
                 f"písmená +{lb}, násobok ×{mult} → <span style='font-weight:bold'>{total}</span>"
             )
             lines.append(line)
         if self._last_move_bingo:
             lines.append("<span style='color:#9cff9c'>+50 bingo</span>")
-        html = "<br/>".join(lines)
-        prefix = f"Posledný ťah: +{self.last_move_points}" if self.last_move_points else "Posledný ťah:"
-        self.lbl_last_breakdown.setText(f"<div style='margin-bottom:6px'>{prefix}</div>{html}")
+        html_lines = "<br/>".join(lines)
+        prefix = f"Posledný ťah:<br/>"
+        self.lbl_last_breakdown.setText(f"<div style='margin-bottom:6px'>{prefix}</div>{html_lines}")
+
+    def _update_last_move_reason_ui(self) -> None:
+        """Zobrazí alebo schová dôvod rozhodcu pre posledný platný ťah."""
+        reason = self._last_move_reason.strip()
+        if not reason:
+            self.lbl_last_reason.hide()
+            self.lbl_last_reason.setText("")
+            return
+        escaped = html.escape(reason).replace("\n", "<br/>")
+        self.lbl_last_reason.setText(
+            "<div style='margin:6px 0 0 0'><span style='font-weight:bold'>Dôvod rozhodcu:</span><br/>"
+            f"{escaped}</div>"
+        )
+        self.lbl_last_reason.show()
+
+    def _set_last_move_reason(self, reason: str) -> None:
+        """Uloží dôvod rozhodcu k poslednému platnému ťahu a refreshne UI."""
+        self._last_move_reason = reason.strip()
+        self._update_last_move_reason_ui()
+
+    @staticmethod
+    def _extract_reason_from_entries(
+        entries: list[dict[str, Any]],
+        preferred_word: str | None = None,
+    ) -> str:
+        """Vyberie najrelevantnejší dôvod z odpovede rozhodcu."""
+        preferred_cf = preferred_word.casefold() if preferred_word else None
+        fallback_reason = ""
+        for entry in entries:
+            if not bool(entry.get("valid", False)):
+                continue
+            reason = str(entry.get("reason", "")).strip()
+            if not reason:
+                continue
+            word = str(entry.get("word", ""))
+            if preferred_cf and word.casefold() == preferred_cf:
+                return reason
+            if not fallback_reason:
+                fallback_reason = reason
+        return fallback_reason
+
+    @staticmethod
+    def _format_judge_status(words: list[str]) -> str:
+        if not words:
+            return "Rozhoduje rozhodca"
+        if len(words) == 1:
+            return f"Rozhodca rozhoduje slovo {words[0]}"
+        joined = ", ".join(words)
+        return f"Rozhodca rozhoduje slová: {joined}"
 
     def _append_pending_tile(self, placement: Placement) -> None:
         """Pridá dočasne položené písmeno a refreshne UI."""
@@ -1623,7 +1692,8 @@ class MainWindow(QMainWindow):
         words = [wf.word for wf in words_found]
         log.info("Rozhodca overuje slová: %s", words)
         # spusti spinner (online judge)
-        self._start_status_spinner("judge", "Rozhoduje rozhodca", wait_cursor=True)
+        judge_status = self._format_judge_status(words)
+        self._start_status_spinner("judge", judge_status, wait_cursor=True)
 
         # lazy init klienta
         if self.ai_client is None:
@@ -1688,6 +1758,11 @@ class MainWindow(QMainWindow):
 
         # validne: spocitaj skore + bingo, aplikuj prémie a dopln rack
         words_coords = getattr(self, "_pending_words_coords")
+        main_word = ""
+        if words_coords:
+            main_word = max(words_coords, key=lambda item: len(item[0]))[0]
+        reason_text = self._extract_reason_from_entries(entries, main_word)
+        self._set_last_move_reason(reason_text)
         total, _bd = score_words(self.board, self.pending, words_coords)
         # uloz rozpis pre UI
         self._last_move_breakdown = [(bd.word, bd.base_points, bd.letter_bonus_points, bd.word_multiplier, bd.total) for bd in _bd]
@@ -2119,7 +2194,8 @@ class MainWindow(QMainWindow):
         self._ai_judge_words_coords = words_coords
         self._ai_ps2 = ps2
         # spusti spinner pre online rozhodovanie AI
-        self._start_status_spinner("judge", "Rozhoduje rozhodca", wait_cursor=True)
+        judge_status = self._format_judge_status(words)
+        self._start_status_spinner("judge", judge_status, wait_cursor=True)
         self._ai_judge_thread = QThread(self)
         self._ai_judge_worker = JudgeWorker(
             self.ai_client if self.ai_client else OpenAIClient(),
@@ -2215,6 +2291,8 @@ class MainWindow(QMainWindow):
         # validne: spocitaj, aplikuj prémie, refill
         words_coords = self._ai_judge_words_coords
         ps2 = self._ai_ps2
+        reason_text = self._extract_reason_from_entries(entries, self._ai_last_main_word or "")
+        self._set_last_move_reason(reason_text)
         total, _bd = score_words(self.board, ps2, words_coords)
         # rozpis pre UI (posledny tah = AI tah)
         self._last_move_breakdown = [(bd.word, bd.base_points, bd.letter_bonus_points, bd.word_multiplier, bd.total) for bd in _bd]
@@ -2407,6 +2485,7 @@ class MainWindow(QMainWindow):
                 turn=("AI" if self._ai_thinking else "HUMAN"),
                 last_move_cells=getattr(self.board_view, "_last_move_cells", []),
                 last_move_points=self.last_move_points,
+                last_move_reason=self._last_move_reason,
                 consecutive_passes=self._consecutive_passes,
                 human_pass_streak=self._pass_streak.get("HUMAN", 0),
                 ai_pass_streak=self._pass_streak.get("AI", 0),
@@ -2474,6 +2553,7 @@ class MainWindow(QMainWindow):
             # repro info
             self.repro_mode = bool(st.get("repro", False))
             self.repro_seed = int(st.get("seed", 0))
+            self._last_move_reason = str(st.get("last_move_reason", ""))
             # UI refresh
             self.rack.set_letters(self.human_rack)
             self._set_game_ui_visible(True)
