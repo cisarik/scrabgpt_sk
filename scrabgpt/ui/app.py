@@ -1539,6 +1539,41 @@ class MainWindow(QMainWindow):
                     return True
         return False
 
+    def _parse_blank_map(
+        self, blanks_obj: object
+    ) -> tuple[dict[tuple[int, int], str], Optional[str]]:
+        """Normalizuje mapovanie blankov zo schémy AI na interný formát."""
+
+        blank_map: dict[tuple[int, int], str] = {}
+        if blanks_obj is None:
+            return blank_map, None
+        if isinstance(blanks_obj, dict):
+            try:
+                for key, value in blanks_obj.items():
+                    if not isinstance(key, str):
+                        return {}, "Blanks položky majú zlý formát."
+                    row_str, col_str = (part.strip() for part in key.split(",", 1))
+                    row = int(row_str)
+                    col = int(col_str)
+                    blank_map[(row, col)] = str(value)
+            except Exception:
+                return {}, "Blanks položky majú zlý formát."
+            return blank_map, None
+        if isinstance(blanks_obj, list):
+            try:
+                for item in blanks_obj:
+                    if not ("row" in item and "col" in item and "as" in item):
+                        return {}, "Blanks položky majú zlý formát."
+                    row = int(item["row"])
+                    col = int(item["col"])
+                    blank_map[(row, col)] = str(item["as"])
+            except Exception:
+                return {}, "Blanks položky majú zlý formát."
+            return blank_map, None
+        if blanks_obj in ({}, []):
+            return blank_map, None
+        return {}, "Blanks položky majú zlý formát."
+
     def _register_scoreless_turn(self, side: StarterSide) -> None:
         self._pass_streak[side] = self._pass_streak.get(side, 0) + 1
         self._consecutive_passes += 1
@@ -1827,16 +1862,10 @@ class MainWindow(QMainWindow):
         if dir_ is None:
             return "AI ťah nie je v jednej línii."
         # dopln blank_as z response ak je
-        blanks = proposal.get("blanks", [])
-        blank_map: dict[tuple[int,int], str] = {}
-        if isinstance(blanks, list):
-            for b in blanks:
-                if not ("row" in b and "col" in b and "as" in b):
-                    return "Blanks položky majú zlý formát."
-                rr = int(b["row"])
-                cc = int(b["col"])
-                ch = str(b["as"])
-                blank_map[(rr, cc)] = ch
+        blanks = proposal.get("blanks")
+        blank_map, blank_err = self._parse_blank_map(blanks)
+        if blank_err is not None:
+            return blank_err
         # skontroluj diery s ohladom na existujuce pismena
         if not no_gaps_in_line(self.board, ps, dir_):
             return "AI ťah má diery."
@@ -1948,14 +1977,8 @@ class MainWindow(QMainWindow):
             Placement(int(p["row"]), int(p["col"]), str(p["letter"]))
             for p in placements_list
         ]
-        blanks = proposal.get("blanks", [])
-        blank_map: dict[tuple[int, int], str] = {}
-        if isinstance(blanks, list):
-            for b in cast(list[dict[str, Any]], blanks):
-                rr = int(b["row"])
-                cc = int(b["col"])
-                ch = str(b["as"])
-                blank_map[(rr, cc)] = ch
+        blanks = proposal.get("blanks")
+        blank_map, _ = self._parse_blank_map(blanks)
         # nastav blank_as; ak AI oznacila v `blanks`, prekonvertuj na '?'
         ps2: list[Placement] = []
         for p in ps:

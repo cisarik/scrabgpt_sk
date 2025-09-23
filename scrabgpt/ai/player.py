@@ -83,8 +83,8 @@ def _build_prompt(compact_state: str, variant: VariantDefinition, retry_hint: st
             + " Prioritize TL/DL for high-value letters and aim to span DW/TW "
               "with the main word when possible; stacking letter multipliers "
               "that feed into word multipliers yields maximal score. "
-              "Prefer TW (x3 word) if reachable, or combine multiple word multipliers "
-              "in one move when legal (e.g., DW+DW=4x, TW+TW=9x). Also value high-scoring "
+              "Prefer TW (x3 word) and DW (x2 word) if reachable and combine word multiplier with letter multipiers "
+              "in one move when legal. Also value high-scoring "
               "cross-words created by your placements."
         )
 
