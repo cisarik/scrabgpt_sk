@@ -36,7 +36,7 @@ from ..ai.client import OpenAIClient, TokenBudgetExceededError
 from ..ai.player import propose_move as ai_propose_move
 from ..ai.player import should_auto_trigger_ai_opening, is_board_empty
 from ..core.state import build_ai_state_dict
-from ..core.rack import consume_rack
+from ..core.rack import consume_rack, restore_rack
 from ..core.state import build_save_state_dict, parse_save_state_dict, restore_board_from_save, restore_bag_from_save
 from ..core.variant_store import (
     VariantDefinition,
@@ -1672,11 +1672,13 @@ class MainWindow(QMainWindow):
                     bad = str(it.get("word", ""))
                     bad_reason = str(it.get("reason", ""))
                     break
-            # zmaz docasne (rack ostáva nezmenený)
+            # zmaž dočasné a vráť písmená na rack
             self.board.clear_letters(self.pending)
+            self.human_rack = restore_rack(self.human_rack, self.pending)
             self.pending = []
             self.rack.set_letters(self.human_rack)
             self.board_view.set_pending(self.pending)
+            self._pending_words_coords = []
             self.status.showMessage("Hrá hráč…")
             msg = f"Neplatné slovo: {bad}" if bad else "Neplatný ťah"
             if bad_reason:
@@ -1731,9 +1733,11 @@ class MainWindow(QMainWindow):
     def _on_judge_fail(self, e: Exception) -> None:
         self._stop_status_spinner("judge")
         log.exception("Rozhodca zlyhal: %s", e)
-        # vrat dosku do stavu pred potvrdenim (rack ostáva nezmenený)
+        # vráť dosku do stavu pred potvrdením a pridaj písmená späť na rack
         self.board.clear_letters(self.pending)
+        self.human_rack = restore_rack(self.human_rack, self.pending)
         self.pending = []
+        self._pending_words_coords = []
         self.rack.set_letters(self.human_rack)
         self.board_view.set_pending(self.pending)
         self.status.showMessage("Hrá hráč…")
@@ -2381,9 +2385,10 @@ class MainWindow(QMainWindow):
     # ---------- Save/Load ----------
     def save_game_dialog(self) -> None:
         from PySide6.QtWidgets import QFileDialog
-        # zruš pending placements (neukladáme dočasné zmeny)
+        # zruš pending placements a vráť písmená (neukladáme dočasné zmeny)
         if self.pending:
             self.board.clear_letters(self.pending)
+            self.human_rack = restore_rack(self.human_rack, self.pending)
             self.pending = []
             self.board_view.set_pending(self.pending)
             self.rack.set_letters(self.human_rack)

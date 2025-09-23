@@ -72,3 +72,18 @@ def consume_rack(rack: list[str], placements: list[Placement]) -> list[str]:
     return [c for i, c in enumerate(rack) if i not in selected_indices]
 
 
+def restore_rack(rack: list[str], placements: list[Placement]) -> list[str]:
+    """Vráti písmená z `placements` späť na rack bez mutácie vstupu.
+
+    - Zachováva poradie už existujúcich písmen na racku.
+    - Nové (vrátené) písmená sa pridajú na koniec v poradí, v akom boli
+      dočasne položené.
+    - Blank zostane reprezentovaný ako '?' bez ohľadu na `blank_as`.
+    """
+
+    restored = rack.copy()
+    for placement in placements:
+        letter = "?" if placement.letter == "?" else placement.letter
+        restored.append(letter)
+    return restored
+

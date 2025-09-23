@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from scrabgpt.core.rack import consume_rack
+from scrabgpt.core.rack import consume_rack, restore_rack
 from scrabgpt.core.types import Placement
 from scrabgpt.core.tiles import TileBag
 
@@ -45,4 +45,35 @@ def test_refill_from_bag_seeded() -> None:
     assert len(refilled) == len(rack)
     assert bag.remaining() == before_remaining - k
 
+
+def test_restore_rack_returns_pending_letters() -> None:
+    rack = list("AEIRST?")
+    mutated = rack.copy()
+    # simuluj UI – po položení odstránime konkrétne písmená z racku
+    mutated.remove("A")
+    mutated.remove("?")
+    placements = [
+        Placement(row=7, col=7, letter="A"),
+        Placement(row=7, col=8, letter="?", blank_as="E"),
+    ]
+    restored = restore_rack(mutated, placements)
+    assert restored[:len(mutated)] == mutated
+    assert restored[-2:] == ["A", "?"]
+    assert sorted(restored) == sorted(rack)
+
+
+def test_restore_rack_handles_duplicates() -> None:
+    rack = list("AABBCD")
+    mutated = rack.copy()
+    mutated.remove("A")
+    mutated.remove("B")
+    mutated.remove("B")
+    placements = [
+        Placement(row=7, col=7, letter="A"),
+        Placement(row=7, col=8, letter="B"),
+        Placement(row=7, col=9, letter="B"),
+    ]
+    restored = restore_rack(mutated, placements)
+    assert sorted(restored) == sorted(rack)
+    assert restored[-3:] == ["A", "B", "B"]
 

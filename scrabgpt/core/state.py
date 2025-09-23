@@ -8,7 +8,7 @@ from __future__ import annotations
 from typing import Any, Literal, TypedDict
 
 from .board import Board
-from .tiles import TileBag
+from .tiles import TileBag, get_tile_distribution
 from .variant_store import get_active_variant_slug
 
 
@@ -337,7 +337,32 @@ def restore_board_from_save(state: SaveGameState, premiums_path: str) -> Board:
 def restore_bag_from_save(state: SaveGameState) -> TileBag:
     """Z `SaveGameState` v1 zloží `TileBag` so zachovaným poradím kameňov."""
     # Dôležité: pri poskytnutých `tiles` sa taška už nesmie premiešať
-    letters = list(state["bag"]) if state.get("bag") else []
+    bag_serialized = state.get("bag", "")
     seed = state.get("seed", 0)
-    variant = state.get("variant")
-    return TileBag(seed=seed, tiles=letters, variant=variant)
+    variant_slug = state.get("variant")
+
+    def _parse_bag(serialized: str) -> list[str]:
+        if not serialized:
+            return []
+        distribution = get_tile_distribution(variant_slug)
+        symbols = sorted(distribution.keys(), key=len, reverse=True)
+        if "?" not in distribution:
+            symbols.append("?")
+        result: list[str] = []
+        idx = 0
+        length = len(serialized)
+        while idx < length:
+            matched = None
+            for symbol in symbols:
+                if serialized.startswith(symbol, idx):
+                    matched = symbol
+                    idx += len(symbol)
+                    break
+            if matched is None:
+                matched = serialized[idx]
+                idx += 1
+            result.append(matched)
+        return result
+
+    letters = _parse_bag(bag_serialized)
+    return TileBag(seed=seed, tiles=letters, variant=variant_slug)

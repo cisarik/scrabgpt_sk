@@ -6,6 +6,7 @@ from scrabgpt.core.board import Board
 from scrabgpt.core.scoring import apply_premium_consumption
 from scrabgpt.core.state import (
     build_save_state_dict,
+    SaveGameState,
     parse_save_state_dict,
     restore_bag_from_save,
     restore_board_from_save,
@@ -97,3 +98,23 @@ def test_round_trip_save_load_preserves_state_and_bag_order() -> None:
     lm2 = {(pos["row"], pos["col"]) for pos in st2["last_move_cells"]}
     assert lm == lm2
 
+
+def test_restore_bag_from_save_handles_multichar_tiles() -> None:
+    state: SaveGameState = {
+        "schema_version": "1",
+        "grid": ["." * 15 for _ in range(15)],
+        "blanks": [],
+        "premium_used": [],
+        "human_rack": "",
+        "ai_rack": "",
+        "bag": "CHAA",
+        "human_score": 0,
+        "ai_score": 0,
+        "turn": "HUMAN",
+        "variant": "slovak-2",
+        "seed": 42,
+    }
+
+    bag = restore_bag_from_save(state)
+    assert bag.tiles[:3] == ["CH", "A", "A"]
+    assert bag.variant_slug == "slovak-2"
