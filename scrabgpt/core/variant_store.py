@@ -14,6 +14,9 @@ log = logging.getLogger("scrabgpt.variants")
 
 _VARIANTS_SUBDIR = "variants"
 _DEFAULT_VARIANT_SLUG = "english"
+_ROOT_DIR = Path(__file__).resolve().parents[2]
+_ENV_PATH = _ROOT_DIR / ".env"
+_ENV_LOADED = False
 
 
 @dataclass(frozen=True)
@@ -60,6 +63,31 @@ def _variants_dir() -> Path:
 def _variant_path(slug: str) -> Path:
     slug_norm = slugify(slug)
     return _variants_dir() / f"{slug_norm}.json"
+
+
+def _ensure_env_loaded() -> None:
+    """Ensure values from .env are present in the process environment."""
+
+    global _ENV_LOADED
+    if _ENV_LOADED:
+        return
+    try:
+        from dotenv import load_dotenv
+    except Exception:  # python-dotenv is an optional dependency in some contexts
+        _ENV_LOADED = True
+        return
+
+    try:
+        if _ENV_PATH.exists():
+            load_dotenv(_ENV_PATH, override=False)
+        else:
+            # Fall back to default search to support alternate layouts during tests
+            load_dotenv(override=False)
+    except Exception:
+        # Loading .env is a best-effort; missing or malformed files should not crash startup
+        pass
+    finally:
+        _ENV_LOADED = True
 
 
 def slugify(text: str) -> str:
@@ -222,6 +250,7 @@ def save_variant(defn: VariantDefinition) -> Path:
 
 def get_active_variant_slug() -> str:
     ensure_builtin_variant()
+    _ensure_env_loaded()
     slug = slugify(Path(_variant_path(_DEFAULT_VARIANT_SLUG)).stem)
     from os import getenv
 
@@ -235,10 +264,25 @@ def get_active_variant_slug() -> str:
 
 def set_active_variant_slug(slug: str) -> VariantDefinition:
     ensure_builtin_variant()
+    _ensure_env_loaded()
     definition = load_variant(slug)
     from os import environ
 
     environ["SCRABBLE_VARIANT"] = definition.slug
+
+    try:
+        from dotenv import set_key as _dotenv_set_key
+    except Exception:
+        return definition
+
+    try:
+        _ENV_PATH.parent.mkdir(parents=True, exist_ok=True)
+        if not _ENV_PATH.exists():
+            _ENV_PATH.touch()
+        _dotenv_set_key(str(_ENV_PATH), "SCRABBLE_VARIANT", definition.slug)
+    except Exception:
+        # Persisting to .env is best-effort; runtime environment already reflects the change.
+        pass
     return definition
 
 

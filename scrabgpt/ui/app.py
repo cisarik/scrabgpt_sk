@@ -5,6 +5,7 @@ import uuid
 import json
 import logging
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any, Literal, Optional, Sequence, cast
 from pathlib import Path
 from PySide6.QtCore import Qt, QSize, QRectF, QTimer, Signal, QObject, QThread, QPoint, QMimeData
@@ -63,6 +64,12 @@ TILE_MIME = "application/x-scrabgpt-tile"
 
 # Typ alias pre strany pri určovaní štartéra
 StarterSide = Literal["HUMAN", "AI"]
+
+@dataclass(frozen=True)
+class _SpinnerEntry:
+    owner: str
+    base_text: str
+    wait_cursor: bool
 
 # ---------- Logging + trace_id ----------
 # Použi centralizovanú konfiguráciu (zabráni duplicitám handlerov)
@@ -1069,12 +1076,13 @@ class MainWindow(QMainWindow):
         # zobrazi prazdny rack, kym sa nespusti nova hra
         self.rack.set_letters(self.human_rack)
 
-        # status spinner pri rozhodcovi
+        # status spinner pri čakaní (AI/rozhodca)
         self._spinner_timer = QTimer(self)
         self._spinner_timer.setInterval(300)
         self._spinner_timer.timeout.connect(self._on_spinner_tick)
         self._spinner_phase = 0
-        self._show_judge_status: bool = False
+        self._spinner_stack: list[_SpinnerEntry] = []
+        self._wait_cursor_depth = 0
         self._ai_thinking: bool = False
         # Guard pre otvárací ťah AI (zabraňuje dvojitému volaniu pri štarte)
         self._ai_opening_active: bool = False
@@ -1256,8 +1264,7 @@ class MainWindow(QMainWindow):
     def _reset_to_idle_state(self) -> None:
         """Vráti aplikáciu do východzieho stavu pred spustením hry."""
         # zastav animácie/spinner a ukonči rozbehnuté vlákna
-        self._spinner_timer.stop()
-        self._show_judge_status = False
+        self._clear_spinner_state()
         self._ai_thinking = False
         self._ai_opening_active = False
         self._starter_side = None
@@ -1453,11 +1460,76 @@ class MainWindow(QMainWindow):
         self.board.clear_letters(self.pending)
         self.status.showMessage(f"Ghost skóre: {score}")
 
-    def _on_spinner_tick(self) -> None:
+    def _set_wait_cursor_active(self, active: bool) -> None:
+        if active:
+            if self._wait_cursor_depth == 0:
+                QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            self._wait_cursor_depth += 1
+            return
+        if self._wait_cursor_depth <= 0:
+            self._wait_cursor_depth = 0
+            return
+        self._wait_cursor_depth -= 1
+        if self._wait_cursor_depth == 0:
+            try:
+                QApplication.restoreOverrideCursor()
+            except Exception:
+                pass
+
+    def _emit_spinner_message(self) -> None:
+        if not self._spinner_stack:
+            return
+        entry = self._spinner_stack[-1]
+        if not entry.base_text:
+            return
         dots = "." * (1 + (self._spinner_phase % 3))
-        # Zobraz text rozhodcu iba ak prebieha online rozhodovanie
-        if self._show_judge_status:
-            self.status.showMessage(f"Rozhoduje rozhodca{dots}")
+        self.status.showMessage(f"{entry.base_text}{dots}")
+
+    def _start_status_spinner(self, owner: str, base_text: str, *, wait_cursor: bool) -> None:
+        for idx, entry in enumerate(self._spinner_stack):
+            if entry.owner == owner:
+                removed = self._spinner_stack.pop(idx)
+                if removed.wait_cursor:
+                    self._set_wait_cursor_active(False)
+                break
+        new_entry = _SpinnerEntry(owner=owner, base_text=base_text, wait_cursor=wait_cursor)
+        self._spinner_stack.append(new_entry)
+        if wait_cursor:
+            self._set_wait_cursor_active(True)
+        self._spinner_phase = 0
+        if not self._spinner_timer.isActive():
+            self._spinner_timer.start()
+        self._emit_spinner_message()
+        self._spinner_phase += 1
+
+    def _stop_status_spinner(self, owner: str) -> None:
+        for idx, entry in enumerate(self._spinner_stack):
+            if entry.owner != owner:
+                continue
+            removed = self._spinner_stack.pop(idx)
+            if removed.wait_cursor:
+                self._set_wait_cursor_active(False)
+            if not self._spinner_stack:
+                self._spinner_timer.stop()
+                self._spinner_phase = 0
+                return
+            if idx == len(self._spinner_stack):
+                self._spinner_phase = 0
+                self._emit_spinner_message()
+                self._spinner_phase += 1
+            return
+
+    def _clear_spinner_state(self) -> None:
+        self._spinner_timer.stop()
+        self._spinner_phase = 0
+        self._spinner_stack.clear()
+        while self._wait_cursor_depth > 0:
+            self._set_wait_cursor_active(False)
+
+    def _on_spinner_tick(self) -> None:
+        if not self._spinner_stack:
+            return
+        self._emit_spinner_message()
         self._spinner_phase += 1
 
     def _has_any_letters(self) -> bool:
@@ -1509,9 +1581,7 @@ class MainWindow(QMainWindow):
         words = [wf.word for wf in words_found]
         log.info("Rozhodca overuje slová: %s", words)
         # spusti spinner (online judge)
-        self._spinner_phase = 0
-        self._show_judge_status = True
-        self._spinner_timer.start()
+        self._start_status_spinner("judge", "Rozhoduje rozhodca", wait_cursor=True)
 
         # lazy init klienta
         if self.ai_client is None:
@@ -1549,8 +1619,7 @@ class MainWindow(QMainWindow):
         self._judge_thread.start()
 
     def _on_judge_ok(self, resp: dict[str, object]) -> None:
-        self._spinner_timer.stop()
-        self._show_judge_status = False
+        self._stop_status_spinner("judge")
         log.info("Rozhodca výsledok: %s", resp)
         all_valid, entries = self._analyze_judge_response(resp)
         if not all_valid:
@@ -1618,8 +1687,7 @@ class MainWindow(QMainWindow):
         self._start_ai_turn()
 
     def _on_judge_fail(self, e: Exception) -> None:
-        self._spinner_timer.stop()
-        self._show_judge_status = False
+        self._stop_status_spinner("judge")
         log.exception("Rozhodca zlyhal: %s", e)
         # vrat dosku do stavu pred potvrdenim (rack ostáva nezmenený)
         self.board.clear_letters(self.pending)
@@ -1682,7 +1750,7 @@ class MainWindow(QMainWindow):
     def _start_ai_turn(self) -> None:
         self._ai_thinking = True
         self._disable_human_inputs()
-        self.status.showMessage("Hrá AI…")
+        self._start_status_spinner("ai", "Hrá AI", wait_cursor=True)
         # reset flagu pre nový ťah
         self._ai_retry_used = False
         # priraď trace_id pre AI ťah
@@ -1837,7 +1905,7 @@ class MainWindow(QMainWindow):
                 )
             except TokenBudgetExceededError:
                 # špeciálna hláška, ale AI iba pasuje, aby sa hra nezasekla
-                self._spinner_timer.stop()
+                self._stop_status_spinner("ai")
                 self._ai_thinking = False
                 self._enable_human_inputs()
                 self._register_scoreless_turn("AI")
@@ -1858,7 +1926,7 @@ class MainWindow(QMainWindow):
                 proposal = {"pass": True}
 
         if bool(proposal.get("pass", False)):
-            self._spinner_timer.stop()
+            self._stop_status_spinner("ai")
             self._ai_thinking = False
             self._enable_human_inputs()
             self._register_scoreless_turn("AI")
@@ -2017,9 +2085,7 @@ class MainWindow(QMainWindow):
         self._ai_judge_words_coords = words_coords
         self._ai_ps2 = ps2
         # spusti spinner pre online rozhodovanie AI
-        self._spinner_phase = 0
-        self._show_judge_status = True
-        self._spinner_timer.start()
+        self._start_status_spinner("judge", "Rozhoduje rozhodca", wait_cursor=True)
         self._ai_judge_thread = QThread(self)
         self._ai_judge_worker = JudgeWorker(
             self.ai_client if self.ai_client else OpenAIClient(),
@@ -2036,7 +2102,7 @@ class MainWindow(QMainWindow):
         self._ai_judge_thread.start()
 
     def _on_ai_fail(self, e: Exception) -> None:
-        self._spinner_timer.stop()
+        self._stop_status_spinner("ai")
         self._ai_thinking = False
         self._enable_human_inputs()
         log.exception("AI navrh zlyhal: %s", e)
@@ -2051,8 +2117,8 @@ class MainWindow(QMainWindow):
         self._check_endgame()
 
     def _on_ai_judge_ok(self, resp: dict[str, object]) -> None:
-        self._spinner_timer.stop()
-        self._show_judge_status = False
+        self._stop_status_spinner("judge")
+        self._stop_status_spinner("ai")
         all_valid, entries = self._analyze_judge_response(resp)
         if not all_valid:
             # guided retry ak ešte neprebehol
@@ -2157,8 +2223,8 @@ class MainWindow(QMainWindow):
         self._check_endgame()
 
     def _on_ai_judge_fail(self, e: Exception) -> None:
-        self._spinner_timer.stop()
-        self._show_judge_status = False
+        self._stop_status_spinner("judge")
+        self._stop_status_spinner("ai")
         log.exception("AI judge zlyhal: %s", e)
         self.board.clear_letters(getattr(self, "_ai_ps2", []))
         self._ai_thinking = False
