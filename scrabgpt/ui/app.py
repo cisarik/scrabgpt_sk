@@ -9,14 +9,29 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal, Optional, Sequence, cast
 from pathlib import Path
-from PySide6.QtCore import Qt, QSize, QRectF, QTimer, Signal, QObject, QThread, QPoint, QMimeData
-from PySide6.QtGui import QAction, QPainter, QColor, QPen, QFont, QMouseEvent, QPaintEvent, QIntValidator, QTextCursor, QPixmap, QDrag
+from PySide6.QtCore import Qt, QSize, QRectF, QTimer, Signal, QObject, QThread, QPoint, QMimeData, QModelIndex
+from PySide6.QtGui import (
+    QAction,
+    QPainter,
+    QColor,
+    QPen,
+    QFont,
+    QMouseEvent,
+    QPaintEvent,
+    QIntValidator,
+    QTextCursor,
+    QPixmap,
+    QDrag,
+    QLinearGradient,
+    QPainterPath,
+    QBrush,
+)
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QToolBar, QLabel, QSplitter, QStatusBar, QMessageBox, QPushButton,
     QDialog, QFormLayout, QLineEdit, QDialogButtonBox, QListWidget, QListWidgetItem,
     QGridLayout, QGraphicsDropShadowEffect, QListView, QPlainTextEdit, QCheckBox,
-    QComboBox, QSizePolicy
+    QComboBox, QSizePolicy, QStyleOptionViewItem, QStyledItemDelegate, QStyle
 )
 from ..logging_setup import configure_logging, TRACE_ID_VAR, default_log_path
 
@@ -580,6 +595,69 @@ class BoardView(QWidget):
         y0 = (h - 15.0 * cell) / 2.0
         return x0, y0, cell
 
+    def _draw_letter_tile(
+        self,
+        painter: QPainter,
+        cell_rect: QRectF,
+        cell_size: float,
+        *,
+        glyph: str,
+        is_blank: bool,
+        pending: bool,
+    ) -> None:
+        """Renderuje stvorec kameňa so zaoblenými rohmi priamo na doske."""
+        painter.save()
+        margin = cell_size * 0.12
+        tile_rect = cell_rect.adjusted(margin, margin, -margin, -margin)
+        corner = cell_size * 0.20
+        shadow_offset = cell_size * 0.05
+
+        shadow_path = QPainterPath()
+        shadow_path.addRoundedRect(
+            tile_rect.translated(0, shadow_offset),
+            corner,
+            corner,
+        )
+        shadow_alpha = 60 if pending else 80
+        painter.fillPath(shadow_path, QColor(0, 0, 0, shadow_alpha))
+
+        tile_path = QPainterPath()
+        tile_path.addRoundedRect(tile_rect, corner, corner)
+        gradient = QLinearGradient(tile_rect.topLeft(), tile_rect.bottomLeft())
+        if pending:
+            gradient.setColorAt(0.0, QColor(252, 252, 232))
+            gradient.setColorAt(1.0, QColor(232, 232, 204))
+        elif is_blank:
+            gradient.setColorAt(0.0, QColor(250, 250, 250))
+            gradient.setColorAt(1.0, QColor(230, 230, 230))
+        else:
+            gradient.setColorAt(0.0, QColor(248, 248, 248))
+            gradient.setColorAt(1.0, QColor(226, 226, 226))
+        painter.fillPath(tile_path, QBrush(gradient))
+
+        border_pen = QPen(QColor(150, 150, 150))
+        border_pen.setWidthF(max(1.0, cell_size * 0.03))
+        painter.setPen(border_pen)
+        painter.drawPath(tile_path)
+
+        text_pen = QPen(QColor(30, 30, 30))
+        painter.setPen(text_pen)
+        font = QFont()
+        font.setBold(True)
+        font.setPointSizeF(cell_size * 0.45)
+        painter.setFont(font)
+        painter.drawText(tile_rect, int(Qt.AlignmentFlag.AlignCenter), glyph)
+
+        if is_blank:
+            indicator_radius = cell_size * 0.045
+            indicator_color = QColor(100, 100, 100, 150)
+            painter.setBrush(indicator_color)
+            painter.setPen(Qt.PenStyle.NoPen)
+            center = tile_rect.center()
+            painter.drawEllipse(center, indicator_radius, indicator_radius)
+
+        painter.restore()
+
     def paintEvent(self, ev: QPaintEvent) -> None:  # noqa: N802
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
@@ -631,30 +709,28 @@ class BoardView(QWidget):
                 if not ch:
                     continue
                 rect = QRectF(x0 + c * cell, y0 + r * cell, cell, cell)
-                # odlis blank
-                if self.board.cells[r][c].is_blank:
-                    p.fillRect(rect.adjusted(cell*0.1, cell*0.1, -cell*0.1, -cell*0.1), QColor(255, 255, 255))
-                    p.setPen(QPen(QColor(160, 160, 160)))
-                    p.drawEllipse(rect.center(), cell*0.06, cell*0.06)
-                p.setPen(QPen(QColor(0, 0, 0)))
-                f = QFont()
-                f.setBold(True)
-                f.setPointSizeF(cell * 0.45)
-                p.setFont(f)
-                p.drawText(rect, int(Qt.AlignmentFlag.AlignCenter), ch)
+                self._draw_letter_tile(
+                    p,
+                    rect,
+                    cell,
+                    glyph=ch,
+                    is_blank=self.board.cells[r][c].is_blank,
+                    pending=False,
+                )
 
         # pending pismena (prekrytie, jemny tien)
         for pl in self._pending:
             r, c = pl.row, pl.col
             rect = QRectF(x0 + c * cell, y0 + r * cell, cell, cell)
-            p.fillRect(rect.adjusted(cell*0.1, cell*0.1, -cell*0.1, -cell*0.1), QColor(255, 255, 224))
-            p.setPen(QPen(QColor(0, 0, 0)))
-            f = QFont()
-            f.setBold(True)
-            f.setPointSizeF(cell * 0.45)
-            p.setFont(f)
-            txt = pl.blank_as if (pl.letter == "?" and pl.blank_as) else pl.letter
-            p.drawText(rect, int(Qt.AlignmentFlag.AlignCenter), txt)
+            glyph = pl.blank_as if (pl.letter == "?" and pl.blank_as) else pl.letter
+            self._draw_letter_tile(
+                p,
+                rect,
+                cell,
+                glyph=glyph or "",
+                is_blank=(pl.letter == "?"),
+                pending=True,
+            )
 
         # zvyraznenie poslednych poloziek tahu (jemny halo/obrys)
         if self._last_move_cells:
@@ -818,6 +894,66 @@ class BoardView(QWidget):
         return bool(payload and payload.get("origin") == "rack")
 
 
+class RackTileDelegate(QStyledItemDelegate):
+    """Renderuje kamene v racku s jemným 3D efektom."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._corner_radius = 7.0
+
+    def paint(  # type: ignore[override]
+        self, painter: QPainter, option: QStyleOptionViewItem, index: QModelIndex
+    ) -> None:
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        available = option.rect.adjusted(3, 3, -3, -3)
+        side = min(available.width(), available.height() - 2)
+        cx = available.center().x()
+        cy = available.center().y() - 1.0
+        base_rect = QRectF(cx - side / 2.0, cy - side / 2.0, side, side)
+        shadow_rect = base_rect.translated(0, 2)
+        shadow_path = QPainterPath()
+        shadow_path.addRoundedRect(shadow_rect, self._corner_radius, self._corner_radius)
+        painter.fillPath(shadow_path, QColor(0, 0, 0, 70))
+
+        tile_path = QPainterPath()
+        tile_path.addRoundedRect(base_rect, self._corner_radius, self._corner_radius)
+        gradient = QLinearGradient(base_rect.topLeft(), base_rect.bottomLeft())
+        gradient.setColorAt(0.0, QColor(248, 248, 248))
+        gradient.setColorAt(1.0, QColor(225, 225, 225))
+        painter.fillPath(tile_path, QBrush(gradient))
+
+        if option.state & QStyle.State_MouseOver:
+            painter.fillPath(tile_path, QColor(140, 195, 140, 60))
+
+        border_color = QColor(160, 160, 160)
+        if option.state & QStyle.State_Selected:
+            painter.fillPath(tile_path, QColor(80, 145, 100, 70))
+            border_color = QColor(70, 125, 90)
+
+        pen = QPen(border_color)
+        pen.setWidthF(1.2)
+        painter.setPen(pen)
+        painter.drawPath(tile_path)
+
+        display = index.data(Qt.ItemDataRole.DisplayRole)
+        if isinstance(display, str) and display:
+            text_pen = QPen(QColor(28, 60, 28))
+            painter.setPen(text_pen)
+            font = painter.font()
+            font.setBold(True)
+            font.setPointSizeF(max(12.0, base_rect.height() * 0.46))
+            painter.setFont(font)
+            painter.drawText(base_rect, int(Qt.AlignmentFlag.AlignCenter), display)
+
+        painter.restore()
+
+    def sizeHint(self, option: QStyleOptionViewItem, index: QModelIndex) -> QSize:  # type: ignore[override]
+        del option, index
+        return QSize(44, 44)
+
+
 class RackListWidget(QListWidget):
     """List widget prispôsobený pre drag & drop kameňov."""
 
@@ -830,6 +966,8 @@ class RackListWidget(QListWidget):
         self.setDropIndicatorShown(False)
         self.setDefaultDropAction(Qt.DropAction.MoveAction)
         self.setDragDropMode(QListWidget.DragDropMode.DragOnly)
+        self._tile_delegate = RackTileDelegate(self)
+        self.setItemDelegate(self._tile_delegate)
 
     def startDrag(self, supported_actions: Any) -> None:  # noqa: N802
         item = self.currentItem()
@@ -851,19 +989,43 @@ class RackListWidget(QListWidget):
         size = self.iconSize()
         if size.isEmpty():
             size = QSize(44, 44)
-        pixmap = QPixmap(size)
+        drag_size = QSize(size.width() + 12, size.height() + 14)
+        pixmap = QPixmap(drag_size)
         pixmap.fill(Qt.GlobalColor.transparent)
         painter = QPainter(pixmap)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        painter.setBrush(QColor(11, 61, 11))
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.drawRoundedRect(pixmap.rect(), 6, 6)
-        painter.setPen(QColor(255, 255, 255))
+        outer = pixmap.rect().adjusted(5, 5, -5, -5)
+        side = min(outer.width(), outer.height() - 2)
+        center = outer.center()
+        tile_rect = QRectF(
+            center.x() - side / 2.0,
+            center.y() - side / 2.0 - 1.0,
+            side,
+            side,
+        )
+        shadow_rect = tile_rect.translated(0, 2)
+        shadow_path = QPainterPath()
+        shadow_path.addRoundedRect(shadow_rect, 7, 7)
+        painter.fillPath(shadow_path, QColor(0, 0, 0, 80))
+
+        tile_path = QPainterPath()
+        tile_path.addRoundedRect(tile_rect, 7, 7)
+        gradient = QLinearGradient(tile_rect.topLeft(), tile_rect.bottomLeft())
+        gradient.setColorAt(0.0, QColor(248, 248, 248))
+        gradient.setColorAt(1.0, QColor(225, 225, 225))
+        painter.fillPath(tile_path, QBrush(gradient))
+
+        pen = QPen(QColor(150, 150, 150))
+        pen.setWidthF(1.2)
+        painter.setPen(pen)
+        painter.drawPath(tile_path)
+
+        painter.setPen(QColor(28, 60, 28))
         font = painter.font()
         font.setBold(True)
-        font.setPointSize(max(10, int(size.height() * 0.6)))
+        font.setPointSize(max(12, int(tile_rect.height() * 0.46)))
         painter.setFont(font)
-        painter.drawText(pixmap.rect(), int(Qt.AlignmentFlag.AlignCenter), item.text())
+        painter.drawText(tile_rect, int(Qt.AlignmentFlag.AlignCenter), item.text())
         painter.end()
         drag.setPixmap(pixmap)
         drag.setHotSpot(pixmap.rect().center())
@@ -919,27 +1081,38 @@ class RackView(QWidget):
         # nastavenie velkosti jednej dlazdice
         self._tile_px = 44
         self._spacing_px = 6
+        self._rack_padding_px = 6
         self.list.setIconSize(QSize(self._tile_px, self._tile_px))
-        self.list.setGridSize(QSize(self._tile_px, self._tile_px))
-        self.list.setSpacing(self._spacing_px)
+        self.list.setGridSize(QSize(self._tile_px + self._spacing_px, self._tile_px + self._spacing_px))
+        self.list.setSpacing(0)
         self.list.setWrapping(False)
         self.list.setFlow(QListView.Flow.LeftToRight)
         self.list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.list.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.list.setFixedHeight(self._tile_px)
-        # tmavozelene pozadie racku
+        self.list.setFixedHeight(self._tile_px + self._rack_padding_px * 2)
+        # tmavozelene pozadie racku so slabým 3D gradientom
         self.list.setStyleSheet(
-            "QListWidget{background-color:#0b3d0b;border:0;} "
-            "QListWidget::item{color:white;}"
+            "QListWidget{"
+            "background:qlineargradient(x1:0,y1:0,x2:0,y2:1,"
+            "stop:0 #1a8c1a, stop:0.6 #147414, stop:1 #0b3d0b);"
+            "border:1px solid #083508;"
+            "border-radius:14px;"
+            f"padding:{self._rack_padding_px}px;"
+            "}"
         )
         # pseudo-3D tieň
         shadow = QGraphicsDropShadowEffect(self)
         shadow.setBlurRadius(12)
         shadow.setOffset(0, 2)
-        shadow.setColor(QColor(0, 0, 0, 80))
+        shadow.setColor(QColor(20, 60, 20, 110))
         self.list.setGraphicsEffect(shadow)
         h.addWidget(self.list)
-        total_height = self._tile_px + h.contentsMargins().top() + h.contentsMargins().bottom()
+        total_height = (
+            self._tile_px
+            + self._rack_padding_px * 2
+            + h.contentsMargins().top()
+            + h.contentsMargins().bottom()
+        )
         self.setFixedHeight(total_height)
 
     def set_letters(self, letters: list[str]) -> None:
@@ -952,7 +1125,11 @@ class RackView(QWidget):
             item.setFont(font)
             self.list.addItem(item)
         # sirka presne na 7 pismen (bez ohladu na obsah)
-        width_px = 7 * self._tile_px + 6 * self._spacing_px
+        width_px = (
+            7 * self._tile_px
+            + (7 - 1) * self._spacing_px
+            + self._rack_padding_px * 2
+        )
         self.list.setFixedWidth(width_px)
 
     def take_selected(self) -> Optional[str]:
@@ -963,6 +1140,18 @@ class RackView(QWidget):
         row = self.list.row(it)
         self.list.takeItem(row)
         return ch
+
+    def set_multi_selection_enabled(self, enabled: bool) -> None:
+        """Toggle multi-selection mode together with drag behaviour."""
+        mode = (
+            QListWidget.SelectionMode.MultiSelection
+            if enabled
+            else QListWidget.SelectionMode.SingleSelection
+        )
+        self.list.setSelectionMode(mode)
+        # Disable dragging while multi-selecting to avoid accidental DnD.
+        self.list.setDragEnabled(not enabled)
+        self.list.clearSelection()
 
 
 class MainWindow(QMainWindow):
@@ -1038,12 +1227,21 @@ class MainWindow(QMainWindow):
         self.score_panel = QWidget()
         spv = QVBoxLayout(self.score_panel)
         self.lbl_scores = QLabel()
+        self.lbl_scores.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_scores.setStyleSheet(
-            "QLabel{font-size:20px;font-weight:600;color:#f0f0f0;}"
+            "QLabel {"
+            "background-color: #4caf50;"
+            "color: #0b1c00;"
+            "font-size: 18px;"
+            "font-weight: 600;"
+            "padding: 10px 18px;"
+            "border: none;"
+            "border-radius: 0;"
+            "}"
         )
         shadow_scores = QGraphicsDropShadowEffect(self.score_panel)
-        shadow_scores.setBlurRadius(12)
-        shadow_scores.setOffset(0, 2)
+        shadow_scores.setBlurRadius(20)
+        shadow_scores.setOffset(0, 3)
         shadow_scores.setColor(QColor(0, 0, 0, 150))
         self.lbl_scores.setGraphicsEffect(shadow_scores)
         spv.addWidget(self.lbl_scores)
@@ -1069,21 +1267,28 @@ class MainWindow(QMainWindow):
         self.btn_reroll.clicked.connect(self._on_repeat_starter_draw)
         spv.addWidget(self.btn_reroll)
         spv.addStretch(1)
-        actions_row = QHBoxLayout()
-        actions_row.setContentsMargins(0, 0, 0, 0)
-        actions_row.setSpacing(6)
-        self.btn_exchange = QPushButton("Vymeniť")
-        self.btn_exchange.clicked.connect(self.exchange_human)
-        self.btn_exchange.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        actions_row.addWidget(self.btn_exchange)
         self.btn_confirm = QPushButton("Potvrdiť ťah")
         self.btn_confirm.clicked.connect(self.confirm_move)
         self.btn_confirm.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.btn_confirm.setMinimumHeight(40)
-        actions_row.addWidget(self.btn_confirm)
-        self.actions_container = QWidget(self.score_panel)
-        self.actions_container.setLayout(actions_row)
-        spv.addWidget(self.actions_container)
+        self.btn_confirm.setStyleSheet(
+            "QPushButton {"
+            "background-color: #4caf50;"
+            "color: #0b1c00;"
+            "font-size: 18px;"
+            "font-weight: 600;"
+            "border-radius: 8px;"
+            "padding: 10px 18px;"
+            "}"
+            "QPushButton:hover {background-color: #5cc75f;}"
+            "QPushButton:pressed {background-color: #3f9143;}"
+            "QPushButton:disabled {background-color: #6c7a6d;color: #dbe2dc;}"
+        )
+        confirm_shadow = QGraphicsDropShadowEffect(self.btn_confirm)
+        confirm_shadow.setBlurRadius(20)
+        confirm_shadow.setOffset(0, 3)
+        confirm_shadow.setColor(QColor(0, 0, 0, 150))
+        self.btn_confirm.setGraphicsEffect(confirm_shadow)
         self.btn_reroll.hide()
         self.split.addWidget(self.score_panel)
         self.split.setSizes([700, 300])
@@ -1092,7 +1297,19 @@ class MainWindow(QMainWindow):
 
         # Spodný pás: rack + status
         self.rack = RackView()
-        v.addWidget(self.rack)
+        self.btn_exchange = QPushButton("Vymeniť")
+        self.btn_exchange.clicked.connect(self.exchange_human)
+        self.btn_exchange.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        rack_bar = QWidget()
+        rack_layout = QHBoxLayout(rack_bar)
+        rack_layout.setContentsMargins(12, 8, 12, 8)
+        rack_layout.setSpacing(12)
+        rack_layout.addWidget(self.btn_exchange)
+        rack_layout.addWidget(self.rack, 1)
+        rack_layout.addWidget(self.btn_confirm)
+        v.addWidget(rack_bar)
+        self.btn_exchange.hide()
+        self.rack_container = rack_bar
         self.status = QStatusBar()
         self.setStatusBar(self.status)
         # start: prazdny status bar
@@ -1125,6 +1342,7 @@ class MainWindow(QMainWindow):
         self._ai_last_main_word: str = ""
         self._ai_last_anchor: str = ""
         self._pending_words_coords: list[tuple[str, list[tuple[int, int]]]] = []
+        self._exchange_mode_active: bool = False
         self._starter_side: StarterSide | None = None
         self._starter_decided: bool = False
 
@@ -1173,6 +1391,7 @@ class MainWindow(QMainWindow):
     def new_game(self) -> None:
         # Základný placeholder pre žreb štartéra (MVP skeleton)
         from ..core.tiles import TileBag
+        self._exit_exchange_mode()
         self.board = Board(PREMIUMS_PATH)
         self.board_view.board = self.board
         self._set_game_ui_visible(True)
@@ -1261,7 +1480,8 @@ class MainWindow(QMainWindow):
         self._handle_starting_draw()
 
     def _set_starter_controls(self, *, decided: bool) -> None:
-        self.btn_reroll.setVisible(not decided)
+        show_reroll = (not decided) and self._game_ui_visible
+        self.btn_reroll.setVisible(show_reroll)
         self.btn_reroll.setEnabled(not decided)
         self.btn_confirm.setVisible(decided)
         self.btn_exchange.setVisible(decided)
@@ -1291,6 +1511,7 @@ class MainWindow(QMainWindow):
         """Vráti aplikáciu do východzieho stavu pred spustením hry."""
         # zastav animácie/spinner a ukonči rozbehnuté vlákna
         self._clear_spinner_state()
+        self._exit_exchange_mode()
         self._ai_thinking = False
         self._ai_opening_active = False
         self._starter_side = None
@@ -1339,11 +1560,11 @@ class MainWindow(QMainWindow):
         self.act_new.setText("🆕 Nová hra")
         self._set_game_ui_visible(False)
         self._disable_human_inputs()
-        self._set_starter_controls(decided=True)
+        self._set_starter_controls(decided=False)
 
     def _update_scores_label(self) -> None:
         self.lbl_scores.setText(
-            f"<div>Hráč: <b>{self.human_score}</b> | AI: <b>{self.ai_score}</b></div><br/>"
+            f"<div>Hráč: <b>{self.human_score}</b> vs. AI: <b>{self.ai_score}</b></div>"
         )
         self._update_last_move_breakdown_ui()
         self._update_last_move_reason_ui()
@@ -1356,14 +1577,14 @@ class MainWindow(QMainWindow):
         lines: list[str] = []
         for (w, base, lb, mult, total) in self._last_move_breakdown:
             line = (
-                f"<span style='font-weight:bold'>{w}</span>: <br/>základ {base}, "
+                f"<span style='font-weight:bold'><br>{w}</span>: <br/>základ {base}, "
                 f"písmená +{lb}, násobok ×{mult} → <span style='font-weight:bold'>{total}</span>"
             )
             lines.append(line)
         if self._last_move_bingo:
-            lines.append("<span style='color:#9cff9c'>+50 bingo</span>")
+            lines.append("<span style='color:#9cff9c'>+50 bingo!</span>")
         html_lines = "<br/>".join(lines)
-        prefix = f"Posledný ťah:<br/>"
+        prefix = ""
         self.lbl_last_breakdown.setText(f"<div style='margin-bottom:6px'>{prefix}</div>{html_lines}")
 
     def _update_last_move_reason_ui(self) -> None:
@@ -1375,7 +1596,7 @@ class MainWindow(QMainWindow):
             return
         escaped = html.escape(reason).replace("\n", "<br/>")
         self.lbl_last_reason.setText(
-            "<div style='margin:6px 0 0 0'><span style='font-weight:bold'>Dôvod rozhodcu:</span><br/>"
+            "<div style='margin:6px 0 0 0'><span style='font-weight:bold'>Zdôvonenie rozhodcu:</span><br/>"
             f"{escaped}</div>"
         )
         self.lbl_last_reason.show()
@@ -1534,7 +1755,11 @@ class MainWindow(QMainWindow):
         score, _ = score_words(self.board, self.pending, words_coords)
         # vycisti docasne
         self.board.clear_letters(self.pending)
-        self.status.showMessage(f"Ghost skóre: {score}")
+        self.status.showMessage(f"Potencionálne skóre: {score}")
+
+    def _refresh_board_view(self) -> None:
+        """Zabezpečí prekreslenie dosky po manuálnych zmenách stavu."""
+        self.board_view.update()
 
     def _set_wait_cursor_active(self, active: bool) -> None:
         if active:
@@ -1687,6 +1912,7 @@ class MainWindow(QMainWindow):
             return
         # docasne poloz, ziskaj slova a drz ich pre scoring
         self.board.place_letters(self.pending)
+        self._refresh_board_view()
         words_found = extract_all_words(self.board, self.pending)
         words_coords = [(wf.word, wf.letters) for wf in words_found]
         words = [wf.word for wf in words_found]
@@ -1820,6 +2046,7 @@ class MainWindow(QMainWindow):
 
     # ---------- AI tah ----------
     def _disable_human_inputs(self) -> None:
+        self._exit_exchange_mode()
         self.btn_confirm.setEnabled(False)
         self.board_view.setEnabled(False)
         self.rack.setEnabled(False)
@@ -1831,32 +2058,64 @@ class MainWindow(QMainWindow):
         self.rack.setEnabled(True)
         self.btn_exchange.setEnabled(True)
 
+    def _enter_exchange_mode(self) -> None:
+        if self._exchange_mode_active:
+            return
+        self._exchange_mode_active = True
+        self.btn_exchange.setText("Potvrdiť")
+        self.rack.set_multi_selection_enabled(True)
+        self.status.showMessage("Vyber kamene na výmenu a klikni na Potvrdiť.")
+
+    def _exit_exchange_mode(self, *, status_message: str | None = None) -> None:
+        if not self._exchange_mode_active:
+            return
+        self._exchange_mode_active = False
+        self.btn_exchange.setText("Vymeniť písmená")
+        self.rack.set_multi_selection_enabled(False)
+        if status_message is not None:
+            self.status.showMessage(status_message)
+        elif not self._ai_thinking:
+            self.status.showMessage("Hrá hráč…")
+
     def exchange_human(self) -> None:
-        """Vymena vybranych kamienkov v racku (ak taska ma >=7)."""
+        """Spracovanie akcie na tlačidle výmeny kameňov."""
         if self._ai_thinking:
             return
-        # ťah hráča (výmena) – vlastné trace_id
-        TRACE_ID_VAR.set(str(uuid.uuid4())[:8])
-        log.info("[HUMAN] start exchange")
-        if self.bag.remaining() < 7:
-            QMessageBox.information(self, "Vymeniť", "Taška má menej ako 7 kameňov – výmena nie je povolená.")
+        if not self._exchange_mode_active:
+            if self.bag.remaining() < 7:
+                QMessageBox.information(
+                    self,
+                    "Vymeniť",
+                    "Taška má menej ako 7 kameňov – výmena nie je povolená.",
+                )
+                return
+            self._enter_exchange_mode()
             return
-        # pozbieraj vybrane polozky
-        selected: list[str] = [it.text() for it in self.rack.list.selectedItems()]
+
+        # potvrdzujeme výmenu
+        selected_items = self.rack.list.selectedItems()
+        selected: list[str] = [it.text() for it in selected_items]
         if not selected:
-            QMessageBox.information(self, "Vymeniť", "Vyber aspoň jeden kameň na výmenu.")
+            log.info("[HUMAN] exchange cancelled (no selection)")
+            self._exit_exchange_mode(status_message="Výmena zrušená.")
             return
-        # Odober z racku presne tieto znaky (podla poradia selectu) a vymen
+
+        TRACE_ID_VAR.set(str(uuid.uuid4())[:8])
+        log.info("[HUMAN] confirm exchange letters=%s", "".join(selected))
+
         tmp_rack = self.human_rack.copy()
         for ch in selected:
             if ch in tmp_rack:
                 tmp_rack.remove(ch)
-            else:
-                QMessageBox.warning(self, "Vymeniť", "Vybraný kameň sa nenašiel v racku.")
-                return
+                continue
+            QMessageBox.warning(self, "Vymeniť", "Vybraný kameň sa nenašiel v racku.")
+            self._exit_exchange_mode()
+            return
+
         self.status.showMessage("Hráč vymieňa…")
         new_tiles = self.bag.exchange(selected)
         self.human_rack = tmp_rack + new_tiles
+        self._exit_exchange_mode()
         self.rack.set_letters(self.human_rack)
         self._update_scores_label()
         # vymena konci kolo ako pass
@@ -2073,6 +2332,7 @@ class MainWindow(QMainWindow):
             else:
                 ps2.append(p)
         self.board.place_letters(ps2)
+        self._refresh_board_view()
         words_found = extract_all_words(self.board, ps2)
         words_coords = [(wf.word, wf.letters) for wf in words_found]
         words = [wf.word for wf in words_found]
@@ -2141,6 +2401,7 @@ class MainWindow(QMainWindow):
         ):
             # Mismatch = pravdepodobné lepenie na existujúci reťazec
             self.board.clear_letters(ps2)
+            self._refresh_board_view()
             self._spinner_phase = 0
             self._spinner_timer.start()
             self._ai_retry_used = True
@@ -2235,6 +2496,7 @@ class MainWindow(QMainWindow):
             if not self._ai_retry_used:
                 ps2 = getattr(self, "_ai_ps2")
                 self.board.clear_letters(ps2)
+                self._refresh_board_view()
                 self._ai_retry_used = True
                 invalid_word = ""
                 invalid_reason = ""
@@ -2282,6 +2544,7 @@ class MainWindow(QMainWindow):
                 return
             # inak: pass
             self.board.clear_letters(getattr(self, "_ai_ps2"))
+            self._refresh_board_view()
             self._ai_thinking = False
             self._enable_human_inputs()
             self.status.showMessage("AI navrhla neplatné slovo — pass")
@@ -2339,6 +2602,7 @@ class MainWindow(QMainWindow):
         self._stop_status_spinner("ai")
         log.exception("AI judge zlyhal: %s", e)
         self.board.clear_letters(getattr(self, "_ai_ps2", []))
+        self._refresh_board_view()
         self._ai_thinking = False
         self._enable_human_inputs()
         self.status.showMessage("AI pasuje (chyba rozhodcu)")
@@ -2438,17 +2702,20 @@ class MainWindow(QMainWindow):
         if visible == self._game_ui_visible:
             return
         if visible:
-            self.score_panel.show()
+            self.lbl_scores.show()
+            self.lbl_last_breakdown.show()
+            if self._last_move_reason.strip():
+                self.lbl_last_reason.show()
             self.rack.show()
             if self._stored_split_sizes:
                 self.split.setSizes(self._stored_split_sizes)
-            self._game_ui_visible = True
         else:
             self._stored_split_sizes = self.split.sizes()
-            self.score_panel.hide()
+            self.lbl_last_breakdown.hide()
+            self.lbl_last_reason.hide()
+            self.btn_reroll.hide()
             self.rack.hide()
-            self.split.setSizes([1, 0])
-            self._game_ui_visible = False
+        self._game_ui_visible = visible
 
     def _on_new_or_surrender(self) -> None:
         if self.act_new.text().startswith("🏳️"):
