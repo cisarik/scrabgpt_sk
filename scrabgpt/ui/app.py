@@ -609,12 +609,19 @@ class BoardView(QWidget):
                 p.drawRect(rect)
 
         # hviezda v strede
-        star_rect = QRectF(x0 + 7 * cell, y0 + 7 * cell, cell, cell)
-        p.setPen(QPen(QColor(120, 120, 120)))
-        font = QFont()
-        font.setPointSizeF(cell * 0.4)
-        p.setFont(font)
-        p.drawText(star_rect, int(Qt.AlignmentFlag.AlignCenter), "★")
+        center_has_letter = bool(self.board.cells[7][7].letter)
+        if not center_has_letter:
+            for pl in self._pending:
+                if pl.row == 7 and pl.col == 7:
+                    center_has_letter = True
+                    break
+        if not center_has_letter:
+            star_rect = QRectF(x0 + 7 * cell, y0 + 7 * cell, cell, cell)
+            p.setPen(QPen(QColor(120, 120, 120)))
+            font = QFont()
+            font.setPointSizeF(cell * 0.4)
+            p.setFont(font)
+            p.drawText(star_rect, int(Qt.AlignmentFlag.AlignCenter), "★")
 
         # existujuce pismena
         for r in range(15):

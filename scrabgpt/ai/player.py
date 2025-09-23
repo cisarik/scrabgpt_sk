@@ -16,7 +16,7 @@ log = logging.getLogger("scrabgpt.ai")
 def _format_tile_summary(variant: VariantDefinition) -> str:
     entries = []
     for letter in variant.letters:
-        entries.append(f"{letter.letter}:{letter.count}({letter.points})")
+        entries.append(f"{letter.letter}:{letter.points}")
     return ", ".join(entries)
 
 
@@ -62,7 +62,7 @@ def _build_prompt(compact_state: str, variant: VariantDefinition, retry_hint: st
         "Reply with JSON only. Do NOT overwrite existing board letters; place only on empty cells. "
         "Placements must form a single contiguous line with no gaps and must connect to existing letters after the first move. "
         "Use only letters from ai_rack; for '?' provide mapping in 'blanks' with the chosen uppercase letter (respecting diacritics). "
-        f"Tile distribution summary: {tile_summary}. "
+        f"Points you can get for each tile: {tile_summary}. "
         f"Do not glue your letters to adjacent existing letters unless the resulting main word is a valid {language} word. "
         "Use intersections/hooks properly; you may share letters with the board only at overlapping cells; do not extend an existing word into a non-word. "
         "The field 'word' must equal the final main word formed on the board (existing board letters plus your placements). "

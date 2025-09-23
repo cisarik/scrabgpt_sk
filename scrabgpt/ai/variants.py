@@ -171,13 +171,13 @@ _LANGUAGE_SCHEMA = {
                 "type": "object",
                 "properties": {
                     "name": {"type": "string"},
-                    "code": {"type": "string"},
+                    "code": {"type": ["string", "null"]},
                     "aliases": {
                         "type": "array",
                         "items": {"type": "string"},
                         "default": [],
                     },
-                    "script": {"type": "string"},
+                    "script": {"type": ["string", "null"]},
                 },
                 "required": ["name"],
                 "additionalProperties": False,
@@ -195,9 +195,10 @@ def fetch_supported_languages(client: OpenAIClient) -> list[LanguageInfo]:
     prompt = (
         "Zostav JSON so zoznamom prirodzených jazykov, v ktorých dokážeš spoľahlivo "
         "komunikovať. Vráť aspoň 40 jazykov naprieč svetadielmi. Pre každý jazyk "
-        "uved' pole 'name' (anglický názov), 'code' (ISO 639-1 alebo 639-3, ak existuje), "
-        "'aliases' (alternatívne názvy alebo názvy v slovenčine) a 'script' (napr. Latin, "
-        "Cyrillic). Odpovedz výhradne JSON objektom so štruktúrou languages=[...]."
+        "uved' kľúče 'name' (anglický názov), 'code' (ISO 639-1 alebo 639-3, ak "
+        "existuje), 'aliases' (alternatívne názvy alebo názvy v slovenčine, použi prázdne "
+        "pole ak žiadne nemáš) a 'script' (napr. Latin, Cyrillic). Odpovedz výhradne JSON "
+        "objektom so štruktúrou languages=[...]."
     )
     data = client._call_json(prompt, _LANGUAGE_SCHEMA)
     languages: list[LanguageInfo] = []

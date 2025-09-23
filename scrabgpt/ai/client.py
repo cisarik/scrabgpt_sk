@@ -225,8 +225,23 @@ class OpenAIClient:
         }
         sys_prompt = (
             f"You are a strict Scrabble referee for {language} words. "
-            "Reply with JSON only and judge legality according to that Scrabble lexicon."
+            "Reply with JSON only. "
+            "Use the official Scrabble lexicon as primary evidence. "
+            "Also consider attested usage in real sentences and corpora when judging legality. "
+            f"If a word is naturally used as an independent {language} word, treat it as playable even "
+            "when it lacks an entry in the lexicon."
         )
+        if language.lower() == "slovak":
+            sys_prompt += (
+                " For each word, confirm it can stand on its own in a natural Slovak sentence. "
+                "Treat regular inflected forms of recognised lemmas "
+                "(like plurals or case variants) as valid even without lexicon coverage. "
+                "Before rejecting a word, actively look for its use in idioms, sayings, "
+                "imperatives, or other fixed Slovak expressions. If you can produce a "
+                "credible natural sentence that uses the exact form as an independent word, "
+                "declare it valid and cite that sentence in the reason. Only label a word "
+                "invalid when you are confident no such natural usage exists."
+            )
         user_prompt = (
             f"Validate these words for {language} Scrabble play: {words}. "
             "Return JSON exactly matching the schema."
@@ -239,16 +254,57 @@ class OpenAIClient:
 
         if isinstance(raw, dict):
             normalized: list[JudgeResult] = []
+            reserved_keys = {
+                "results",
+                "words",
+                "all_valid",
+                "word",
+                "valid",
+                "reason",
+                "explanation",
+                "is_valid",
+                "is_playable",
+                "playable",
+                "legal",
+                "is_legal",
+                "allowed",
+            }
+
+            def _resolve_valid_flag(data: dict[str, Any]) -> bool | None:
+                """Extract a boolean validity flag from diverse model fields."""
+                for key in ("valid", "is_valid", "is_playable", "playable", "legal", "is_legal", "allowed"):
+                    value = data.get(key)
+                    if isinstance(value, bool):
+                        return bool(value)
+                return None
+
+            def _normalize_reason(data: dict[str, Any]) -> str:
+                reason = data.get("reason")
+                if isinstance(reason, str) and reason.strip():
+                    return reason
+                explanation = data.get("explanation")
+                if isinstance(explanation, str) and explanation.strip():
+                    return explanation
+                evidence = data.get("evidence")
+                if isinstance(evidence, list):
+                    parts: list[str] = []
+                    for item in evidence:
+                        if isinstance(item, str):
+                            parts.append(item)
+                    if parts:
+                        return " | ".join(parts)
+                return ""
 
             results = raw.get("results")
             if isinstance(results, list):
                 for item in results:
                     if isinstance(item, dict):
+                        valid_flag = _resolve_valid_flag(item)
                         normalized.append(
                             {
                                 "word": str(item.get("word", "")),
-                                "valid": bool(item.get("valid", False)),
-                                "reason": str(item.get("reason", "")),
+                                "valid": bool(valid_flag) if valid_flag is not None else bool(item.get("valid", False)),
+                                "reason": _normalize_reason(item),
                             }
                         )
 
@@ -256,14 +312,12 @@ class OpenAIClient:
             if not normalized:
                 single_word = raw.get("word")
                 if isinstance(single_word, str):
-                    reason = raw.get("reason")
-                    if not isinstance(reason, str):
-                        reason = str(raw.get("explanation", ""))
+                    valid_flag = _resolve_valid_flag(raw)
                     normalized.append(
                         {
                             "word": single_word,
-                            "valid": bool(raw.get("valid", False)),
-                            "reason": reason,
+                            "valid": bool(valid_flag) if valid_flag is not None else bool(raw.get("valid", False)),
+                            "reason": _normalize_reason(raw),
                         }
                     )
 
@@ -273,13 +327,67 @@ class OpenAIClient:
                 if isinstance(alt_words, list):
                     for item in alt_words:
                         if isinstance(item, dict):
+                            valid_flag = _resolve_valid_flag(item)
                             normalized.append(
                                 {
                                     "word": str(item.get("word", "")),
-                                    "valid": bool(item.get("valid", False)),
-                                    "reason": str(item.get("reason", "")),
+                                    "valid": bool(valid_flag) if valid_flag is not None else bool(item.get("valid", False)),
+                                    "reason": _normalize_reason(item),
                                 }
                             )
+
+            # Niektoré odpovede môžu mať tvar {"SLOVO": true, ...}
+            if not normalized:
+                bool_map = {
+                    k: v
+                    for k, v in raw.items()
+                    if isinstance(k, str)
+                    and k not in reserved_keys
+                    and isinstance(v, bool)
+                }
+                if bool_map:
+                    used_keys: set[str] = set()
+
+                    def _fallback_reason(valid: bool) -> str:
+                        if valid:
+                            return "Model confirmed validity without explanation."
+                        return "Model rejected word without explanation."
+
+                    for expected in words:
+                        if not isinstance(expected, str):
+                            continue
+                        value = None
+                        if expected in bool_map:
+                            value = bool_map[expected]
+                            used_keys.add(expected)
+                        else:
+                            expected_cf = expected.casefold()
+                            for key, val in bool_map.items():
+                                if key in used_keys:
+                                    continue
+                                if key.casefold() == expected_cf:
+                                    value = val
+                                    used_keys.add(key)
+                                    break
+                        if value is not None:
+                            normalized.append(
+                                {
+                                    "word": expected,
+                                    "valid": bool(value),
+                                    "reason": _fallback_reason(bool(value)),
+                                }
+                            )
+
+                    for key, value in bool_map.items():
+                        if key in used_keys:
+                            continue
+                        normalized.append(
+                            {
+                                "word": key,
+                                "valid": bool(value),
+                                "reason": _fallback_reason(bool(value)),
+                            }
+                        )
 
             if normalized:
                 all_valid_raw = raw.get("all_valid")
