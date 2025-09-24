@@ -6,7 +6,6 @@ from scrabgpt.core.board import Board
 from scrabgpt.core.scoring import apply_premium_consumption
 from scrabgpt.core.state import (
     build_save_state_dict,
-    SaveGameState,
     parse_save_state_dict,
     restore_bag_from_save,
     restore_board_from_save,

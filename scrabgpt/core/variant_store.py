@@ -144,7 +144,7 @@ def _load_variant_from_path(path: Path) -> VariantDefinition:
     return VariantDefinition(
         slug=slug,
         language=language,
-        letters=tuple(sorted(letters, key=lambda l: l.letter)),
+        letters=tuple(sorted(letters, key=lambda letter: letter.letter)),
         source=source,
         fetched_at=str(fetched_at) if fetched_at else None,
     )
