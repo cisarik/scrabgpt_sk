@@ -45,7 +45,7 @@ from PySide6.QtWidgets import (
     QToolBar, QLabel, QSplitter, QStatusBar, QMessageBox, QPushButton,
     QDialog, QFormLayout, QLineEdit, QDialogButtonBox, QListWidget, QListWidgetItem,
     QGridLayout, QGraphicsDropShadowEffect, QListView, QPlainTextEdit, QCheckBox,
-    QComboBox, QSizePolicy, QStyleOptionViewItem, QStyledItemDelegate, QStyle
+    QComboBox, QSizePolicy, QStyleOptionViewItem, QStyledItemDelegate, QStyle, QButtonGroup
 )
 from ..logging_setup import configure_logging, TRACE_ID_VAR, default_log_path
 
@@ -100,6 +100,16 @@ class _SpinnerEntry:
     owner: str
     base_text: str
     wait_cursor: bool
+
+
+@dataclass(frozen=True)
+class _WordScoreDetail:
+    word: str
+    base_points: int
+    letter_bonus_points: int
+    word_multiplier: int
+    total: int
+    reason: str
 
 # ---------- Logging + trace_id ----------
 # Použi centralizovanú konfiguráciu (zabráni duplicitám handlerov)
@@ -1427,6 +1437,8 @@ class MainWindow(QMainWindow):
         self._last_move_breakdown: list[tuple[str, int, int, int, int]] = []  # (word, base, letter_bonus, word_mult, total)
         self._last_move_bingo: bool = False
         self._last_move_reason: str = ""
+        self._last_move_word_details: list[_WordScoreDetail] = []
+        self._active_word_index: int | None = None
 
         # Repro mód nastavenia (iba runtime)
         # Pozn.: Nastavuje sa v dialógu Nastavenia a používa pri "Nová hra".
@@ -1497,6 +1509,45 @@ class MainWindow(QMainWindow):
         shadow_scores.setColor(QColor(0, 0, 0, 150))
         self.lbl_scores.setGraphicsEffect(shadow_scores)
         spv.addWidget(self.lbl_scores)
+        self.word_tabs_container = QWidget(self.score_panel)
+        self._word_tabs_layout = QHBoxLayout(self.word_tabs_container)
+        self._word_tabs_layout.setContentsMargins(0, 6, 0, 6)
+        self._word_tabs_layout.setSpacing(8)
+        self._word_tabs_layout.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        self.word_tabs_container.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        self.word_tabs_container.setStyleSheet(
+            """
+            QPushButton {
+                background-color: rgba(255, 255, 255, 0.08);
+                border: 1px solid rgba(255, 255, 255, 0.25);
+                border-radius: 6px;
+                padding: 4px 12px;
+                color: #f4f4f4;
+            }
+            QPushButton:checked {
+                background-color: #4caf50;
+                border-color: #3f9143;
+                color: #0b1c00;
+            }
+            QPushButton:checked:hover {
+                background-color: #5cc75f;
+                border-color: #4caf50;
+            }
+            QPushButton:checked:pressed {
+                background-color: #3f9143;
+                border-color: #2e6f33;
+            }
+            QPushButton:hover {
+                background-color: rgba(255, 255, 255, 0.18);
+            }
+            """
+        )
+        self._word_tabs_group = QButtonGroup(self.word_tabs_container)
+        self._word_tabs_group.setExclusive(True)
+        self._word_tabs_group.idClicked.connect(self._on_last_move_tab_clicked)
+        self._word_tab_buttons: list[QPushButton] = []
+        spv.addWidget(self.word_tabs_container)
+        self.word_tabs_container.hide()
         self.lbl_last_breakdown = QLabel("")
         self.lbl_last_breakdown.setWordWrap(True)
         self.lbl_last_breakdown.setStyleSheet(
@@ -1515,6 +1566,7 @@ class MainWindow(QMainWindow):
         )
         self.lbl_last_reason.hide()
         spv.addWidget(self.lbl_last_reason)
+        self._clear_last_move_word_details()
         self.btn_reroll = QPushButton("Opakovať žreb")
         self.btn_reroll.clicked.connect(self._on_repeat_starter_draw)
         spv.addWidget(self.btn_reroll)
@@ -1675,6 +1727,7 @@ class MainWindow(QMainWindow):
         self._last_move_breakdown = []
         self._last_move_bingo = False
         self._last_move_reason = ""
+        self._clear_last_move_word_details()
         self.board_view.set_last_move_cells([])
         self._update_scores_label()
         self.act_new.setText("🏳️ Vzdať sa")
@@ -1801,6 +1854,7 @@ class MainWindow(QMainWindow):
         self._last_move_breakdown = []
         self._last_move_bingo = False
         self._last_move_reason = ""
+        self._clear_last_move_word_details()
         self._pending_words_coords = []
         self._consecutive_passes = 0
         self._pass_streak = {"HUMAN": 0, "AI": 0}
@@ -1824,21 +1878,74 @@ class MainWindow(QMainWindow):
 
     def _update_last_move_breakdown_ui(self) -> None:
         """Aktualizuje panel rozpisu 'Posledný ťah'."""
-        if not self._last_move_breakdown and not self._last_move_bingo:
+        if not self._last_move_word_details or self._active_word_index is None:
             self.lbl_last_breakdown.setText("")
+            self.word_tabs_container.hide()
             return
-        lines: list[str] = []
-        for (w, base, lb, mult, total) in self._last_move_breakdown:
-            line = (
-                f"<span style='font-weight:bold'><br>{w}</span>: <br/>{base}, "
-                f"písmená +{lb}, násobok ×{mult} → <span style='font-weight:bold'>{total}</span>"
-            )
-            lines.append(line)
+        count = len(self._last_move_word_details)
+        if not (0 <= self._active_word_index < count):
+            self._active_word_index = 0
+        detail = self._last_move_word_details[self._active_word_index]
+        self.word_tabs_container.show()
+        line = (
+            f"{detail.base_points}, písmená +{detail.letter_bonus_points}, "
+            f"násobok ×{detail.word_multiplier} → "
+            f"<span style='font-weight:bold'>{detail.total}</span>"
+        )
+        lines = [line]
         if self._last_move_bingo:
             lines.append("<span style='color:#9cff9c'>+50 bingo!</span>")
         html_lines = "<br/>".join(lines)
-        prefix = ""
-        self.lbl_last_breakdown.setText(f"<div style='margin-bottom:6px'>{prefix}</div>{html_lines}")
+        self.lbl_last_breakdown.setText(f"<div style='margin-bottom:6px'>{html_lines}</div>")
+
+    def _rebuild_last_move_word_tabs(self) -> None:
+        while self._word_tabs_layout.count():
+            item = self._word_tabs_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                self._word_tabs_group.removeButton(widget)
+                widget.deleteLater()
+        self._word_tab_buttons.clear()
+        if not self._last_move_word_details:
+            self.word_tabs_container.hide()
+            return
+        for idx, detail in enumerate(self._last_move_word_details):
+            btn = QPushButton(detail.word, self.word_tabs_container)
+            btn.setCheckable(True)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            self._word_tabs_layout.addWidget(btn)
+            self._word_tabs_group.addButton(btn, idx)
+            self._word_tab_buttons.append(btn)
+        self._word_tabs_layout.addStretch(1)
+        self.word_tabs_container.show()
+
+    def _select_last_move_word(self, index: int) -> None:
+        if not self._last_move_word_details:
+            self._active_word_index = None
+            self.lbl_last_breakdown.setText("")
+            self.word_tabs_container.hide()
+            self._set_last_move_reason("")
+            return
+        index = max(0, min(index, len(self._last_move_word_details) - 1))
+        self._active_word_index = index
+        try:
+            self._word_tabs_group.blockSignals(True)
+            for idx, btn in enumerate(self._word_tab_buttons):
+                btn.setChecked(idx == index)
+        finally:
+            self._word_tabs_group.blockSignals(False)
+        detail = self._last_move_word_details[index]
+        self._set_last_move_reason(detail.reason)
+        self._update_last_move_breakdown_ui()
+
+    def _on_last_move_tab_clicked(self, index: int) -> None:
+        self._select_last_move_word(index)
+
+    def _clear_last_move_word_details(self) -> None:
+        self._last_move_word_details = []
+        self._active_word_index = None
+        self._rebuild_last_move_word_tabs()
+        self.lbl_last_breakdown.setText("")
 
     def _update_last_move_reason_ui(self) -> None:
         """Zobrazí alebo schová dôvod rozhodcu pre posledný platný ťah."""
@@ -1879,6 +1986,47 @@ class MainWindow(QMainWindow):
             if not fallback_reason:
                 fallback_reason = reason
         return fallback_reason
+
+    @staticmethod
+    def _build_reason_lookup(entries: Sequence[dict[str, Any]]) -> dict[str, str]:
+        lookup: dict[str, str] = {}
+        for entry in entries:
+            word = str(entry.get("word", "")).strip()
+            if not word:
+                continue
+            reason = str(entry.get("reason", "")).strip()
+            if reason:
+                lookup[word.casefold()] = reason
+        return lookup
+
+    def _compose_last_move_word_details(
+        self,
+        breakdown: Sequence[tuple[str, int, int, int, int]],
+        entries: Sequence[dict[str, Any]],
+        preferred_word: str,
+        fallback_reason: str,
+    ) -> list[_WordScoreDetail]:
+        lookup = self._build_reason_lookup(entries)
+        preferred_cf = preferred_word.casefold() if preferred_word else None
+        details: list[_WordScoreDetail] = []
+        for idx, (word, base, letter_bonus, word_multiplier, total) in enumerate(breakdown):
+            reason = lookup.get(word.casefold(), "")
+            if not reason:
+                if preferred_cf and word.casefold() == preferred_cf and fallback_reason:
+                    reason = fallback_reason
+                elif not preferred_cf and idx == 0 and fallback_reason:
+                    reason = fallback_reason
+            details.append(
+                _WordScoreDetail(
+                    word=word,
+                    base_points=base,
+                    letter_bonus_points=letter_bonus,
+                    word_multiplier=word_multiplier,
+                    total=total,
+                    reason=reason,
+                )
+            )
+        return details
 
     @staticmethod
     def _format_judge_status(words: list[str]) -> str:
@@ -2289,10 +2437,22 @@ class MainWindow(QMainWindow):
         if words_coords:
             main_word = max(words_coords, key=lambda item: len(item[0]))[0]
         reason_text = self._extract_reason_from_entries(entries, main_word)
-        self._set_last_move_reason(reason_text)
         total, _bd = score_words(self.board, self.pending, words_coords)
         # uloz rozpis pre UI
         self._last_move_breakdown = [(bd.word, bd.base_points, bd.letter_bonus_points, bd.word_multiplier, bd.total) for bd in _bd]
+        self._last_move_word_details = self._compose_last_move_word_details(
+            self._last_move_breakdown,
+            entries,
+            main_word,
+            reason_text,
+        )
+        self._rebuild_last_move_word_tabs()
+        if self._last_move_word_details:
+            self._select_last_move_word(0)
+        else:
+            self._active_word_index = None
+            self._set_last_move_reason(reason_text)
+            self._update_last_move_breakdown_ui()
         self._last_move_bingo = (len(self.pending) == 7)
         # zvyrazni posledne polozene bunky
         self.board_view.set_last_move_cells([(p.row, p.col) for p in self.pending])
@@ -2856,10 +3016,22 @@ class MainWindow(QMainWindow):
         words_coords = self._ai_judge_words_coords
         ps2 = self._ai_ps2
         reason_text = self._extract_reason_from_entries(entries, self._ai_last_main_word or "")
-        self._set_last_move_reason(reason_text)
         total, _bd = score_words(self.board, ps2, words_coords)
         # rozpis pre UI (posledny tah = AI tah)
         self._last_move_breakdown = [(bd.word, bd.base_points, bd.letter_bonus_points, bd.word_multiplier, bd.total) for bd in _bd]
+        self._last_move_word_details = self._compose_last_move_word_details(
+            self._last_move_breakdown,
+            entries,
+            self._ai_last_main_word or "",
+            reason_text,
+        )
+        self._rebuild_last_move_word_tabs()
+        if self._last_move_word_details:
+            self._select_last_move_word(0)
+        else:
+            self._active_word_index = None
+            self._set_last_move_reason(reason_text)
+            self._update_last_move_breakdown_ui()
         self._last_move_bingo = (len(ps2) == 7)
         self.board_view.set_last_move_cells([(p.row, p.col) for p in ps2])
         if len(ps2) == 7:
@@ -3005,6 +3177,10 @@ class MainWindow(QMainWindow):
         if visible:
             self.lbl_scores.show()
             self.lbl_last_breakdown.show()
+            if self._last_move_word_details:
+                self.word_tabs_container.show()
+            else:
+                self.word_tabs_container.hide()
             if self._last_move_reason.strip():
                 self.lbl_last_reason.show()
             self.rack.show()
@@ -3014,6 +3190,7 @@ class MainWindow(QMainWindow):
             self._stored_split_sizes = self.split.sizes()
             self.lbl_last_breakdown.hide()
             self.lbl_last_reason.hide()
+            self.word_tabs_container.hide()
             self.btn_reroll.hide()
             self.rack.hide()
         self._game_ui_visible = visible
@@ -3122,6 +3299,7 @@ class MainWindow(QMainWindow):
             self.repro_mode = bool(st.get("repro", False))
             self.repro_seed = int(st.get("seed", 0))
             self._last_move_reason = str(st.get("last_move_reason", ""))
+            self._clear_last_move_word_details()
             # UI refresh
             self.rack.set_letters(self.human_rack)
             self._set_game_ui_visible(True)
