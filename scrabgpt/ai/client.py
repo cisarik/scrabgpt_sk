@@ -344,6 +344,34 @@ class OpenAIClient:
                                 }
                             )
 
+            # Niektoré odpovede môžu mať tvar {"SLOVO": {"valid": true, ...}}
+            if not normalized:
+                raw_word_map: list[dict[str, Any]] = []
+                for key, value in raw.items():
+                    if not isinstance(key, str) or not isinstance(value, dict):
+                        continue
+                    word_field = value.get("word") if isinstance(value.get("word"), str) else None
+                    word = (word_field or key).strip()
+                    if not word:
+                        continue
+                    entry = dict(value)
+                    entry["word"] = word
+                    valid_flag = _resolve_valid_flag(value)
+                    entry["valid"] = bool(valid_flag) if valid_flag is not None else bool(value.get("valid", False))
+                    entry["reason"] = _normalize_reason(entry)
+                    raw_word_map.append(entry)
+                if raw_word_map:
+                    seen: set[str] = set()
+                    for entry in raw_word_map:
+                        word = entry.get("word")
+                        if not isinstance(word, str):
+                            continue
+                        key_cf = word.casefold()
+                        if key_cf in seen:
+                            continue
+                        seen.add(key_cf)
+                        normalized.append(entry)
+
             # Niektoré odpovede môžu mať tvar {"SLOVO": true, ...}
             if not normalized:
                 bool_map = {

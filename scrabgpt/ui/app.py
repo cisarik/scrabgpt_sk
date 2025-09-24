@@ -2319,6 +2319,18 @@ class MainWindow(QMainWindow):
                     if isinstance(item, dict):
                         entries.append(item)
         if not entries:
+            for key, value in resp.items():
+                if isinstance(value, dict) and ("valid" in value or "reason" in value or "word" in value):
+                    word = value.get("word") if isinstance(value.get("word"), str) else None
+                    if word is None and isinstance(key, str):
+                        word = key
+                    normalized = dict(value)
+                    if word is not None:
+                        normalized["word"] = word
+                    if word is not None and any(entry.get("word") == word for entry in entries):
+                        continue
+                    entries.append(normalized)
+        if not entries:
             if isinstance(resp.get("word"), str):
                 entries.append(
                     {

@@ -56,3 +56,31 @@ def test_judge_words_accepts_is_playable_inside_results() -> None:
     assert result["results"][0]["word"] == "OČI"
     assert result["results"][0]["valid"] is True
     assert result["results"][0]["reason"] == "Povolené v oficiálnom slovníku."
+
+
+def test_judge_words_handles_word_keyed_payload() -> None:
+    payload = {
+        "VODE": {
+            "valid": True,
+            "reason": "Platný tvar podstatného mena 'voda'.",
+        },
+        "DRIEME": {
+            "valid": True,
+            "reason": "Prítomný čas slovesa 'driemať'.",
+        },
+    }
+
+    class Dummy(OpenAIClient):
+        def __init__(self) -> None:
+            self.judge_max_output_tokens = 800
+
+        def _call_json(self, prompt, schema, *, max_output_tokens=None):  # type: ignore[override]
+            return payload
+
+    client = Dummy()
+
+    result = client.judge_words(["VODE", "DRIEM"], language="Slovak")
+
+    assert result["all_valid"] is True
+    assert {entry["word"] for entry in result["results"]} == {"VODE", "DRIEME"}
+    assert all(entry["valid"] for entry in result["results"])
