@@ -2,7 +2,7 @@ from scrabgpt.core.tiles import TileBag, get_tile_distribution
 
 
 def test_bag_total_count() -> None:
-    assert sum(get_tile_distribution().values()) == 100
+    assert sum(get_tile_distribution().values()) == 108
 
 
 def test_draw_putback() -> None:

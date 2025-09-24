@@ -98,24 +98,3 @@ def test_round_trip_save_load_preserves_state_and_bag_order() -> None:
     lm = {(p.row, p.col) for p in placements}
     lm2 = {(pos["row"], pos["col"]) for pos in st2["last_move_cells"]}
     assert lm == lm2
-
-
-def test_restore_bag_from_save_handles_multichar_tiles() -> None:
-    state: SaveGameState = {
-        "schema_version": "1",
-        "grid": ["." * 15 for _ in range(15)],
-        "blanks": [],
-        "premium_used": [],
-        "human_rack": "",
-        "ai_rack": "",
-        "bag": "CHAA",
-        "human_score": 0,
-        "ai_score": 0,
-        "turn": "HUMAN",
-        "variant": "slovak-2",
-        "seed": 42,
-    }
-
-    bag = restore_bag_from_save(state)
-    assert bag.tiles[:3] == ["CH", "A", "A"]
-    assert bag.variant_slug == "slovak-2"

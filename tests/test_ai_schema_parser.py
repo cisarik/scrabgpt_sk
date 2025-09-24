@@ -66,3 +66,28 @@ def test_invalid_direction_raises_in_canonicalization() -> None:
     with pytest.raises(ValueError) as ei:
         _ = to_move_payload(m)
     assert "direction_invalid" in str(ei.value)
+
+
+def test_pass_without_placements_is_allowed() -> None:
+    payload = {"pass": True}
+    m = parse_ai_move(json.dumps(payload))
+    can = to_move_payload(m)
+    assert can["pass"] is True
+    assert can["placements"] == []
+
+
+def test_pass_with_tiles_is_rejected() -> None:
+    payload = {
+        "pass": True,
+        "placements": [{"row": 7, "col": 7, "letter": "A"}],
+    }
+    with pytest.raises(ValueError) as ei:
+        parse_ai_move(json.dumps(payload))
+    assert "pass_move_must_not_have_placements" in str(ei.value)
+
+
+def test_missing_placements_without_pass_is_rejected() -> None:
+    payload = {"start": {"row": 7, "col": 7}, "direction": "ACROSS"}
+    with pytest.raises(ValueError) as ei:
+        parse_ai_move(json.dumps(payload))
+    assert "placements_required_for_play" in str(ei.value)

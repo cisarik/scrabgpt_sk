@@ -102,7 +102,7 @@ def _build_prompt(compact_state: str, variant: VariantDefinition, retry_hint: st
         f"Do not glue your letters to adjacent existing letters unless the resulting main word is a valid {language} word. "
         "Use intersections/hooks properly; you may share letters with the board only at overlapping cells; do not extend an existing word into a non-word. "
         "The field 'word' must equal the final main word formed on the board (existing board letters plus your placements). "
-        f"All cross-words should plausibly be valid {language} words. Diacritics is very important to (Distinguish between 'Ú' and 'U' for example and do not swap them ever!) "
+        f"All cross-words should plausibly be valid {language} words. Diacritics is very important so distinguishing between 'Ú' and 'U' for example and every letter with diacritic."
         "ONLY If no legal move exists, you may pass (set 'pass': true) but it's better to to gain as many points as possible then pass. "
         "If the board is empty, the first move must cross the center star at H8 (row=7,col=7). "
         "Coordinates are 0-based. No explanations — JSON only. "

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from typing import Any, TypedDict, cast
+from typing import Any, Sequence, TypedDict, cast
 
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -20,6 +20,12 @@ class JudgeResult(TypedDict):
 class JudgeBatchResponse(TypedDict):
     results: list[JudgeResult]
     all_valid: bool
+
+class DisputeJudgeResult(TypedDict):
+    word: str
+    valid: bool
+    reason: str
+    attempts_left: int
 
 class MoveProposal(TypedDict):
     placements: list[dict[str, int | str]]
@@ -228,12 +234,13 @@ class OpenAIClient:
             "Reply with JSON only. "
             "Use the official Scrabble lexicon as primary evidence. "
             "Also consider attested usage in real sentences and corpora when judging legality. "
-            f"If a word is naturally used as an independent {language} word, treat it as playable even "
-            "when it lacks an entry in the lexicon."
+            "If a word is naturally used as an independent {language} word, treat it as playable even "
+            "when it lacks an entry in the lexicon. "
         )
         if language.lower() == "slovak":
             sys_prompt += (
-                " For each word, confirm it can stand on its own in a natural Slovak sentence. "
+                "Diacritics is very important so distinguishing between 'Ú' and 'U' for example and every letter with diacritic"
+                "For each word, confirm it can stand on its own in a natural Slovak sentence. "
                 "Treat regular inflected forms of recognised lemmas "
                 "(like plurals or case variants) as valid even without lexicon coverage. "
                 "Before rejecting a word, actively look for its use in idioms, sayings, "
@@ -422,6 +429,83 @@ class OpenAIClient:
 
         # Fallback: create minimal structure
         return cast(JudgeBatchResponse, {"results": [], "all_valid": False})
+
+    def dispute_word(
+        self,
+        *,
+        word: str,
+        language: str,
+        history: Sequence[tuple[str, str]],
+        attempts_left: int,
+    ) -> DisputeJudgeResult:
+        """Prehodnotí jedno slovo na základe argumentácie hráča."""
+
+        schema = {
+            "type": "object",
+            "properties": {
+                "word": {"type": "string"},
+                "valid": {"type": "boolean"},
+                "reason": {"type": "string"},
+                "attempts_left": {"type": "integer", "minimum": 0},
+            },
+            "required": ["word", "valid", "reason", "attempts_left"],
+            "additionalProperties": False,
+        }
+
+        convo_lines: list[str] = []
+        for role, message in history:
+            label = "Rozhodca" if role == "referee" else "Hráč"
+            convo_lines.append(f"{label}: {message}")
+        conversation = "\n".join(convo_lines) if convo_lines else "(Žiadna konverzácia)"
+
+        sys_prompt = (
+            "Si rozhodca slovenského Scrabble, ktorý pôvodne slovo zamietol a teraz "
+            "vyhodnocuje nové argumenty hráča. Rozhoduj striktne podľa slovenských "
+            "Scrabble pravidiel a vráť odpoveď presne vo forme JSON zodpovedajúcej "
+            "poskytnutej schéme. "
+            "Pole 'valid' nastav na true len ak aktuálne uznávaš slovo ako platné. "
+            "Do 'reason' vlož stručné odôvodnenie v slovenčine (1–3 vety). "
+            "Pole 'attempts_left' nastav na počet pokusov, ktoré hráč ešte môže využiť "
+            "po tomto vyhodnotení (nepôsob, keď už sú 0)."
+        )
+
+        user_prompt = (
+            f"Posudzované slovo: {word}\n"
+            f"Jazyk: {language}\n"
+            f"Zostávajúce pokusy hráča po tomto vyhodnotení: {attempts_left}\n"
+            "Konverzácia doteraz (chronologicky):\n"
+            f"{conversation}\n"
+            "Vráť výstup ako JSON presne podľa schémy (žiadny text mimo JSON)."
+        )
+
+        raw = self._call_json(
+            sys_prompt + "\n" + user_prompt,
+            schema,
+            max_output_tokens=self.judge_max_output_tokens,
+        )
+
+        if not isinstance(raw, dict):
+            raise ValueError("Neplatná odpoveď rozhodcu pri spornej argumentácii")
+
+        word_value = str(raw.get("word", word)).strip() or word
+        valid_value = bool(raw.get("valid", False))
+        reason_value = str(raw.get("reason", "")).strip()
+        attempts_reported = raw.get("attempts_left")
+        if not isinstance(attempts_reported, int) or attempts_reported < 0:
+            attempts_reported = max(0, attempts_left)
+
+        if not reason_value:
+            if valid_value:
+                reason_value = "Rozhodca uznal platnosť bez dodatočného vysvetlenia."
+            else:
+                reason_value = "Rozhodca odmietol bez dodatočného vysvetlenia."
+
+        return {
+            "word": word_value,
+            "valid": valid_value,
+            "reason": reason_value,
+            "attempts_left": attempts_reported,
+        }
 
     # ---------------- AI hrac ----------------
     def propose_move(

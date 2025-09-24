@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import Any, Literal, cast
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 Direction = Literal["ACROSS", "DOWN"]
 
@@ -55,10 +55,21 @@ class MoveModel(BaseModel):
     start: Coord | None = None
 
     direction: str = "ACROSS"
-    placements: list[Placement]
+    placements: list[Placement] = Field(default_factory=list)
     blanks: dict[str, Any] | None = None
     word: str | None = None
     pass_: bool | None = Field(None, alias="pass")
+
+    @model_validator(mode="after")
+    def _ensure_pass_has_no_tiles(self) -> "MoveModel":
+        """Overí konzistenciu medzi `pass` a zoznamom kameňov."""
+
+        if self.pass_:
+            if self.placements:
+                raise ValueError("pass_move_must_not_have_placements")
+        elif not self.placements:
+            raise ValueError("placements_required_for_play")
+        return self
 
     @field_validator("direction", mode="before")
     @classmethod
