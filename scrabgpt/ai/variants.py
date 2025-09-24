@@ -49,6 +49,25 @@ class LanguageInfo:
         return any(alias.casefold() == q for alias in self.aliases)
 
 
+def _coerce_int(value: object) -> int:
+    """Ensure JSON values for counts/points are integers."""
+
+    if value is None or isinstance(value, bool):
+        raise TypeError("numeric value missing")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if not value.is_integer():
+            raise ValueError(f"expected integer, got {value}")
+        return int(value)
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("empty string cannot be converted to int")
+        return int(stripped)
+    raise TypeError(f"unsupported numeric value: {value!r}")
+
+
 def _ensure_variants_dir() -> None:
     _VARIANTS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -304,8 +323,8 @@ def fetch_variant_definition(
             log.warning("variant_letter_missing idx=%s raw=%r", idx, letter_raw)
             continue
         try:
-            count = int(item.get("count"))
-            points = int(item.get("points"))
+            count = _coerce_int(item.get("count"))
+            points = _coerce_int(item.get("points"))
         except (TypeError, ValueError):
             log.warning("variant_letter_bad_numbers letter=%s raw=%r", letter, item)
             continue

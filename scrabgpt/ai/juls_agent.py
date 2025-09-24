@@ -6,7 +6,7 @@ import re
 import time
 import urllib.parse
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, cast
 
 import httpx
 from bs4 import BeautifulSoup
@@ -91,10 +91,10 @@ def parse_juls_results(html_text: str, base_url: str, query_word: str) -> List[M
     items: List[MatchItem] = []
 
     for section in soup.select("section[id^=qb_]"):
-        section_id = section.get("id", "")
-        if not section_id.startswith("qb_"):
+        section_id_obj = section.get("id")
+        if not isinstance(section_id_obj, str) or not section_id_obj.startswith("qb_"):
             continue
-        dictionary = section_id[3:].strip() or "?"
+        dictionary = section_id_obj[3:].strip() or "?"
         for body in section.select(".resultbody"):
             body_text = _clip(body.get_text(" ", strip=True), 200)
             headword = ""
@@ -236,7 +236,10 @@ def _call_agent_json(
                 "json_schema": schema,
             },
         )
-        return resp.output_text
+        output_text = getattr(resp, "output_text", None)
+        if not isinstance(output_text, str):
+            raise RuntimeError("OpenAI response neobsahuje textovú odpoveď.")
+        return output_text
     except TypeError as exc:
         # staršie SDK nepodporujú response_format pre Responses API
         try:
@@ -284,9 +287,12 @@ def agent_validate_word(word: str, *, openai_api_key: str) -> Dict[str, Any]:
     if not content:
         raise RuntimeError("JÚĽŠ agent nevrátil žiadnu odpoveď.")
     try:
-        return json.loads(content)
+        parsed = json.loads(content)
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"JÚĽŠ agent poskytol neplatný JSON: {content}") from exc
+    if not isinstance(parsed, dict):
+        raise RuntimeError("JÚĽŠ agent nevrátil objekt JSON.")
+    return cast(Dict[str, Any], parsed)
 
 
 def plain_validate_word(word: str) -> dict[str, Any]:

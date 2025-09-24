@@ -100,6 +100,25 @@ def slugify(text: str) -> str:
     return cleaned or "variant"
 
 
+def _coerce_int(value: object) -> int:
+    """Convert JSON-loaded numeric values into ints with validation."""
+
+    if value is None or isinstance(value, bool):
+        raise TypeError("numeric value missing")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if not value.is_integer():
+            raise ValueError(f"expected integer, got {value}")
+        return int(value)
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("empty string cannot be converted to int")
+        return int(stripped)
+    raise TypeError(f"unsupported numeric value: {value!r}")
+
+
 def _load_variant_from_path(path: Path) -> VariantDefinition:
     data = json.loads(path.read_text(encoding="utf-8"))
     language = str(data.get("language") or data.get("name") or "Unknown")
@@ -130,8 +149,8 @@ def _load_variant_from_path(path: Path) -> VariantDefinition:
             )
             continue
         try:
-            count = int(raw.get("count"))
-            points = int(raw.get("points"))
+            count = _coerce_int(raw.get("count"))
+            points = _coerce_int(raw.get("points"))
         except (TypeError, ValueError):
             log.warning("variant_letter_bad_numeric path=%s letter=%s", path, letter)
             continue

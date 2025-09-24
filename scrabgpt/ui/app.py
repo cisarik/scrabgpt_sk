@@ -12,6 +12,7 @@ from pathlib import Path
 from PySide6.QtCore import (
     Qt,
     QSize,
+    QRect,
     QRectF,
     QTimer,
     Signal,
@@ -46,7 +47,8 @@ from PySide6.QtWidgets import (
     QDialog, QFormLayout, QLineEdit, QDialogButtonBox, QListWidget, QListWidgetItem,
     QGridLayout, QGraphicsDropShadowEffect, QListView, QPlainTextEdit, QCheckBox,
     QTextBrowser,
-    QComboBox, QSizePolicy, QStyleOptionViewItem, QStyledItemDelegate, QStyle, QButtonGroup
+    QComboBox, QSizePolicy, QStyleOptionViewItem, QStyledItemDelegate, QStyle, QButtonGroup,
+    QAbstractButton,
 )
 from ..logging_setup import configure_logging, TRACE_ID_VAR, default_log_path
 
@@ -1552,7 +1554,21 @@ class RackTileDelegate(QStyledItemDelegate):
         else:
             highlight_strength = 0.0
 
-        available = option.rect.adjusted(3, 3, -3, -3)
+        rect_attr = getattr(option, "rect", None)
+        if not isinstance(rect_attr, QRect):
+            painter.restore()
+            return
+        state_attr = getattr(option, "state", 0)
+        if isinstance(state_attr, QStyle.StateFlag):
+            state_flags = state_attr
+        elif isinstance(state_attr, int):
+            try:
+                state_flags = QStyle.StateFlag(state_attr)
+            except Exception:
+                state_flags = QStyle.StateFlag(0)
+        else:
+            state_flags = QStyle.StateFlag(0)
+        available = rect_attr.adjusted(3, 3, -3, -3)
         side = min(available.width(), available.height() - 2)
         cx = available.center().x()
         cy = available.center().y() - 1.0
@@ -1569,11 +1585,11 @@ class RackTileDelegate(QStyledItemDelegate):
         gradient.setColorAt(1.0, QColor(225, 225, 225))
         painter.fillPath(tile_path, QBrush(gradient))
 
-        if option.state & QStyle.State_MouseOver:
+        if bool(state_flags & QStyle.StateFlag.State_MouseOver):
             painter.fillPath(tile_path, QColor(140, 195, 140, 60))
 
         border_color = QColor(160, 160, 160)
-        if option.state & QStyle.State_Selected:
+        if bool(state_flags & QStyle.StateFlag.State_Selected):
             painter.fillPath(tile_path, QColor(80, 145, 100, 70))
             border_color = QColor(70, 125, 90)
 
@@ -1737,7 +1753,7 @@ class RackListWidget(QListWidget):
             self._drop_gap_index = None
             self.viewport().update()
 
-    def paintEvent(self, event: QPaintEvent) -> None:  # type: ignore[override]
+    def paintEvent(self, event: QPaintEvent) -> None:
         super().paintEvent(event)
         if self._drop_gap_index is None:
             return
@@ -1837,7 +1853,7 @@ class RackListWidget(QListWidget):
         self._highlight_item_key = id(moved_item) if moved_item is not None else None
         self._reorder_animation = QVariantAnimation(self)
         self._reorder_animation.setDuration(260)
-        self._reorder_animation.setEasingCurve(QEasingCurve.OutBack)
+        self._reorder_animation.setEasingCurve(QEasingCurve.Type.OutBack)
         self._reorder_animation.setStartValue(0.0)
         self._reorder_animation.setEndValue(1.0)
         self._reorder_animation.valueChanged.connect(self._apply_animation_frame)
@@ -2193,7 +2209,7 @@ class MainWindow(QMainWindow):
         spv.addStretch(1)
         self.btn_confirm = QPushButton("Potvrdiť ťah")
         self.btn_confirm.clicked.connect(self.confirm_move)
-        self.btn_confirm.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.btn_confirm.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.btn_confirm.setMinimumHeight(40)
         self.btn_confirm.setStyleSheet(
             "QPushButton {"
@@ -2224,7 +2240,7 @@ class MainWindow(QMainWindow):
         self.rack.letters_reordered.connect(self._on_rack_letters_reordered)
         self.btn_exchange = QPushButton("Vymeniť")
         self.btn_exchange.clicked.connect(self.exchange_human)
-        self.btn_exchange.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.btn_exchange.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         rack_bar = QWidget()
         rack_layout = QHBoxLayout(rack_bar)
         rack_layout.setContentsMargins(12, 8, 12, 8)
@@ -2254,7 +2270,7 @@ class MainWindow(QMainWindow):
         # Guard pre otvárací ťah AI (zabraňuje dvojitému volaniu pri štarte)
         self._ai_opening_active: bool = False
         self._consecutive_passes: int = 0
-        self._pass_streak: dict[StarterSide, int] = {"HUMAN": 0, "AI": 0}
+        self._pass_streak: dict[str, int] = {"HUMAN": 0, "AI": 0}
         self._no_moves_possible: bool = False
         self._game_over: bool = False
         self._game_end_reason: GameEndReason | None = None
@@ -2530,8 +2546,9 @@ class MainWindow(QMainWindow):
         while self._word_tabs_layout.count():
             item = self._word_tabs_layout.takeAt(0)
             widget = item.widget()
-            if widget is not None:
+            if isinstance(widget, QAbstractButton):
                 self._word_tabs_group.removeButton(widget)
+            if widget is not None:
                 widget.deleteLater()
         self._word_tab_buttons.clear()
         if not self._last_move_word_details:
@@ -3124,7 +3141,11 @@ class MainWindow(QMainWindow):
         # spotrebuj rack presne o pouzite pismena a dopln z tasky
         before = "".join(self.human_rack)
         used = ",".join(p.letter for p in self.pending)
-        new_rack = consume_rack(self.human_rack, self.pending)
+        # Rack už v tomto momente neobsahuje dočasne položené kamene –
+        # odobrali sme ich pri interakcii hráča (drag alebo klik z racku).
+        # Opätovné volanie `consume_rack` by preto odstránilo aj iné blanky,
+        # ktoré na racku zostali. Pracujeme teda priamo s aktuálnym stavom.
+        new_rack = list(self.human_rack)
         draw_cnt = max(0, 7 - len(new_rack))
         drawn = self.bag.draw(draw_cnt) if draw_cnt > 0 else []
         new_rack.extend(drawn)
