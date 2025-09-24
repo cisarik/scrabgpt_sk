@@ -1,8 +1,25 @@
 from scrabgpt.core.tiles import TileBag, get_tile_distribution
+from scrabgpt.core.variant_store import list_installed_variants
+
+
+EXPECTED_TILE_COUNTS: dict[str, int] = {
+    "english": 100,
+    "slovak": 108,
+}
 
 
 def test_bag_total_count() -> None:
-    assert sum(get_tile_distribution().values()) == 108
+    variants = list_installed_variants()
+    found_slugs = {variant.slug for variant in variants}
+    missing_expectations = sorted(found_slugs - EXPECTED_TILE_COUNTS.keys())
+    assert not missing_expectations, (
+        "Add expected tile totals for new variants:"
+        f" {', '.join(missing_expectations)}"
+    )
+
+    for variant in variants:
+        distribution = get_tile_distribution(variant)
+        assert sum(distribution.values()) == EXPECTED_TILE_COUNTS[variant.slug]
 
 
 def test_draw_putback() -> None:
