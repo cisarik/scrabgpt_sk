@@ -28,46 +28,82 @@ def _build_prompt(compact_state: str, variant: VariantDefinition, retry_hint: st
     - Dopĺňa sanity pravidlá a krátky príklad hook vs. zlé lepenie.
     - `retry_hint` (ak je) doplní na koniec promptu.
     """
-    def _build_premium_summary() -> str:
-        """Vytvorí kompaktný zoznam súradníc prémiových polí.
+    def _overlay_premiums(state: str) -> tuple[str, str] | None:
+        """Vráti stav s prémiami priamo v gride a legendu symbolov.
 
-        Komentár (SK): Čítame `premiums.json` a vraciame krátku vetu,
-        ktorú vložíme do promptu pre lepšie rozhodovanie AI.
+        - Pre prázdne prémiové políčka nahradí '.' symbolom z legendy.
+        - Obsadené políčka nechá bez zmeny, aby ostali pôvodné písmená.
         """
+
+        trailing_newline = state.endswith("\n")
+        lines = state.splitlines()
+
+        try:
+            grid_idx = lines.index("grid:")
+        except ValueError:
+            return None
+
+        grid_rows = lines[grid_idx + 1 : grid_idx + 16]
+        if len(grid_rows) != 15:
+            return None
+
         try:
             with open(get_premiums_path(), "r", encoding="utf-8") as f:
-                data: list[list[str]] = json.load(f)
-            tags: dict[str, list[tuple[int, int]]] = {"TW": [], "DW": [], "TL": [], "DL": []}
-            for r, row in enumerate(data):
-                for c, tag in enumerate(row):
-                    if tag in tags:
-                        tags[tag].append((r, c))
-            def fmt(lst: list[tuple[int, int]]) -> str:
-                return "[" + ",".join(f"({r},{c})" for r, c in lst) + "]"
-            return (
-                "Premiums (0-based row,col): "
-                f"TW:{fmt(tags['TW'])}; DW:{fmt(tags['DW'])}; "
-                f"TL:{fmt(tags['TL'])}; DL:{fmt(tags['DL'])}."
-            )
+                premium_layout: list[list[str]] = json.load(f)
         except Exception:
-            return ""
+            return None
 
-    prem_summary = _build_premium_summary()
+        if len(premium_layout) != 15 or any(len(row) != 15 for row in premium_layout):
+            return None
+
+        symbol_map: dict[str, str] = {"TW": "*", "DW": "~", "TL": "$", "DL": "^"}
+        new_grid_rows: list[str] = []
+        for r, row in enumerate(grid_rows):
+            if len(row) != 15:
+                return None
+            new_row_chars: list[str] = []
+            for c, ch in enumerate(row):
+                if ch != ".":
+                    new_row_chars.append(ch)
+                    continue
+
+                tag = premium_layout[r][c]
+                symbol = symbol_map.get(tag)
+                new_row_chars.append(symbol if symbol else ".")
+
+            new_grid_rows.append("".join(new_row_chars))
+
+        lines[grid_idx + 1 : grid_idx + 16] = new_grid_rows
+        updated_state = "\n".join(lines)
+        if trailing_newline:
+            updated_state += "\n"
+
+        legend = "*=TW (word*3), ~=DW (word*2), $=TL (letter*3), ^=DL (letter*2)"
+        return updated_state, legend
+
+    overlay = _overlay_premiums(compact_state)
+    if overlay:
+        compact_state_with_premiums, premium_legend = overlay
+    else:
+        compact_state_with_premiums = compact_state
+        premium_legend = None
     language = variant.language
     tile_summary = _format_tile_summary(variant)
 
     sys_prompt = (
         f"You are an expert Scrabble player for the {language} language variant. "
         "Play to win and obey official Scrabble rules for that language. "
-        "Reply with JSON only. Do NOT overwrite existing board letters; place only on empty cells. "
-        "Placements must form a single contiguous line with no gaps and must connect to existing letters after the first move. "
+        "Do NOT overwrite existing board letters; place only on empty cells. "
+        "Placements must form a single contiguous line with no gaps and must connect to existing letters after preiovus move. "
         "Use only letters from ai_rack; for '?' provide mapping in 'blanks' with the chosen uppercase letter (respecting diacritics). "
         f"Points you can get for each tile: {tile_summary}. "
+        "Always evaluate moves that use all 7 rack tiles for the 50 point bingo bonus; play it when legal. "
+        "Prefer the move that maximizes total points, spending high-value rack letters on premium squares. "
         f"Do not glue your letters to adjacent existing letters unless the resulting main word is a valid {language} word. "
         "Use intersections/hooks properly; you may share letters with the board only at overlapping cells; do not extend an existing word into a non-word. "
         "The field 'word' must equal the final main word formed on the board (existing board letters plus your placements). "
-        f"All cross-words should plausibly be valid {language} words. "
-        "If no high-value legal move exists, you may pass (set 'pass': true). "
+        f"All cross-words should plausibly be valid {language} words. Diacritics is very important to (Distinguish between 'Ú' and 'U' for example and do not swap them ever!) "
+        "ONLY If no legal move exists, you may pass (set 'pass': true) but it's better to to gain as many points as possible then pass. "
         "If the board is empty, the first move must cross the center star at H8 (row=7,col=7). "
         "Coordinates are 0-based. No explanations — JSON only. "
         "Always return a JSON object with keys: start:{row:int,col:int}, direction:'ACROSS'|'DOWN', placements:[{row,col,letter}], "
@@ -75,17 +111,13 @@ def _build_prompt(compact_state: str, variant: VariantDefinition, retry_hint: st
         "If you use '?' in placements, you must include the blanks mapping for each '?'."
     )
 
-    if prem_summary:
-        # Kompaktné vysvetlenie prémií + stručné odporúčanie pre maximalizáciu skóre
+    if premium_legend:
+        # Nepoužité prémie sú priamo v gride – pripomeň skóring hinty
         sys_prompt += (
-            " "
-            + prem_summary
-            + " Prioritize TL/DL for high-value letters and aim to span DW/TW "
-              "with the main word when possible; stacking letter multipliers "
-              "that feed into word multipliers yields maximal score. "
-              "Prefer TW (x3 word) and DW (x2 word) if reachable and combine word multiplier with letter multipiers "
-              "in one move when legal. Also value high-scoring "
-              "cross-words created by your placements."
+            " Empty premium squares in the grid already show their multiplier symbol (see legend). "
+            "Prioritize TL/DL for high-value letters and aim to span DW/TW with the main word when possible; "
+            "stacking letter multipliers that feed into word multipliers yields maximal score. Also value "
+            "high-scoring cross-words created by your placements."
         )
 
     rules = (
@@ -100,8 +132,11 @@ def _build_prompt(compact_state: str, variant: VariantDefinition, retry_hint: st
     user_prompt = (
         f"Given this compact state, propose exactly one move with placements in a single line using only valid {language} words.\n"
         f"{rules}"
-        f"State:\n{compact_state}"
+        f"State:\n{compact_state_with_premiums}"
     )
+
+    if premium_legend:
+        user_prompt += f"\nPremium legend: {premium_legend}"
 
     if retry_hint:
         user_prompt += f"\nHINT:{retry_hint}"

@@ -9,7 +9,21 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal, Optional, Sequence, cast
 from pathlib import Path
-from PySide6.QtCore import Qt, QSize, QRectF, QTimer, Signal, QObject, QThread, QPoint, QMimeData, QModelIndex
+from PySide6.QtCore import (
+    Qt,
+    QSize,
+    QRectF,
+    QTimer,
+    Signal,
+    QObject,
+    QThread,
+    QPoint,
+    QPointF,
+    QEasingCurve,
+    QVariantAnimation,
+    QMimeData,
+    QModelIndex,
+)
 from PySide6.QtGui import (
     QAction,
     QPainter,
@@ -770,7 +784,7 @@ class BoardView(QWidget):
 
     def dropEvent(self, event):  # type: ignore[no-untyped-def]  # noqa: N802
         payload = self._decode_payload(event.mimeData())
-        if payload is None or payload.get("origin") != "rack":
+        if payload is None or payload.get("origin") not in {"rack", "board"}:
             event.ignore()
             return
         x0, y0, cell = self._grid_geometry()
@@ -891,21 +905,30 @@ class BoardView(QWidget):
 
     def _accepts_mime(self, mime: QMimeData) -> bool:
         payload = self._decode_payload(mime)
-        return bool(payload and payload.get("origin") == "rack")
+        return bool(payload and payload.get("origin") in {"rack", "board"})
 
 
 class RackTileDelegate(QStyledItemDelegate):
-    """Renderuje kamene v racku s jemným 3D efektom."""
+    """Renderuje kamene v racku s jemným 3D efektom a podporou animácií."""
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._corner_radius = 7.0
+        self._rack = cast("RackListWidget | None", parent)
 
     def paint(  # type: ignore[override]
         self, painter: QPainter, option: QStyleOptionViewItem, index: QModelIndex
     ) -> None:
         painter.save()
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        if self._rack is not None:
+            offset = self._rack.animation_offset_for_index(index)
+            if offset is not None:
+                painter.translate(offset)
+            highlight_strength = self._rack.highlight_strength_for_index(index)
+        else:
+            highlight_strength = 0.0
 
         available = option.rect.adjusted(3, 3, -3, -3)
         side = min(available.width(), available.height() - 2)
@@ -932,6 +955,10 @@ class RackTileDelegate(QStyledItemDelegate):
             painter.fillPath(tile_path, QColor(80, 145, 100, 70))
             border_color = QColor(70, 125, 90)
 
+        if highlight_strength > 0.0:
+            glow_alpha = int(110 * min(1.0, highlight_strength))
+            painter.fillPath(tile_path, QColor(255, 255, 210, glow_alpha))
+
         pen = QPen(border_color)
         pen.setWidthF(1.2)
         painter.setPen(pen)
@@ -955,7 +982,9 @@ class RackTileDelegate(QStyledItemDelegate):
 
 
 class RackListWidget(QListWidget):
-    """List widget prispôsobený pre drag & drop kameňov."""
+    """List widget prispôsobený pre drag & drop kameňov s animovaným radením."""
+
+    letters_reordered = Signal(list)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -965,9 +994,15 @@ class RackListWidget(QListWidget):
         self.setAcceptDrops(True)
         self.setDropIndicatorShown(False)
         self.setDefaultDropAction(Qt.DropAction.MoveAction)
-        self.setDragDropMode(QListWidget.DragDropMode.DragOnly)
+        self.setDragDropMode(QListWidget.DragDropMode.DragDrop)
         self._tile_delegate = RackTileDelegate(self)
         self.setItemDelegate(self._tile_delegate)
+        self._reorder_animation: QVariantAnimation | None = None
+        self._animation_deltas: dict[int, QPointF] = {}
+        self._animation_offsets: dict[int, QPointF] = {}
+        self._highlight_item_key: int | None = None
+        self._highlight_strength: dict[int, float] = {}
+        self._drop_gap_index: int | None = None
 
     def startDrag(self, supported_actions: Any) -> None:  # noqa: N802
         item = self.currentItem()
@@ -1032,43 +1067,258 @@ class RackListWidget(QListWidget):
         drag.exec(Qt.DropAction.MoveAction)
 
     def dragEnterEvent(self, event):  # type: ignore[no-untyped-def]  # noqa: N802
-        if self._accepts_payload(event.mimeData()):
+        if self._decode_payload(event.mimeData()) is not None:
             event.acceptProposedAction()
         else:
             event.ignore()
 
     def dragMoveEvent(self, event):  # type: ignore[no-untyped-def]  # noqa: N802
-        if self._accepts_payload(event.mimeData()):
-            event.acceptProposedAction()
-        else:
+        payload = self._decode_payload(event.mimeData())
+        if payload is None:
             event.ignore()
+            return
+        origin = payload.get("origin")
+        if origin == "rack":
+            gap_index = self._insertion_index_from_pos(event.position())
+            if gap_index != self._drop_gap_index:
+                self._drop_gap_index = gap_index
+                self.viewport().update()
+        else:
+            if self._drop_gap_index is not None:
+                self._drop_gap_index = None
+                self.viewport().update()
+        event.acceptProposedAction()
+
+    def dragLeaveEvent(self, event):  # type: ignore[no-untyped-def]  # noqa: N802
+        del event
+        if self._drop_gap_index is not None:
+            self._drop_gap_index = None
+            self.viewport().update()
 
     def dropEvent(self, event):  # type: ignore[no-untyped-def]  # noqa: N802
-        if self._accepts_payload(event.mimeData()):
+        payload = self._decode_payload(event.mimeData())
+        if payload is None:
+            event.ignore()
+            return
+        origin = payload.get("origin")
+        handled = False
+        if origin == "board":
+            handled = True
+        elif origin == "rack":
+            handled = self._handle_internal_drop(payload, event.position())
+        if handled:
             event.setDropAction(Qt.DropAction.MoveAction)
             event.accept()
         else:
             event.ignore()
+        if self._drop_gap_index is not None:
+            self._drop_gap_index = None
+            self.viewport().update()
+
+    def paintEvent(self, event: QPaintEvent) -> None:  # type: ignore[override]
+        super().paintEvent(event)
+        if self._drop_gap_index is None:
+            return
+        painter = QPainter(self.viewport())
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        gap_rect = self._indicator_rect(self._drop_gap_index)
+        gradient = QLinearGradient(gap_rect.topLeft(), gap_rect.bottomLeft())
+        gradient.setColorAt(0.0, QColor(255, 255, 255, 160))
+        gradient.setColorAt(1.0, QColor(180, 220, 180, 60))
+        painter.fillRect(gap_rect, gradient)
+
+    def animation_offset_for_index(self, index: QModelIndex) -> QPointF | None:
+        if not index.isValid():
+            return None
+        item = self.item(index.row())
+        if item is None:
+            return None
+        return self._animation_offsets.get(id(item))
+
+    def highlight_strength_for_index(self, index: QModelIndex) -> float:
+        if not index.isValid():
+            return 0.0
+        item = self.item(index.row())
+        if item is None:
+            return 0.0
+        return self._highlight_strength.get(id(item), 0.0)
+
+    def reset_visual_state(self) -> None:
+        if self._reorder_animation is not None:
+            self._reorder_animation.stop()
+            self._reorder_animation = None
+        self._animation_deltas.clear()
+        self._animation_offsets.clear()
+        self._highlight_strength.clear()
+        self._highlight_item_key = None
+        self._drop_gap_index = None
+
+    def _handle_internal_drop(self, payload: dict[str, Any], pos: QPointF) -> bool:
+        origin_index = int(payload.get("rack_index", -1))
+        if not (0 <= origin_index < self.count()):
+            return False
+        gap_index = self._insertion_index_from_pos(pos)
+        if gap_index == -1:
+            gap_index = self.count()
+        target_index = gap_index
+        if target_index > origin_index:
+            target_index -= 1
+        target_index = max(0, min(target_index, self.count() - 1))
+        if target_index == origin_index:
+            self._start_reorder_animation(self._capture_item_geometry(), self._capture_item_geometry(), self.item(origin_index))
+            self.letters_reordered.emit(self._collect_letters())
+            return True
+
+        old_rects = self._capture_item_geometry()
+        item = self.takeItem(origin_index)
+        if item is None:
+            return False
+        self.insertItem(target_index, item)
+        self.setCurrentItem(item)
+        new_rects = self._capture_item_geometry()
+        self._start_reorder_animation(old_rects, new_rects, item)
+        self.letters_reordered.emit(self._collect_letters())
+        return True
+
+    def _capture_item_geometry(self) -> dict[int, QRectF]:
+        geometries: dict[int, QRectF] = {}
+        for row in range(self.count()):
+            item = self.item(row)
+            if item is None:
+                continue
+            index = self.indexFromItem(item)
+            rect = QRectF(self.visualRect(index))
+            geometries[id(item)] = rect
+        return geometries
+
+    def _start_reorder_animation(
+        self,
+        old_rects: dict[int, QRectF],
+        new_rects: dict[int, QRectF],
+        moved_item: QListWidgetItem | None,
+    ) -> None:
+        if self._reorder_animation is not None:
+            self._reorder_animation.stop()
+        deltas: dict[int, QPointF] = {}
+        for key, old_rect in old_rects.items():
+            new_rect = new_rects.get(key)
+            if new_rect is None:
+                continue
+            delta = QPointF(
+                old_rect.topLeft().x() - new_rect.topLeft().x(),
+                old_rect.topLeft().y() - new_rect.topLeft().y(),
+            )
+            if abs(delta.x()) < 0.1 and abs(delta.y()) < 0.1:
+                continue
+            deltas[key] = delta
+        self._animation_deltas = deltas
+        self._highlight_item_key = id(moved_item) if moved_item is not None else None
+        self._reorder_animation = QVariantAnimation(self)
+        self._reorder_animation.setDuration(260)
+        self._reorder_animation.setEasingCurve(QEasingCurve.OutBack)
+        self._reorder_animation.setStartValue(0.0)
+        self._reorder_animation.setEndValue(1.0)
+        self._reorder_animation.valueChanged.connect(self._apply_animation_frame)
+        self._reorder_animation.finished.connect(self._finish_animation)
+        self._apply_animation_frame(0.0)
+        self._reorder_animation.start()
+
+    def _apply_animation_frame(self, value: Any) -> None:
+        try:
+            progress = float(value)
+        except (TypeError, ValueError):
+            progress = 0.0
+        remaining = max(0.0, 1.0 - progress)
+        offsets: dict[int, QPointF] = {}
+        for key, delta in self._animation_deltas.items():
+            offset = QPointF(delta.x() * remaining, delta.y() * remaining)
+            if abs(offset.x()) < 0.1 and abs(offset.y()) < 0.1:
+                continue
+            offsets[key] = offset
+        self._animation_offsets = offsets
+        if self._highlight_item_key is not None:
+            strength = min(1.0, remaining)
+            self._highlight_strength = {self._highlight_item_key: strength}
+        else:
+            self._highlight_strength = {}
+        self.viewport().update()
+
+    def _finish_animation(self) -> None:
+        self._animation_offsets.clear()
+        self._animation_deltas.clear()
+        self._highlight_strength.clear()
+        self._highlight_item_key = None
+        if self._reorder_animation is not None:
+            self._reorder_animation.deleteLater()
+        self._reorder_animation = None
+        self.viewport().update()
+
+    def _insertion_index_from_pos(self, pos: QPointF) -> int:
+        if self.count() == 0:
+            return 0
+        x = pos.x()
+        best_index = self.count()
+        for row in range(self.count()):
+            item = self.item(row)
+            if item is None:
+                continue
+            rect = self.visualRect(self.indexFromItem(item))
+            center_x = rect.center().x()
+            if x < center_x:
+                best_index = row
+                break
+        return best_index
+
+    def _indicator_rect(self, gap_index: int) -> QRectF:
+        viewport_rect = QRectF(self.viewport().rect())
+        height = viewport_rect.height() * 0.72
+        top = viewport_rect.center().y() - height / 2.0
+        if self.count() == 0:
+            x = viewport_rect.center().x()
+        elif gap_index <= 0:
+            first_rect = QRectF(self.visualRect(self.indexFromItem(self.item(0))))
+            x = first_rect.left()
+        elif gap_index >= self.count():
+            last_rect = QRectF(self.visualRect(self.indexFromItem(self.item(self.count() - 1))))
+            x = last_rect.right()
+        else:
+            left_rect = QRectF(self.visualRect(self.indexFromItem(self.item(gap_index - 1))))
+            right_rect = QRectF(self.visualRect(self.indexFromItem(self.item(gap_index))))
+            x = (left_rect.right() + right_rect.left()) / 2.0
+        indicator_width = 8.0
+        return QRectF(x - indicator_width / 2.0, top, indicator_width, height)
+
+    def _collect_letters(self) -> list[str]:
+        letters: list[str] = []
+        for i in range(self.count()):
+            item = self.item(i)
+            if item is None:
+                continue
+            letters.append(item.text())
+        return letters
 
     @staticmethod
-    def _accepts_payload(mime: QMimeData) -> bool:
+    def _decode_payload(mime: QMimeData) -> Optional[dict[str, Any]]:
         if not mime.hasFormat(TILE_MIME):
-            return False
+            return None
         try:
             raw = mime.data(TILE_MIME)
             raw_bytes = cast(bytes, raw.data())
             text = raw_bytes.decode("ascii")
             data = json.loads(text)
         except Exception:
-            return False
+            return None
         if not isinstance(data, dict):
-            return False
-        return data.get("origin") == "board"
+            return None
+        return cast(dict[str, Any], data)
+
 
 
 
 class RackView(QWidget):
     """Jednoduchy rack bez DnD - klik na pismenko a potom na dosku (MVP zatial bez prekliku)."""
+    letters_reordered = Signal(list)
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         # nizsi pas racku; bude presne sirky na 7 pismen
@@ -1076,6 +1326,7 @@ class RackView(QWidget):
         h.setContentsMargins(0, 6, 0, 0)
         h.setAlignment(Qt.AlignmentFlag.AlignHCenter)
         self.list = RackListWidget()
+        self.list.letters_reordered.connect(self.letters_reordered.emit)
         self.list.setViewMode(QListWidget.ViewMode.IconMode)
         self.list.setResizeMode(QListWidget.ResizeMode.Adjust)
         # nastavenie velkosti jednej dlazdice
@@ -1116,6 +1367,7 @@ class RackView(QWidget):
         self.setFixedHeight(total_height)
 
     def set_letters(self, letters: list[str]) -> None:
+        self.list.reset_visual_state()
         self.list.clear()
         for ch in letters:
             item = QListWidgetItem(ch)
@@ -1219,7 +1471,7 @@ class MainWindow(QMainWindow):
 
         self.board_view = BoardView(self.board)
         self.board_view.cellClicked.connect(self.on_board_clicked)
-        self.board_view.set_tile_drop_handler(self._handle_tile_drop_from_rack)
+        self.board_view.set_tile_drop_handler(self._handle_tile_drop)
         self.board_view.set_pending_drag_handler(self._handle_pending_drag_finished)
         self.split.addWidget(self.board_view)
 
@@ -1297,6 +1549,7 @@ class MainWindow(QMainWindow):
 
         # Spodný pás: rack + status
         self.rack = RackView()
+        self.rack.letters_reordered.connect(self._on_rack_letters_reordered)
         self.btn_exchange = QPushButton("Vymeniť")
         self.btn_exchange.clicked.connect(self.exchange_human)
         self.btn_exchange.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
@@ -1577,7 +1830,7 @@ class MainWindow(QMainWindow):
         lines: list[str] = []
         for (w, base, lb, mult, total) in self._last_move_breakdown:
             line = (
-                f"<span style='font-weight:bold'><br>{w}</span>: <br/>základ {base}, "
+                f"<span style='font-weight:bold'><br>{w}</span>: <br/>{base}, "
                 f"písmená +{lb}, násobok ×{mult} → <span style='font-weight:bold'>{total}</span>"
             )
             lines.append(line)
@@ -1596,7 +1849,7 @@ class MainWindow(QMainWindow):
             return
         escaped = html.escape(reason).replace("\n", "<br/>")
         self.lbl_last_reason.setText(
-            "<div style='margin:6px 0 0 0'><span style='font-weight:bold'>Zdôvonenie rozhodcu:</span><br/>"
+            "<div style='margin:6px 0 0 0'><br/>"
             f"{escaped}</div>"
         )
         self.lbl_last_reason.show()
@@ -1643,7 +1896,15 @@ class MainWindow(QMainWindow):
         self.board_view.flash_cell(placement.row, placement.col)
         self._update_ghost_score()
 
-    def _handle_tile_drop_from_rack(self, row: int, col: int, payload: dict[str, Any]) -> bool:
+    def _handle_tile_drop(self, row: int, col: int, payload: dict[str, Any]) -> bool:
+        origin = payload.get("origin")
+        if origin == "rack":
+            return self._place_tile_from_rack(row, col, payload)
+        if origin == "board":
+            return self._reposition_pending_tile(row, col, payload)
+        return False
+
+    def _place_tile_from_rack(self, row: int, col: int, payload: dict[str, Any]) -> bool:
         if self.board.cells[row][col].letter:
             self.status.showMessage("Pole je obsadené.", 2000)
             return False
@@ -1673,8 +1934,44 @@ class MainWindow(QMainWindow):
         self.rack.set_letters(self.human_rack)
         return True
 
+    def _reposition_pending_tile(self, row: int, col: int, payload: dict[str, Any]) -> bool:
+        original_row = int(payload.get("row", -1))
+        original_col = int(payload.get("col", -1))
+        if original_row == -1 or original_col == -1:
+            return False
+        if row == original_row and col == original_col:
+            return True
+        if self.board.cells[row][col].letter:
+            self.status.showMessage("Pole je obsadené.", 2000)
+            return False
+        for placement in self.pending:
+            if placement.row == row and placement.col == col:
+                self.status.showMessage("Pole už obsahuje dočasné písmeno.", 2000)
+                return False
+        target_index: Optional[int] = None
+        original_placement: Optional[Placement] = None
+        for idx, placement in enumerate(self.pending):
+            if placement.row == original_row and placement.col == original_col:
+                target_index = idx
+                original_placement = placement
+                break
+        if target_index is None or original_placement is None:
+            return False
+        updated = Placement(
+            row=row,
+            col=col,
+            letter=original_placement.letter,
+            blank_as=original_placement.blank_as,
+        )
+        self.pending[target_index] = updated
+        self.board_view.set_pending(self.pending)
+        self.board_view.flash_cell(row, col)
+        self._update_ghost_score()
+        return True
+
     def _handle_pending_drag_finished(self, payload: dict[str, Any], action: Qt.DropAction) -> None:
-        del action  # action slúži len ako informatívny údaj, spracovanie je rovnaké
+        if action != Qt.DropAction.MoveAction:
+            return
         row = int(payload.get("row", -1))
         col = int(payload.get("col", -1))
         removed: Optional[Placement] = None
@@ -1689,6 +1986,10 @@ class MainWindow(QMainWindow):
         self.human_rack.append(removed.letter)
         self.rack.set_letters(self.human_rack)
         self._update_ghost_score()
+
+    def _on_rack_letters_reordered(self, letters: list[str]) -> None:
+        """Synchronizuje interný poradie písmen po drag-and-drop zmene."""
+        self.human_rack = list(letters)
 
     def on_board_clicked(self, row: int, col: int) -> None:
         """Klik na dosku: ak je vybrate pismeno v racku a bunka je prazdna, poloz ho."""
