@@ -74,6 +74,7 @@ def test_judge_words_handles_word_keyed_payload() -> None:
     class Dummy(OpenAIClient):
         def __init__(self) -> None:
             self.judge_max_output_tokens = 800
+            self._slovak_dict = None
 
         def _call_json(self, prompt, schema, *, max_output_tokens=None):  # type: ignore[override]
             return payload
