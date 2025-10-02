@@ -95,7 +95,7 @@ def _build_prompt(compact_state: str, variant: VariantDefinition, retry_hint: st
         "Play to win and obey official Scrabble rules for that language. "
         "Do NOT overwrite existing board letters; place only on empty cells. "
         "Placements must form a single contiguous line with no gaps and must connect to existing letters after preiovus move. "
-        "Use only letters from ai_rack; for '?' provide mapping in 'blanks' with the chosen uppercase letter (respecting diacritics). "
+        "Use only letters from ai_rack; for '?' use chosen uppercase letter (respecting diacritics). "
         f"Points you can get for each tile: {tile_summary}. "
         "Always evaluate moves that use all 7 rack tiles for the 50 point bingo bonus; play it when legal. "
         "Prefer the move that maximizes total points, spending high-value rack letters on premium squares. "
@@ -103,12 +103,10 @@ def _build_prompt(compact_state: str, variant: VariantDefinition, retry_hint: st
         "Use intersections/hooks properly; you may share letters with the board only at overlapping cells; do not extend an existing word into a non-word. "
         "The field 'word' must equal the final main word formed on the board (existing board letters plus your placements). "
         f"All cross-words should plausibly be valid {language} words. Diacritics is very important so distinguishing between 'Ú' and 'U' for example and every letter with diacritic."
-        "ONLY If no legal move exists, you may pass (set 'pass': true) but it's better to to gain as many points as possible then pass. "
+        "ONLY If no legal move exists, you may pass (set 'pass': true) but it's better to to gain some points then pass. "
         "If the board is empty, the first move must cross the center star at H8 (row=7,col=7). "
         "Coordinates are 0-based. No explanations — JSON only. "
-        "Always return a JSON object with keys: start:{row:int,col:int}, direction:'ACROSS'|'DOWN', placements:[{row,col,letter}], "
-        "optional blanks mapping where keys are 'row,col' (e.g. '7,7': 'R'), optional pass (boolean), and optional word (string). "
-        "If you use '?' in placements, you must include the blanks mapping for each '?'."
+        "Always return a JSON object with keys: start:{row:int,col:int}, direction:'ACROSS'|'DOWN', placements:[{row,col,letter}]."
     )
 
     if premium_legend:
@@ -126,7 +124,6 @@ def _build_prompt(compact_state: str, variant: VariantDefinition, retry_hint: st
         f"- Do not extend existing words unless the resulting contiguous main word is valid in {language}.\n"
         "- Prefer hooks/intersections instead of blind prefix/suffix sticking.\n"
         "- 'word' must equal the final main word on the board.\n"
-        "- Provide 'blanks' mapping for every '?' used.\n"
     )
 
     user_prompt = (

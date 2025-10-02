@@ -31,3 +31,13 @@ def test_state_format_and_round_trip() -> None:
     assert st2["turn"] == "AI"
 
 
+def test_blank_tiles_render_real_letter_in_grid() -> None:
+    b = Board(PREM)
+    b.place_letters([Placement(4, 5, "?", blank_as="R")])
+
+    state = build_ai_state_dict(b, ai_rack=list("AEIOU?"), human_score=0, ai_score=0, turn="AI")
+
+    # blank pozicia je zaznamenana, ale v samotnom gride je ulozene realne pismeno
+    assert state["blanks"] == [{"row": 4, "col": 5}]
+    assert state["grid"][4][5] == "R"
+    assert "?" not in state["grid"][4]

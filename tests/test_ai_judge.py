@@ -7,6 +7,7 @@ def _run_judge(payload: dict) -> dict:
     class Dummy(OpenAIClient):
         def __init__(self) -> None:
             self.judge_max_output_tokens = 800
+            self._slovak_dict = None
 
         def _call_json(self, prompt, schema, *, max_output_tokens=None):  # type: ignore[override]
             return payload
