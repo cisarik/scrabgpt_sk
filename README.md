@@ -48,3 +48,47 @@ ScrabGPT supports saving and loading the full game state to JSON.
 Notes:
 - The format is versioned and future migrations may be introduced. Always check `schema_version`.
 - No secrets are stored in save files.
+
+---
+
+## Changelist - Recent Features & Improvements
+
+### Multi-Model AI Support
+- **OpenRouter Integration**: Support for multiple AI models via OpenRouter API with concurrent execution
+- **Model Competition**: Up to 10 AI models compete simultaneously, best valid move is selected
+- **AI Configuration Dialog**: Visual interface to select and configure multiple models with real-time cost estimation
+- **Competition Results Table**: Beautiful dark-themed table showing all model proposals, scores, and judge validation results
+- **Model Tracking**: Status bar displays which model proposed which move throughout gameplay
+- **Click-to-View Details**: Click any model result row to see raw response and GPT analysis
+
+### Intelligent Error Handling & Recovery
+- **GPT Fallback Parser**: When models return non-JSON responses (with thinking/reasoning), GPT-5-mini automatically extracts the move
+- **Response Detail Dialog**: View raw model responses and GPT analysis for transparency
+- **Empty Response Handling**: Graceful handling of empty/invalid responses from models
+- **Slovak Error Messages**: User-friendly error messages in Slovak with full details in tooltips
+- **OpenRouter Reasoning Field**: Support for models that return content in `reasoning` field (like GLM-4.6)
+
+### Performance & UX Improvements
+- **Parallel Judge Validation**: All model moves validated concurrently (3-5x speed improvement)
+- **No UI Freezing**: Background validation keeps UI responsive with multiple models
+- **Dark Mode Styling**: All new UI components match the app's dark theme
+- **Larger Fonts**: Improved readability in AI config dialog and results table
+- **Top Weekly Models**: AI config dialog shows trending models from OpenRouter
+- **Clear on Retry**: Results table clears when AI retries, preventing stale data display
+- **Cost Visibility**: Prominent display of maximum cost per turn with smart decimal formatting
+
+### Technical Improvements
+- **GPT-5 Support**: Proper parameter handling for GPT-5 models (`max_completion_tokens` vs `max_tokens`)
+- **Improved Logging**: Detailed logging throughout multi-model pipeline with timing information
+- **Better Prompts**: Enhanced GPT-5 extraction prompts for more reliable move recovery
+- **3-Tier Validation**: Efficient Slovak word validation (local dictionary → simplified check → full OpenAI validation)
+- **Error Classification**: Distinct handling of parse errors, API errors, and validation failures
+
+### UI/UX Enhancements
+- **Compact Layouts**: More efficient use of space in dialogs and tables
+- **Visual Hierarchy**: Important information (cost, winner, status) prominently displayed
+- **Medals for Winners**: Top 3 models shown with 🥇🥈🥉 medals in results table
+- **Status Messages**: Detailed status updates showing current model, phase, and results
+- **Responsive Design**: Proper window sizing (800×650 for config, auto-sizing for results)
+
+See detailed documentation in `docs/` directory for implementation details of each feature.

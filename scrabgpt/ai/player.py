@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 import json
+import os
+from pathlib import Path
 from typing import Any
 
 from ..ai.schema import parse_ai_move, to_move_payload
@@ -13,6 +15,36 @@ from .client import OpenAIClient
 log = logging.getLogger("scrabgpt.ai")
 
 
+def _load_prompt_template() -> str:
+    """Load AI prompt template from file specified in .env or use default."""
+    prompt_file = os.getenv("AI_PROMPT_FILE", "prompts/default.txt")
+    
+    try:
+        path = Path(prompt_file)
+        if path.exists():
+            return path.read_text(encoding="utf-8")
+        else:
+            log.warning("Prompt file not found: %s, using fallback", prompt_file)
+    except Exception as e:
+        log.exception("Failed to load prompt from %s: %s", prompt_file, e)
+    
+    # Fallback to embedded default if file loading fails
+    return """You are an expert Scrabble player for the {language} language variant. Play to win and obey official Scrabble rules for that language. Do NOT overwrite existing board letters; place only on empty cells. Placements must form a single contiguous line with no gaps and must connect to existing letters after previous move. Use only letters from ai_rack; for '?' use chosen uppercase letter (respecting diacritics). Points you can get for each tile: {tile_summary}. Always evaluate moves that use all 7 rack tiles for the 50 point bingo bonus; play it when legal. Prefer the move that maximizes total points, spending high-value rack letters on premium squares. Do not glue your letters to adjacent existing letters unless the resulting main word is a valid {language} word. Use intersections/hooks properly; you may share letters with the board only at overlapping cells; do not extend an existing word into a non-word. The field 'word' must equal the final main word formed on the board (existing board letters plus your placements). All cross-words should plausibly be valid {language} words. Diacritics is very important so distinguishing between 'Ú' and 'U' for example and every letter with diacritic. ONLY If no legal move exists, you may pass (set 'pass': true) but it's better to gain some points then pass. If the board is empty, the first move must cross the center star at H8 (row=7,col=7). Coordinates are 0-based. No explanations — JSON only. Always return a JSON object with keys: start:{{row:int,col:int}}, direction:'ACROSS'|'DOWN', placements:[{{row,col,letter}}]. Empty premium squares in the grid already show their multiplier symbol (see legend). Prioritize TL/DL for high-value letters and aim to span DW/TW with the main word when possible; stacking letter multipliers that feed into word multipliers yields maximal score. Also value high-scoring cross-words created by your placements.
+
+Given this compact state, propose exactly one move with placements in a single line using only valid {language} words.
+
+Sanity rules:
+- Place tiles in exactly one line (ACROSS or DOWN); no gaps.
+- Do not extend existing words unless the resulting contiguous main word is valid in {language}.
+- Prefer hooks/intersections instead of blind prefix/suffix sticking.
+- 'word' must equal the final main word on the board.
+
+State:
+{compact_state}
+
+Premium legend: {premium_legend}"""
+
+
 def _format_tile_summary(variant: VariantDefinition) -> str:
     entries = []
     for letter in variant.letters:
@@ -20,13 +52,11 @@ def _format_tile_summary(variant: VariantDefinition) -> str:
     return ", ".join(entries)
 
 
-def _build_prompt(compact_state: str, variant: VariantDefinition, retry_hint: str | None) -> str:
-    """Zostaví system+user prompt pre AI hráča.
-
-    - Pravidlá explicitne zakazujú neplatné „lepenie" k existujúcim slovám,
-      ak výsledný súvislý reťazec nie je platné anglické slovo.
-    - Dopĺňa sanity pravidlá a krátky príklad hook vs. zlé lepenie.
-    - `retry_hint` (ak je) doplní na koniec promptu.
+def _build_prompt(compact_state: str, variant: VariantDefinition) -> str:
+    """Zostaví prompt pre AI hráča načítaním šablóny zo súboru.
+    
+    Šablóna je načítaná zo súboru definovaného v AI_PROMPT_FILE (.env).
+    Podporuje placeholdery: {language}, {tile_summary}, {compact_state}, {premium_legend}
     """
     def _overlay_premiums(state: str) -> tuple[str, str] | None:
         """Vráti stav s prémiami priamo v gride a legendu symbolov.
@@ -81,97 +111,49 @@ def _build_prompt(compact_state: str, variant: VariantDefinition, retry_hint: st
         legend = "*=TW (word*3), ~=DW (word*2), $=TL (letter*3), ^=DL (letter*2)"
         return updated_state, legend
 
+    # Process state to overlay premium symbols
     overlay = _overlay_premiums(compact_state)
     if overlay:
         compact_state_with_premiums, premium_legend = overlay
     else:
         compact_state_with_premiums = compact_state
-        premium_legend = None
+        premium_legend = "*=TW, ~=DW, $=TL, ^=DL"
+    
     language = variant.language
     tile_summary = _format_tile_summary(variant)
-
-    sys_prompt = (
-        f"You are an expert Scrabble player for the {language} language variant. "
-        "Play to win and obey official Scrabble rules for that language. "
-        "Do NOT overwrite existing board letters; place only on empty cells. "
-        "Placements must form a single contiguous line with no gaps and must connect to existing letters after preiovus move. "
-        "Use only letters from ai_rack; for '?' use chosen uppercase letter (respecting diacritics). "
-        f"Points you can get for each tile: {tile_summary}. "
-        "Always evaluate moves that use all 7 rack tiles for the 50 point bingo bonus; play it when legal. "
-        "Prefer the move that maximizes total points, spending high-value rack letters on premium squares. "
-        f"Do not glue your letters to adjacent existing letters unless the resulting main word is a valid {language} word. "
-        "Use intersections/hooks properly; you may share letters with the board only at overlapping cells; do not extend an existing word into a non-word. "
-        "The field 'word' must equal the final main word formed on the board (existing board letters plus your placements). "
-        f"All cross-words should plausibly be valid {language} words. Diacritics is very important so distinguishing between 'Ú' and 'U' for example and every letter with diacritic."
-        "ONLY If no legal move exists, you may pass (set 'pass': true) but it's better to to gain some points then pass. "
-        "If the board is empty, the first move must cross the center star at H8 (row=7,col=7). "
-        "Coordinates are 0-based. No explanations — JSON only. "
-        "Always return a JSON object with keys: start:{row:int,col:int}, direction:'ACROSS'|'DOWN', placements:[{row,col,letter}]."
+    
+    # Load prompt template and substitute placeholders
+    template = _load_prompt_template()
+    
+    prompt = template.format(
+        language=language,
+        tile_summary=tile_summary,
+        compact_state=compact_state_with_premiums,
+        premium_legend=premium_legend or "",
     )
-
-    if premium_legend:
-        # Nepoužité prémie sú priamo v gride – pripomeň skóring hinty
-        sys_prompt += (
-            " Empty premium squares in the grid already show their multiplier symbol (see legend). "
-            "Prioritize TL/DL for high-value letters and aim to span DW/TW with the main word when possible; "
-            "stacking letter multipliers that feed into word multipliers yields maximal score. Also value "
-            "high-scoring cross-words created by your placements."
-        )
-
-    rules = (
-        "Sanity rules:\n"
-        "- Place tiles in exactly one line (ACROSS or DOWN); no gaps.\n"
-        f"- Do not extend existing words unless the resulting contiguous main word is valid in {language}.\n"
-        "- Prefer hooks/intersections instead of blind prefix/suffix sticking.\n"
-        "- 'word' must equal the final main word on the board.\n"
-    )
-
-    user_prompt = (
-        f"Given this compact state, propose exactly one move with placements in a single line using only valid {language} words.\n"
-        f"{rules}"
-        f"State:\n{compact_state_with_premiums}"
-    )
-
-    if premium_legend:
-        user_prompt += f"\nPremium legend: {premium_legend}"
-
-    if retry_hint:
-        user_prompt += f"\nHINT:{retry_hint}"
-
-    return sys_prompt + "\n" + user_prompt
+    
+    return prompt
 
 
 def propose_move(
     client: OpenAIClient,
     compact_state: str,
     variant: VariantDefinition,
-    *,
-    retry_hint: str | None = None,
 ) -> dict[str, Any]:
     """Zavolá OpenAI, parsuje odpoveď lokálne a normalizuje payload.
 
     Komentár (SK): Nepoužívame serverovú JSON schému; spoliehame sa na
     lokálne pydantic parsovanie `parse_ai_move` a konverziu na kanonický
-    formát vhodný pre validáciu a UI. Pri chybných dátach spravíme jeden
-    riadený retry. Výstup obsahuje aj kľúč `exchange` (prázdny zoznam)
-    kvôli UI kompatibilite.
+    formát vhodný pre validáciu a UI. Výstup obsahuje aj kľúč `exchange`
+    (prázdny zoznam) kvôli UI kompatibilite.
     """
 
-    prompt = _build_prompt(compact_state, variant, retry_hint)
+    prompt = _build_prompt(compact_state, variant)
     raw = client._call_text(prompt, max_output_tokens=client.ai_move_max_output_tokens)
-    try:
-        model = parse_ai_move(raw)
-        move = to_move_payload(model)
-    except Exception as e:  # noqa: BLE001
-        log.warning("ai_parse_failed reason=%s raw=%r", e, (raw or "")[:300])
-        hint = (
-            "Return a strict JSON object with keys start,row/col,direction,placements,"
-            "optional blanks mapping by 'row,col', optional pass. No prose."
-        )
-        retry_prompt = _build_prompt(compact_state, variant, retry_hint=hint)
-        raw2 = client._call_text(retry_prompt, max_output_tokens=client.ai_move_max_output_tokens)
-        model = parse_ai_move(raw2)
-        move = to_move_payload(model)
+    
+    # Parse response - no retry on failure
+    model = parse_ai_move(raw)
+    move = to_move_payload(model)
 
     # Kompatibilita s UI – udržiavaj 'exchange' kľúč (prázdny zoznam)
     if "exchange" not in move:

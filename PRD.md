@@ -74,11 +74,16 @@ scrabgpt/
     client.py     # tenký klient pre OpenAI (minimálny)
     judge.py      # validácia hlavného slova (JSON schema)
     player.py     # AI hráč (JSON schema návrhu ťahu)
+    openrouter.py # OpenRouter API klient (multi-model)
+    multi_model.py # Multi-model orchestrácia, GPT fallback parser
   ui/
     app.py        # PySide6 hlavné okno
     board_view.py # 2D mriežka, DnD, zvýraznenia prémií
     rack_view.py  # DnD kocky
     dialogs.py    # nastavenia, upozornenia
+    ai_config.py  # AI model konfiguračný dialóg
+    model_results.py # Tabuľka výsledkov multi-model súťaže
+    response_detail.py # Detail dialóg pre model responses
   assets/
     premiums.json # mapa prémií 15×15
   tests/
@@ -102,7 +107,9 @@ scrabgpt/
 
 ## 6) OpenAI integrácia (minimalistická, structured completions)
 ### 6.1 Modely
-- **`gpt-5-mini`** použitý pre **AI hráča** aj **Rozhodcu**.
+- **`gpt-5-mini`** použitý pre **AI hráča** aj **Rozhodcu** (single-model režim).
+- **OpenRouter API** pre multi-model režim – top týždenné modely (GPT-4, Claude, Gemini, DeepSeek, atď.).
+- **GPT-5-mini** použitý aj pre GPT fallback parser (extrakcia ťahov z non-JSON responses).
 
 ### 6.2 Kontrakty (JSON Schema – log výstupu)
 **A) Rozhodca – `judge_word`**  
@@ -133,6 +140,13 @@ scrabgpt/
 - Metódy: `call_judge(word: str) -> JudgeResult`, `call_ai(state: GameState) -> MoveProposal`.  
 - JSON/„function‑calling“ režim (strict), timeout/reties, jednoduchý rate‑limit.  
 - **Žiadne** volania z testov – v testoch sa **mockuje**.
+
+### 6.4 Multi-Model Klient (OpenRouter)
+- `fetch_models()` – Načíta dostupné modely z OpenRouter API (top týždenné).
+- `call_model_async(model_id, prompt)` – Asynchrónne volanie jedného modelu.
+- `propose_move_multi_model(models, state)` – Volá všetky modely súčasne, validuje paralelne, vráti najlepší ťah + všetky výsledky.
+- Podpora pre `reasoning` field (GLM-4.6 a podobné modely).
+- Graceful error handling pre empty/invalid responses.
 
 
 ---
@@ -190,14 +204,94 @@ GameState = {"board": [[" ",...]], "rack_human": str, "rack_ai": str, "scores": 
 ## 11) Akceptačné kritériá MVP (DoD)
 - `pytest -q` prejde: `test_scoring.py`, `test_premiums.py`, `test_rules.py`, `test_tiles.py`.  
 - Manuálne demo podľa **1.1**: odohrám min. 3 ťahy človek/AI; skóre na UI sedí s logom v konzole.  
-- OpenAI volania sú izolované v `ai/` a konfigurované cez `.env`; testy **bez siete**.  
+- OpenAI volania sú izolované v `ai/` a konfigurované cez `.env`; testy **bez siete**.
+
+**Multi-model akceptačné kritériá (Splnené):**
+- Konfiguračný dialóg načíta modely z OpenRouter a zobrazí ich s cenami.
+- Používateľ môže vybrať 1-10 modelov, nastaviť max_tokens pre každý.
+- Real-time odhad maximálnej ceny za ťah sa zobrazuje správne.
+- Pri AI ťahu sa zavolajú všetky vybrané modely súčasne.
+- Tabuľka výsledkov zobrazí všetky modely s ranking, skóre, validáciou.
+- Víťazný model (najvyšší score + validný) sa aplikuje na dosku.
+- Paralelná validácia prebehne v <5s pre 5+ modelov.
+- GPT fallback parser extrahuje ťahy z non-JSON responses.
+- Response detail dialóg zobrazí raw odpoveď + GPT analýzu pri kliku.
+- UI zostane responzívne počas multi-model operácií.
+- Všetky error stavy (empty response, parse error, API error) sú správne zobrazené.
 
 ---
 
-## 12) Post‑MVP (len poznámky)
+## 12) Multi‑Model AI Support (Implementované)
+
+ScrabGPT teraz podporuje **súčasné volanie viacerých AI modelov** cez OpenRouter API s automatickým výberom najlepšieho ťahu.
+
+### 12.1 Funkčnosť
+- **OpenRouter integrácia**: Volanie top týždenných modelov z OpenRouter.ai
+- **Konkurencia modelov**: Až 10 modelov súčasne navrhuje ťahy
+- **Automatický výber**: Najvyšší skóre + platný ťah od Rozhodcu = víťaz
+- **Konfiguračný dialóg**: Vizuálny výber modelov, nastavenie max_tokens, real‑time odhad ceny
+- **Tabuľka výsledkov**: Zobrazenie všetkých návrhov s rankingom (🥇🥈🥉), skóre, validáciou
+- **Sledovanie modelov**: Status bar zobrazuje ktorý model navrhol ktorý ťah
+
+### 12.2 GPT Fallback Parser
+- **Automatická extrakcia**: Keď model vráti text+JSON alebo len text, GPT‑5‑mini analyzuje a extrahuje ťah
+- **Response Detail Dialog**: Klik na riadok → zobrazí raw odpoveď + GPT analýzu
+- **Transparentnosť**: Používateľ vidí presne čo model odpovedal a ako to GPT interpretoval
+
+### 12.3 Error Handling & Performance
+- **Paralelná validácia**: Všetky modely sa validujú súčasne (3‑5× rýchlejšie)
+- **Žiadne zamrznutie**: UI zostáva responzívne aj s 10 modelmi
+- **Graceful errors**: Prázdne odpovede, parse errors, API errors sa zobrazia user‑friendly
+- **Reasoning field support**: Modely ako GLM‑4.6 ktoré vracajú content v `reasoning` poli
+- **GPT‑5 podpora**: Správne parametre pre GPT‑5 modely (`max_completion_tokens`)
+
+### 12.4 UI/UX
+- **Dark mode**: Všetky nové komponenty v tmavej téme
+- **Kompaktný layout**: Efektívne využitie priestoru, väčšie písmo (12‑13px)
+- **Cost visibility**: Výrazné zobrazenie max. ceny za ťah
+- **Model tracking**: `[Model Name]` prefix v status bare
+- **Clear on retry**: Tabuľka sa vyčistí pri retry, žiadne staré dáta
+
+### 12.5 Technické detaily
+**Nové súbory:**
+- `scrabgpt/ai/openrouter.py` – OpenRouter klient
+- `scrabgpt/ai/multi_model.py` – Multi‑model orchestrácia, GPT fallback parser
+- `scrabgpt/ui/ai_config.py` – Konfiguračný dialóg
+- `scrabgpt/ui/model_results.py` – Tabuľka výsledkov
+- `scrabgpt/ui/response_detail.py` – Detail dialóg pre odpovede
+
+**Kľúčové funkcie:**
+- `propose_move_multi_model()` – Volá modely asynchrónne, validuje paralelne
+- `_analyze_response_with_gpt()` – GPT fallback pre non‑JSON odpovede
+- `judge_words()` – Paralelná validácia všetkých modelov
+- `get_top_models()` – Načíta top týždenné modely z OpenRouter
+
+**Dátové štruktúry:**
+```python
+MultiModelResult = {
+    "model": str,              # Model ID
+    "model_name": str,         # Display name
+    "status": "ok"|"invalid"|"error"|"parse_error",
+    "move": Move | None,
+    "score": int,
+    "words": list[str],
+    "judge_valid": bool,
+    "judge_reason": str,
+    "error": str | None,
+    "raw_response": str,       # Pre response detail
+    "gpt_analysis": str | None # GPT fallback analýza
+}
+```
+
+---
+
+## 13) Post‑MVP (len poznámky)
 - Overovanie **všetkých** krížových slov u Rozhodcu (batched).  
 - Vyhľadávanie najlepšieho ťahu lokálne (rack solver) + AI ako komentátor.  
-- Export PNG skóre tabuľky, PyInstaller balíčky.  
+- Export PNG skóre tabuľky, PyInstaller balíčky.
+- Model performance tracking a štatistiky (success rate, avg score)
+- Model filtering (skryť/zobraziť nespoľahlivé modely)
+- Batch GPT analysis (analyzovať všetky failed responses v jednom calle)
 
 ---
 

@@ -100,10 +100,23 @@ def parse_ai_move(text: str) -> MoveModel:
     """Napevno očakávaj JSON objekt; pri zlyhaní vyhoď výnimku s dôvodom.
 
     Komentár (SK): Parsuje sa striktne cez `json.loads` a `model_validate`.
+    Podporuje markdown code blocks (```json ... ```).
     """
     import json
 
-    obj = json.loads(text)
+    # Strip markdown code blocks if present
+    cleaned = text.strip()
+    if cleaned.startswith("```json"):
+        cleaned = cleaned[7:]  # Remove ```json
+    elif cleaned.startswith("```"):
+        cleaned = cleaned[3:]  # Remove ```
+    
+    if cleaned.endswith("```"):
+        cleaned = cleaned[:-3]  # Remove trailing ```
+    
+    cleaned = cleaned.strip()
+    
+    obj = json.loads(cleaned)
     return MoveModel.model_validate(obj)
 
 

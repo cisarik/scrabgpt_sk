@@ -6,7 +6,7 @@ import json
 import logging
 import html
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal, Optional, Sequence, cast
 from pathlib import Path
 from PySide6.QtCore import (
@@ -47,6 +47,7 @@ from PySide6.QtWidgets import (
     QDialog, QFormLayout, QLineEdit, QDialogButtonBox, QListWidget, QListWidgetItem,
     QGridLayout, QGraphicsDropShadowEffect, QListView, QPlainTextEdit, QCheckBox,
     QComboBox, QSizePolicy, QStyleOptionViewItem, QStyledItemDelegate, QStyle, QButtonGroup,
+    QFrame,
     QAbstractButton,
 )
 from ..logging_setup import configure_logging, TRACE_ID_VAR, default_log_path
@@ -60,13 +61,16 @@ from ..core.game import (
     apply_final_scoring,
     determine_end_reason,
 )
-from ..core.rules import placements_in_line  # noqa: F401 (placeholder, will be used in next slices)
+from ..core.rules import placements_in_line
 from ..core.rules import first_move_must_cover_center, connected_to_existing, no_gaps_in_line, extract_all_words
 from ..core.scoring import score_words, apply_premium_consumption
 from ..core.types import Placement, Premium
-from ..ai.client import OpenAIClient, TokenBudgetExceededError
+from ..ai.client import OpenAIClient
 from ..ai.player import propose_move as ai_propose_move
 from ..ai.player import should_auto_trigger_ai_opening, is_board_empty
+from ..ai.openrouter import OpenRouterClient
+from ..ai.multi_model import propose_move_multi_model
+from .prompt_editor import PromptEditorDialog
 from ..core.state import build_ai_state_dict
 from ..core.rack import consume_rack, restore_rack
 from ..core.state import build_save_state_dict, parse_save_state_dict, restore_board_from_save, restore_bag_from_save
@@ -84,6 +88,7 @@ from ..ai.variants import (
     get_languages_for_ui,
     match_language,
 )
+from .model_results import AIModelResultsTable
 
 ASSETS = str(Path(__file__).parent / ".." / "assets")
 PREMIUMS_PATH = get_premiums_path()
@@ -91,6 +96,15 @@ ROOT_DIR = Path(__file__).resolve().parents[2]
 ENV_PATH = str(ROOT_DIR / ".env")
 LOG_PATH = default_log_path()
 EUR_PER_TOKEN = 0.00000186  # 1 token ≈ 0.00000186 EUR (zadané majiteľom)
+
+DEFAULT_OPENROUTER_TIMEOUT = 120
+OPENROUTER_TIMEOUT_CHOICES: list[tuple[int, str]] = [
+    (30, "30 sekúnd"),
+    (60, "1 minúta"),
+    (120, "2 minúty"),
+    (180, "3 minúty"),
+    (300, "5 minút"),
+]
 
 TILE_MIME = "application/x-scrabgpt-tile"
 
@@ -112,6 +126,10 @@ class _WordScoreDetail:
     word_multiplier: int
     total: int
     reason: str
+    lexicons: tuple[str, ...] = field(default_factory=tuple)
+    definitions: tuple[str, ...] = field(default_factory=tuple)
+    examples: tuple[str, ...] = field(default_factory=tuple)
+    notes: str = ""
 
 # ---------- Logging + trace_id ----------
 # Použi centralizovanú konfiguráciu (zabráni duplicitám handlerov)
@@ -491,7 +509,6 @@ class SettingsDialog(QDialog):
             except Exception:
                 # aj pri zlyhaní zápisu do .env necháme aspoň runtime hodnotu
                 os.environ["SCRABBLE_VARIANT"] = slug_data
-        super().accept()
         super().accept()
 
 
@@ -1454,6 +1471,7 @@ class MainWindow(QMainWindow):
         self._last_move_breakdown: list[tuple[str, int, int, int, int]] = []  # (word, base, letter_bonus, word_mult, total)
         self._last_move_bingo: bool = False
         self._last_move_reason: str = ""
+        self._last_move_reason_is_html: bool = False
         self._last_move_word_details: list[_WordScoreDetail] = []
         self._active_word_index: int | None = None
 
@@ -1464,6 +1482,13 @@ class MainWindow(QMainWindow):
 
         # OpenAI klient (lazy init po prvom pouziti ak treba)
         self.ai_client: Optional[OpenAIClient] = None
+        
+        # OpenRouter multi-model configuration
+        self.use_multi_model: bool = False
+        self.selected_ai_models: list[dict[str, Any]] = []
+        self.openrouter_timeout_seconds: int = self._load_openrouter_timeout()
+        self.ai_move_max_tokens, self._ai_tokens_from_env = self._load_ai_move_max_tokens()
+        self._user_defined_ai_tokens: bool = False
 
         # UI
         self.toolbar = QToolBar()
@@ -1488,6 +1513,18 @@ class MainWindow(QMainWindow):
         self.act_open = QAction("📂 Otvoriť…", self)
         self.act_open.triggered.connect(self.open_game_dialog)
         self.toolbar.addAction(self.act_open)
+
+        self.act_create_iq_test = QAction("🧠 Uložiť ako test", self)
+        self.act_create_iq_test.triggered.connect(self.create_iq_test)
+        self.toolbar.addAction(self.act_create_iq_test)
+
+        self.act_config_ai = QAction("🤖 Nastaviť AI", self)
+        self.act_config_ai.triggered.connect(self.configure_ai_models)
+        self.toolbar.addAction(self.act_config_ai)
+        
+        self.act_edit_prompt = QAction("📝 Upraviť prompt", self)
+        self.act_edit_prompt.triggered.connect(self.edit_ai_prompt)
+        self.toolbar.addAction(self.act_edit_prompt)
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -1576,6 +1613,47 @@ class MainWindow(QMainWindow):
         shadow_last.setColor(QColor(0, 0, 0, 130))
         self.lbl_last_breakdown.setGraphicsEffect(shadow_last)
         spv.addWidget(self.lbl_last_breakdown)
+
+        self.judge_subtabs_container = QWidget(self.score_panel)
+        self.judge_subtabs_layout = QHBoxLayout(self.judge_subtabs_container)
+        self.judge_subtabs_layout.setContentsMargins(0, 4, 0, 4)
+        self.judge_subtabs_layout.setSpacing(6)
+        self.judge_subtabs_layout.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        self.judge_subtabs_container.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        self.judge_subtabs_container.setStyleSheet(
+            """
+            QPushButton {
+                background-color: #14281b;
+                border: 1px solid #2f5c39;
+                border-radius: 6px;
+                padding: 4px 12px;
+                color: #d7f4dd;
+                font-size: 12px;
+                min-width: 76px;
+            }
+            QPushButton:hover {
+                background-color: #1d3a27;
+            }
+            QPushButton:checked {
+                background-color: #235432;
+                border-color: #4caf50;
+                color: #ffffff;
+            }
+            QPushButton:checked:hover {
+                background-color: #2f6f41;
+            }
+            """
+        )
+        self._judge_subtab_group = QButtonGroup(self.judge_subtabs_container)
+        self._judge_subtab_group.setExclusive(True)
+        self._judge_subtab_group.idClicked.connect(self._on_judge_subtab_clicked)
+        self._judge_subtab_buttons: dict[str, QPushButton] = {}
+        self._judge_subtab_order: list[str] = []
+        self._current_judge_detail: _WordScoreDetail | None = None
+        self._current_judge_category: str | None = None
+        spv.addWidget(self.judge_subtabs_container)
+        self.judge_subtabs_container.hide()
+
         self.lbl_last_reason = QLabel("")
         self.lbl_last_reason.setWordWrap(True)
         self.lbl_last_reason.setStyleSheet(
@@ -1632,6 +1710,78 @@ class MainWindow(QMainWindow):
         v.addWidget(rack_bar)
         self.btn_exchange.hide()
         self.rack_container = rack_bar
+
+        # Inline settings row (timeout etc.)
+        self.timeout_frame = QFrame()
+        self.timeout_frame.setObjectName("timeoutFrame")
+        timeout_layout = QHBoxLayout(self.timeout_frame)
+        timeout_layout.setContentsMargins(18, 10, 18, 10)
+        timeout_layout.setSpacing(24)
+
+        timeout_label = QLabel("⏱ Timeout pre modely:")
+        timeout_label.setStyleSheet(
+            "QLabel { color: #e0e6f0; font-size: 15px; font-weight: 600; }"
+        )
+        timeout_layout.addWidget(timeout_label)
+
+        self.timeout_combo = QComboBox()
+        self.timeout_combo.setObjectName("timeoutCombo")
+        self.timeout_combo.setStyleSheet(
+            "QComboBox {"
+            "background-color: #1a1a1a;"
+            "color: #f0f6ff;"
+            "font-size: 15px;"
+            "padding: 8px 16px;"
+            "border: 1px solid #2f3645;"
+            "border-radius: 6px;"
+            "min-width: 200px;"
+            "}"
+            "QComboBox::drop-down { width: 26px; border: none; }"
+            "QComboBox QAbstractItemView {"
+            "background: #101218; color: #f0f6ff; selection-background-color: #2d6cdf;"
+            "border: 1px solid #2f3645;"
+            "}"
+        )
+        for seconds, label in OPENROUTER_TIMEOUT_CHOICES:
+            self.timeout_combo.addItem(label, seconds)
+
+        current_timeout = self.openrouter_timeout_seconds
+        current_index = self.timeout_combo.findData(current_timeout)
+        if current_index == -1:
+            custom_label = self._format_timeout_choice(current_timeout)
+            self.timeout_combo.addItem(custom_label, current_timeout)
+            current_index = self.timeout_combo.findData(current_timeout)
+        self.timeout_combo.setCurrentIndex(current_index)
+        self.timeout_combo.currentIndexChanged.connect(self._on_timeout_changed)
+        timeout_layout.addWidget(self.timeout_combo)
+
+        timeout_hint = QLabel("Zastaví pomalé modely po limite počas konkurenčného ťahu.")
+        timeout_hint.setStyleSheet(
+            "QLabel { color: #9aa5b5; font-size: 12px; }"
+        )
+        timeout_layout.addWidget(timeout_hint)
+
+        self.max_tokens_label = QLabel("")
+        self.max_tokens_label.setStyleSheet(
+            "QLabel { color: #9aa5b5; font-size: 12px; }"
+        )
+        timeout_layout.addWidget(self.max_tokens_label)
+        timeout_layout.addStretch(1)
+
+        self.timeout_frame.setStyleSheet(
+            "QFrame#timeoutFrame {"
+            "background-color: #12141b;"
+            "border-top: 1px solid #202532;"
+            "border-bottom: 1px solid #202532;"
+            "}"
+        )
+
+        v.addWidget(self.timeout_frame)
+        self._update_max_tokens_label()
+
+        # AI Model Results Table (below rack)
+        self.model_results_table = AIModelResultsTable()
+        v.addWidget(self.model_results_table)
         self.status = QStatusBar()
         self.setStatusBar(self.status)
         # start: prazdny status bar
@@ -1669,6 +1819,80 @@ class MainWindow(QMainWindow):
         self._starter_decided: bool = False
 
         self._reset_to_idle_state()
+
+    def _load_openrouter_timeout(self) -> int:
+        raw = os.getenv("OPENROUTER_TIMEOUT_SECONDS")
+        try:
+            value = int(raw) if raw is not None else DEFAULT_OPENROUTER_TIMEOUT
+        except ValueError:
+            value = DEFAULT_OPENROUTER_TIMEOUT
+        if value < 5:
+            value = DEFAULT_OPENROUTER_TIMEOUT
+        return value
+
+    @staticmethod
+    def _load_ai_move_max_tokens() -> tuple[int, bool]:
+        raw = os.getenv("AI_MOVE_MAX_OUTPUT_TOKENS")
+        default = 3600
+        if raw is None:
+            return default, False
+        try:
+            value = int(raw)
+        except ValueError:
+            return default, False
+        if value <= 0:
+            return default, False
+        return value, True
+
+    def _update_max_tokens_label(self) -> None:
+        if hasattr(self, "max_tokens_label") and self.max_tokens_label is not None:
+            self.max_tokens_label.setText("Maximálne tokenov na ťah:")
+            self.max_tokens_label.setToolTip(
+                f"Aktuálny limit: {self.ai_move_max_tokens} tokenov"
+            )
+
+    @staticmethod
+    def _format_timeout_choice(seconds: int) -> str:
+        if seconds % 60 == 0:
+            minutes = seconds // 60
+            if minutes == 1:
+                return "1 minúta"
+            if minutes in {2, 3, 4}:
+                return f"{minutes} minúty"
+            return f"{minutes} minút"
+        return f"{seconds} sekúnd"
+
+    def _update_env_value(self, key: str, value: str) -> None:
+        os.environ[key] = value
+        try:
+            from dotenv import set_key as _set_key  # type: ignore
+            _set_key(ENV_PATH, key, value)
+        except Exception:
+            self._write_env_value_manually(key, value)
+
+    def _write_env_value_manually(self, key: str, value: str) -> None:
+        try:
+            path = Path(ENV_PATH)
+            if not path.exists():
+                path.touch()
+            lines = path.read_text(encoding="utf-8").splitlines()
+            updated = False
+            new_lines: list[str] = []
+            for line in lines:
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#"):
+                    new_lines.append(line)
+                    continue
+                if stripped.split("=", 1)[0].strip() == key:
+                    new_lines.append(f"{key}='{value}'")
+                    updated = True
+                else:
+                    new_lines.append(line)
+            if not updated:
+                new_lines.append(f"{key}='{value}'")
+            path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+        except Exception:
+            log.exception("Failed to persist %s to .env", key)
 
     def _set_variant(self, slug: str) -> None:
         try:
@@ -1756,6 +1980,7 @@ class MainWindow(QMainWindow):
         self._last_move_breakdown = []
         self._last_move_bingo = False
         self._last_move_reason = ""
+        self._last_move_reason_is_html = False
         self._clear_last_move_word_details()
         self.board_view.set_last_move_cells([])
         self._update_scores_label()
@@ -1842,6 +2067,23 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "Koniec", f"{winner} vyhráva (vzdané).")
         self._reset_to_idle_state()
 
+    def _on_timeout_changed(self, index: int) -> None:
+        if index < 0:
+            return
+        data = self.timeout_combo.itemData(index)
+        try:
+            seconds = int(data)
+        except (TypeError, ValueError):
+            return
+        if seconds == self.openrouter_timeout_seconds:
+            return
+        self.openrouter_timeout_seconds = seconds
+        self._update_env_value("OPENROUTER_TIMEOUT_SECONDS", str(seconds))
+        display = self._format_timeout_choice(seconds)
+        log.info("Timeout updated to %s (%ds)", display, seconds)
+        if hasattr(self, "status") and isinstance(self.status, QStatusBar):
+            self.status.showMessage(f"Timeout nastavený na {display}", 4000)
+
     def _reset_to_idle_state(self) -> None:
         """Vráti aplikáciu do východzieho stavu pred spustením hry."""
         # zastav animácie/spinner a ukonči rozbehnuté vlákna
@@ -1883,6 +2125,7 @@ class MainWindow(QMainWindow):
         self._last_move_breakdown = []
         self._last_move_bingo = False
         self._last_move_reason = ""
+        self._last_move_reason_is_html = False
         self._clear_last_move_word_details()
         self._pending_words_coords = []
         self._consecutive_passes = 0
@@ -1949,11 +2192,132 @@ class MainWindow(QMainWindow):
         self._word_tabs_layout.addStretch(1)
         self.word_tabs_container.show()
 
+    def _clear_judge_subtabs(self) -> None:
+        for btn in list(self._judge_subtab_group.buttons()):
+            self._judge_subtab_group.removeButton(btn)
+        while self.judge_subtabs_layout.count():
+            item = self.judge_subtabs_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self._judge_subtab_buttons.clear()
+        self._judge_subtab_order.clear()
+        self.judge_subtabs_container.hide()
+        self._current_judge_category = None
+        self._current_judge_detail = None
+
+    def _refresh_judge_subtabs(self, detail: _WordScoreDetail) -> None:
+        categories: list[tuple[str, str]] = []
+        if detail.reason:
+            categories.append(("reason", "Dôvod"))
+        if detail.lexicons:
+            categories.append(("lexicons", "Lexikóny"))
+        if detail.definitions:
+            categories.append(("definitions", "Definície"))
+        if detail.examples:
+            categories.append(("examples", "Príklady"))
+        if detail.notes:
+            categories.append(("notes", "Poznámky"))
+
+        self._clear_judge_subtabs()
+        self._current_judge_detail = detail
+
+        if not categories:
+            self._set_last_move_reason("")
+            return
+
+        for idx, (key, label) in enumerate(categories):
+            btn = QPushButton(label, self.judge_subtabs_container)
+            btn.setCheckable(True)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setProperty("judge_category", key)
+            self.judge_subtabs_layout.addWidget(btn)
+            self._judge_subtab_group.addButton(btn, idx)
+            self._judge_subtab_buttons[key] = btn
+            self._judge_subtab_order.append(key)
+
+        self.judge_subtabs_layout.addStretch(1)
+        self.judge_subtabs_container.show()
+
+        first_key = self._judge_subtab_order[0]
+        btn = self._judge_subtab_buttons[first_key]
+        btn.setChecked(True)
+        self._apply_judge_subtab_selection(first_key)
+
+    def _on_judge_subtab_clicked(self, tab_id: int) -> None:
+        btn = self._judge_subtab_group.button(tab_id)
+        if btn is None:
+            return
+        category = btn.property("judge_category")
+        if isinstance(category, str):
+            self._apply_judge_subtab_selection(category)
+
+    def _apply_judge_subtab_selection(self, category: str) -> None:
+        detail = self._current_judge_detail
+        if detail is None:
+            self._set_last_move_reason("")
+            return
+        self._current_judge_category = category
+        content = self._render_judge_subtab_content(detail, category)
+        if content:
+            self._set_last_move_reason(content, is_html=True)
+        else:
+            self._set_last_move_reason("")
+
+    @staticmethod
+    def _render_list_html(items: tuple[str, ...]) -> str:
+        list_items = "".join(f"<li>{html.escape(text)}</li>" for text in items if text)
+        if not list_items:
+            return ""
+        return (
+            "<ul style='margin:6px 0 0 18px; padding:0 0 0 4px; line-height:1.4;'>"
+            f"{list_items}</ul>"
+        )
+
+    def _render_judge_subtab_content(self, detail: _WordScoreDetail, category: str) -> str:
+        labels = {
+            "reason": "Dôvod",
+            "lexicons": "Lexikóny",
+            "definitions": "Definície",
+            "examples": "Príklady",
+            "notes": "Poznámky",
+        }
+        label = labels.get(category, "")
+        title = html.escape(detail.word)
+        if label:
+            header = (
+                "<div style='font-weight:bold;margin-bottom:4px'>"
+                f"{title} — {html.escape(label)}</div>"
+            )
+        else:
+            header = f"<div style='font-weight:bold;margin-bottom:4px'>{title}</div>"
+        if category == "reason":
+            if not detail.reason:
+                return ""
+            body = html.escape(detail.reason).replace("\n", "<br/>")
+            return header + f"<div style='line-height:1.4'>{body}</div>"
+        if category == "lexicons":
+            body = self._render_list_html(detail.lexicons)
+            return header + body
+        if category == "definitions":
+            body = self._render_list_html(detail.definitions)
+            return header + body
+        if category == "examples":
+            body = self._render_list_html(detail.examples)
+            return header + body
+        if category == "notes":
+            if not detail.notes:
+                return ""
+            body = html.escape(detail.notes).replace("\n", "<br/>")
+            return header + f"<div style='line-height:1.4'>{body}</div>"
+        return ""
+
     def _select_last_move_word(self, index: int) -> None:
         if not self._last_move_word_details:
             self._active_word_index = None
             self.lbl_last_breakdown.setText("")
             self.word_tabs_container.hide()
+            self._clear_judge_subtabs()
             self._set_last_move_reason("")
             return
         index = max(0, min(index, len(self._last_move_word_details) - 1))
@@ -1965,7 +2329,7 @@ class MainWindow(QMainWindow):
         finally:
             self._word_tabs_group.blockSignals(False)
         detail = self._last_move_word_details[index]
-        self._set_last_move_reason(detail.reason)
+        self._refresh_judge_subtabs(detail)
         self._update_last_move_breakdown_ui()
 
     def _on_last_move_tab_clicked(self, index: int) -> None:
@@ -1976,6 +2340,7 @@ class MainWindow(QMainWindow):
         self._active_word_index = None
         self._rebuild_last_move_word_tabs()
         self.lbl_last_breakdown.setText("")
+        self._clear_judge_subtabs()
 
     def _update_last_move_reason_ui(self) -> None:
         """Zobrazí alebo schová dôvod rozhodcu pre posledný platný ťah."""
@@ -1984,16 +2349,21 @@ class MainWindow(QMainWindow):
             self.lbl_last_reason.hide()
             self.lbl_last_reason.setText("")
             return
-        escaped = html.escape(reason).replace("\n", "<br/>")
+        if self._last_move_reason_is_html:
+            escaped = reason
+        else:
+            escaped = html.escape(reason).replace("\n", "<br/>")
         self.lbl_last_reason.setText(
             "<div style='margin:6px 0 0 0'>"
             f"{escaped}</div>"
         )
         self.lbl_last_reason.show()
 
-    def _set_last_move_reason(self, reason: str) -> None:
+    def _set_last_move_reason(self, reason: str, *, is_html: bool = False) -> None:
         """Uloží dôvod rozhodcu k poslednému platnému ťahu a refreshne UI."""
-        self._last_move_reason = reason.strip()
+        stripped = reason.strip()
+        self._last_move_reason = stripped
+        self._last_move_reason_is_html = bool(is_html and stripped)
         self._update_last_move_reason_ui()
 
     @staticmethod
@@ -2038,6 +2408,31 @@ class MainWindow(QMainWindow):
     ) -> list[_WordScoreDetail]:
         lookup = self._build_reason_lookup(entries)
         preferred_cf = preferred_word.casefold() if preferred_word else None
+        entry_lookup: dict[str, dict[str, Any]] = {}
+
+        def _score_entry(payload: dict[str, Any]) -> int:
+            score = 0
+            for list_field in ("lexicons", "definitions", "examples"):
+                value = payload.get(list_field)
+                if isinstance(value, (list, tuple)):
+                    score += len(value)
+                elif isinstance(value, str) and value.strip():
+                    score += 1
+            notes_value = payload.get("notes")
+            if isinstance(notes_value, str) and notes_value.strip():
+                score += 1
+            reason_value = payload.get("reason")
+            if isinstance(reason_value, str) and reason_value.strip():
+                score += 1
+            return score
+
+        for entry in entries:
+            word_value = entry.get("word")
+            if isinstance(word_value, str) and word_value.strip():
+                key = word_value.strip().casefold()
+                existing = entry_lookup.get(key)
+                if existing is None or _score_entry(entry) >= _score_entry(existing):
+                    entry_lookup[key] = entry
         details: list[_WordScoreDetail] = []
         for idx, (word, base, letter_bonus, word_multiplier, total) in enumerate(breakdown):
             reason = lookup.get(word.casefold(), "")
@@ -2046,6 +2441,20 @@ class MainWindow(QMainWindow):
                     reason = fallback_reason
                 elif not preferred_cf and idx == 0 and fallback_reason:
                     reason = fallback_reason
+            entry_data = entry_lookup.get(word.casefold(), {})
+            def _coerce_list(field_name: str) -> tuple[str, ...]:
+                value = entry_data.get(field_name)
+                if isinstance(value, (list, tuple)):
+                    collected = [str(item).strip() for item in value if str(item).strip()]
+                    return tuple(collected)
+                if isinstance(value, str) and value.strip():
+                    return (value.strip(),)
+                return tuple()
+            lexicons = _coerce_list("lexicons")
+            definitions = _coerce_list("definitions")
+            examples = _coerce_list("examples")
+            notes_val = entry_data.get("notes")
+            notes = str(notes_val).strip() if isinstance(notes_val, str) else ""
             details.append(
                 _WordScoreDetail(
                     word=word,
@@ -2054,18 +2463,25 @@ class MainWindow(QMainWindow):
                     word_multiplier=word_multiplier,
                     total=total,
                     reason=reason,
+                    lexicons=lexicons,
+                    definitions=definitions,
+                    examples=examples,
+                    notes=notes,
                 )
             )
         return details
 
-    @staticmethod
-    def _format_judge_status(words: list[str]) -> str:
+    def _format_judge_status(self, words: list[str]) -> str:
+        """Format judge status message with model name if available."""
+        model_name = getattr(self, '_current_ai_model', None)
+        model_prefix = f"[{model_name}] " if model_name and model_name != "AI" else ""
+        
         if not words:
-            return "Rozhoduje rozhodca"
+            return f"{model_prefix}Rozhoduje rozhodca"
         if len(words) == 1:
-            return f"Rozhodca rozhoduje slovo {words[0]}"
+            return f"{model_prefix}Rozhodca rozhoduje slovo {words[0]}"
         joined = ", ".join(words)
-        return f"Rozhodca rozhoduje slová: {joined}"
+        return f"{model_prefix}Rozhodca rozhoduje slová: {joined}"
 
     def _append_pending_tile(self, placement: Placement) -> None:
         """Pridá dočasne položené písmeno a refreshne UI."""
@@ -2414,7 +2830,7 @@ class MainWindow(QMainWindow):
         log.info("Rozhodca overuje slová: %s", words)
         # spusti spinner (online judge)
         judge_status = self._format_judge_status(words)
-        self._start_status_spinner("judge", judge_status, wait_cursor=True)
+        self._start_status_spinner("judge", judge_status, wait_cursor=False)
 
         # lazy init klienta
         if self.ai_client is None:
@@ -2631,7 +3047,7 @@ class MainWindow(QMainWindow):
     def _start_ai_turn(self) -> None:
         self._ai_thinking = True
         self._disable_human_inputs()
-        self._start_status_spinner("ai", "Hrá AI", wait_cursor=True)
+        self._start_status_spinner("ai", "Hrá AI", wait_cursor=False)
         # reset flagu pre nový ťah
         self._ai_retry_used = False
         # priraď trace_id pre AI ťah
@@ -2653,34 +3069,186 @@ class MainWindow(QMainWindow):
         class ProposeWorker(QObject):
             finished: Signal = Signal(dict)
             failed: Signal = Signal(Exception)
-            def __init__(self, client: OpenAIClient, state_str: str, trace_id: str, variant: VariantDefinition) -> None:
+            multi_model_results: Signal = Signal(list)
+            partial_result: Signal = Signal(dict)
+            def __init__(
+                self,
+                client: OpenAIClient,
+                state_str: str,
+                trace_id: str,
+                variant: VariantDefinition,
+                use_multi_model: bool,
+                selected_models: list[dict[str, Any]],
+                board: Board,
+                timeout_seconds: int,
+            ) -> None:
                 super().__init__()
                 self.client = client
                 self.state_str = state_str
                 self.trace_id = trace_id
                 self.variant = variant
+                self.use_multi_model = use_multi_model
+                self.selected_models = selected_models
+                self.board = board
+                self.timeout_seconds = timeout_seconds
             def run(self) -> None:
                 try:
                     TRACE_ID_VAR.set(self.trace_id)
-                    # Použi vylepšený prompt z ai.player
-                    resp = ai_propose_move(
-                        client=self.client,
-                        compact_state=self.state_str,
-                        variant=self.variant,
-                    )
+                    if self.use_multi_model and self.selected_models:
+                        import asyncio
+                        import os
+                        api_key = os.getenv("OPENROUTER_API_KEY", "")
+                        openrouter_client = OpenRouterClient(
+                            api_key,
+                            timeout_seconds=self.timeout_seconds,
+                        )
+                        
+                        async def run_multi() -> tuple[dict[str, Any], list[dict[str, Any]]]:
+                            def on_partial(res: dict[str, Any]) -> None:
+                                self.partial_result.emit(res)
+
+                            try:
+                                move, results = await propose_move_multi_model(
+                                    openrouter_client,
+                                    self.selected_models,
+                                    self.state_str,
+                                    self.variant,
+                                    self.board,
+                                    self.client,
+                                    progress_callback=on_partial,
+                                    timeout_seconds=self.timeout_seconds,
+                                )
+                            finally:
+                                await openrouter_client.close()
+
+                            log.info(
+                                "Multi-model: %d models, best score from %s",
+                                len(results),
+                                next(
+                                    (
+                                        r.get("model_name")
+                                        for r in results
+                                        if r.get("status") == "ok"
+                                    ),
+                                    "?",
+                                ),
+                            )
+                            return move, results
+                        
+                        resp, results = asyncio.run(run_multi())
+                        self.multi_model_results.emit(results)
+                    else:
+                        resp = ai_propose_move(
+                            client=self.client,
+                            compact_state=self.state_str,
+                            variant=self.variant,
+                        )
                     self.finished.emit(resp)
                 except Exception as e:  # noqa: BLE001
                     self.failed.emit(e)
 
         self._ai_thread = QThread(self)
-        self._ai_worker = ProposeWorker(self.ai_client, compact, TRACE_ID_VAR.get(), self.variant_definition)
+        self._ai_worker = ProposeWorker(
+            self.ai_client,
+            compact,
+            TRACE_ID_VAR.get(),
+            self.variant_definition,
+            self.use_multi_model,
+            self.selected_ai_models,
+            self.board,
+            self.openrouter_timeout_seconds,
+        )
+
+        if self.use_multi_model and self.selected_ai_models:
+            self.model_results_table.initialize_models(self.selected_ai_models)
+        else:
+            self.model_results_table.clear_results()
+
         self._ai_worker.moveToThread(self._ai_thread)
         self._ai_thread.started.connect(self._ai_worker.run)
+        # Connect signals - results come first, then proposal
+        self._ai_worker.multi_model_results.connect(self._on_multi_model_results)
+        self._ai_worker.partial_result.connect(self._on_multi_model_partial)
         self._ai_worker.finished.connect(self._on_ai_proposal)
         self._ai_worker.failed.connect(self._on_ai_fail)
         self._ai_worker.finished.connect(self._ai_thread.quit)
         self._ai_worker.failed.connect(self._ai_thread.quit)
         self._ai_thread.start()
+        
+        # Update status to show models are being called
+        if self.use_multi_model and self.selected_ai_models:
+            model_count = len(self.selected_ai_models)
+            model_names = ", ".join(
+                [m.get("name", m.get("id", "?"))[:20] for m in self.selected_ai_models[:3]]
+            )
+            if model_count > 3:
+                model_names += f" +{model_count - 3} ďalších"
+            self.status.showMessage(f"Volám {model_count} modelov: {model_names}...")
+    
+    def _on_multi_model_partial(self, result: dict[str, Any]) -> None:
+        """Handle incremental model result updates."""
+        model_id = result.get("model", "?")
+        model_name = result.get("model_name", model_id)
+        status = result.get("status", "pending")
+        score = result.get("score")
+
+        log.info(
+            "Partial result from %s status=%s score=%s", model_name, status, score
+        )
+
+        self.model_results_table.update_result(result)
+
+        if status == "ok":
+            words = result.get("words") or []
+            word_preview = ", ".join(words) if words else result.get("move", {}).get("word", "—")
+            score_text = f"{score} b" if isinstance(score, (int, float)) else "—"
+            self.status.showMessage(
+                f"{model_name} odpovedal: {word_preview} ({score_text})"
+            )
+        elif status == "parse_error":
+            self.status.showMessage(f"{model_name}: neplatná odpoveď – čakám na ostatné modely")
+        elif status == "error":
+            self.status.showMessage(f"{model_name}: API chyba – čakám na ostatné modely")
+        elif status == "timeout":
+            self.status.showMessage(f"{model_name}: Timeout – čakám na ostatné modely")
+
+    def _on_multi_model_results(self, results: list[dict[str, Any]]) -> None:
+        """Handle multi-model competition results and display in table."""
+        log.info("Received multi-model results: %d models", len(results))
+        
+        # Update table immediately with results
+        self.model_results_table.set_results(results)
+        
+        # Store the winning model name for status messages
+        # Find the best valid result
+        valid_results = [r for r in results if r.get("judge_valid")]
+        if valid_results:
+            valid_results.sort(key=lambda r: int(r.get("score", -1)), reverse=True)
+            self._current_ai_model = valid_results[0].get("model_name", "AI")
+            winner_word = ", ".join(valid_results[0].get("words", []))
+            winner_score = valid_results[0].get("score", 0)
+            self.status.showMessage(
+                f"✓ Víťaz: {self._current_ai_model} - {winner_word} ({winner_score} bodov)"
+            )
+        else:
+            # No valid results, find highest scoring attempt
+            all_sorted = sorted(results, key=lambda r: int(r.get("score", -1)), reverse=True)
+            if all_sorted:
+                self._current_ai_model = all_sorted[0].get("model_name", "AI")
+                self.status.showMessage(f"⚠️ Žiadne platné návrhy, používam {self._current_ai_model}")
+            else:
+                self._current_ai_model = "AI"
+                self.status.showMessage("⚠️ Žiadne platné návrhy od modelov")
+    
+    def _update_table_for_judging(self, words: list[str]) -> None:
+        """Update table to highlight which words are being judged."""
+        model_name = getattr(self, '_current_ai_model', "AI")
+        log.info("Judge validating words %s from model %s", words, model_name)
+        
+        # Update status message to show which model's move is being judged
+        words_str = ", ".join(words)
+        judge_status = f"Rozhodca validuje: {words_str} (navrhol {model_name})"
+        self.status.showMessage(judge_status)
 
     def _validate_ai_move(self, proposal: dict[str, object]) -> Optional[str]:
         # zakladna validacia schema a rack
@@ -2694,12 +3262,15 @@ class MainWindow(QMainWindow):
         # validacia rozsahu a linie
         try:
             placements_list: list[dict[str, Any]] = cast(list[dict[str, Any]], placements_obj)
-            ps: list[Placement] = [
-                Placement(int(p["row"]), int(p["col"]), str(p["letter"]))
-                for p in placements_list
-            ]
-        except Exception:
-            return "Placements nemajú správny tvar."
+            ps: list[Placement] = []
+            for p in placements_list:
+                if not isinstance(p, dict):
+                    return "Placement nie je dict."
+                if "row" not in p or "col" not in p or "letter" not in p:
+                    return f"Placement chýbajú kľúče (row/col/letter): {p}"
+                ps.append(Placement(int(p["row"]), int(p["col"]), str(p["letter"])))
+        except (KeyError, ValueError, TypeError) as e:
+            return f"Placements nemajú správny tvar: {e}"
         # nesmie prepisovať existujúce písmená
         for p in ps:
             if self.board.cells[p.row][p.col].letter:
@@ -2748,57 +3319,14 @@ class MainWindow(QMainWindow):
 
     def _on_ai_proposal(self, proposal: dict[str, object]) -> None:
         log.info("AI navrhla: %s", proposal)
-        # validacia / retry / pass
+        # validacia - bez retry, jednoducho pass pri chybe
         err = self._validate_ai_move(proposal)
         if err is not None and not bool(proposal.get("pass", False)):
-            # jeden retry s hintom
-            self.status.showMessage("AI návrh neplatný, skúša znova…")
-            self._spinner_phase = 0
-            self._spinner_timer.start()
-            if self.ai_client is None:
-                self.ai_client = OpenAIClient()
-            # Špecifický hint pre porušenie center-star pravidla pri prvom ťahu
-            if (not self._has_any_letters()) and ("stred" in err or "center" in err or err.startswith("AI prvý ťah")):
-                hint = "Opening rule: your first move must cross the center star at H8. Propose a different move."
-            else:
-                hint = f"Previous error: {err}. Ensure single line, no gaps, valid rack."
-            st = build_ai_state_dict(self.board, self.ai_rack, self.human_score, self.ai_score, turn="AI")
-            compact = (
-                "grid:\n" + "\n".join(st["grid"]) +
-                f"\nblanks:{st['blanks']}\n"
-                f"ai_rack:{st['ai_rack']}\n"
-                f"scores: H={st['human_score']} AI={st['ai_score']}\nturn:{st['turn']}\n"
-            )
-            try:
-                # označ, že prebehol retry (pre logovanie výsledku otvorenia)
-                self._ai_retry_used = True
-                proposal = ai_propose_move(
-                    self.ai_client,
-                    compact_state=compact,
-                    variant=self.variant_definition,
-                    retry_hint=hint,
-                )
-            except TokenBudgetExceededError:
-                # špeciálna hláška, ale AI iba pasuje, aby sa hra nezasekla
-                self._stop_status_spinner("ai")
-                self._ai_thinking = False
-                self._enable_human_inputs()
-                self._register_scoreless_turn("AI")
-                self.status.showMessage("AI minula tokeny — pasuje")
-                if self._ai_opening_active:
-                    try:
-                        log.info("ai_opening done result=%s", "invalid_retry_pass" if self._ai_retry_used else "pass")
-                    except Exception:
-                        pass
-                    self._ai_opening_active = False
-                self._check_endgame()
-                return
-            except Exception as e:  # noqa: BLE001
-                self._on_ai_fail(e)
-                return
-            err = self._validate_ai_move(proposal)
-            if err is not None and not bool(proposal.get("pass", False)):
-                proposal = {"pass": True}
+            # Neplatný návrh - AI pasuje bez retry
+            model_name = getattr(self, '_current_ai_model', "AI")
+            self.status.showMessage(f"[{model_name}] Neplatný návrh ({err}), AI pasuje")
+            log.warning("AI navrhol neplatný ťah: %s", err)
+            proposal = {"pass": True}
 
         if bool(proposal.get("pass", False)):
             self._stop_status_spinner("ai")
@@ -2819,10 +3347,17 @@ class MainWindow(QMainWindow):
         board_was_empty = not self._has_any_letters()
         placements_obj = proposal.get("placements", [])
         placements_list: list[dict[str, Any]] = cast(list[dict[str, Any]], placements_obj) if isinstance(placements_obj, list) else []
-        ps: list[Placement] = [
-            Placement(int(p["row"]), int(p["col"]), str(p["letter"]))
-            for p in placements_list
-        ]
+        ps: list[Placement] = []
+        for p in placements_list:
+            if not isinstance(p, dict) or "row" not in p or "col" not in p or "letter" not in p:
+                log.error("Invalid placement dict: %s", p)
+                self.status.showMessage("AI vrátila neplatný placement")
+                self._stop_status_spinner("ai")
+                self._ai_thinking = False
+                self._enable_human_inputs()
+                self._register_scoreless_turn("AI")
+                return
+            ps.append(Placement(int(p["row"]), int(p["col"]), str(p["letter"])))
         blanks = proposal.get("blanks")
         blank_map, _ = self._parse_blank_map(blanks)
         # nastav blank_as; ak AI oznacila v `blanks`, prekonvertuj na '?'
@@ -2901,40 +3436,38 @@ class MainWindow(QMainWindow):
             and not bool(proposal.get("pass", False))
         ):
             # Mismatch = pravdepodobné lepenie na existujúci reťazec
+            # Neplatné - AI pasuje bez retry
             self.board.clear_letters(ps2)
             self._refresh_board_view()
-            self._spinner_phase = 0
-            self._spinner_timer.start()
-            self._ai_retry_used = True
-            try:
-                log.info("ai_retry reason=invalid_glued_word main=%s anchor=%s", main_word, anchor)
-            except Exception:
-                pass
-            st = build_ai_state_dict(self.board, self.ai_rack, self.human_score, self.ai_score, turn="AI")
-            compact = (
-                "grid:\n" + "\n".join(st["grid"]) +
-                f"\nblanks:{st['blanks']}\n"
-                f"ai_rack:{st['ai_rack']}\n"
-                f"scores: H={st['human_score']} AI={st['ai_score']}\nturn:{st['turn']}\n"
-            )
-            hint = (
-                f"Your previous move created an invalid glued word '{main_word}' by attaching to existing '{anchor}'. "
-                f"Propose a different move that forms a single valid {self.variant_language} word; prefer proper hooks or overlaps. Return JSON only."
-            )
-            try:
-                new_prop = ai_propose_move(
-                    self.ai_client if self.ai_client else OpenAIClient(),
-                    compact_state=compact,
-                    variant=self.variant_definition,
-                    retry_hint=hint,
-                )
-            except Exception as e:  # noqa: BLE001
-                self._on_ai_fail(e)
-                return
-            # Re-validate and continue with new proposal
-            self._on_ai_proposal(new_prop)
+            log.warning("AI vytvorila neplatné lepené slovo: main=%s anchor=%s", main_word, anchor)
+            self._stop_status_spinner("ai")
+            self._ai_thinking = False
+            self._enable_human_inputs()
+            self.status.showMessage(f"AI vytvorila neplatné lepené slovo '{main_word}' — pasuje")
+            self._register_scoreless_turn("AI")
+            if self._ai_opening_active:
+                try:
+                    log.info("ai_opening done result=invalid_glued_word")
+                except Exception:
+                    pass
+                self._ai_opening_active = False
+            self._check_endgame()
             return
 
+        # For retry success, show in table
+        if self._ai_retry_used and hasattr(self, '_current_ai_model'):
+            # Create a single-row result for the successful retry
+            retry_result = {
+                "model": "gpt-5-mini",
+                "model_name": self._current_ai_model,
+                "status": "ok",
+                "move": {"word": words[0] if words else ""},
+                "score": 0,  # Will be calculated by judge
+                "words": words,
+                "judge_valid": None,  # Will be set after judge
+            }
+            self.model_results_table.set_results([retry_result])
+        
         # Rozhodovanie (online)
         class JudgeWorker(QObject):
             finished: Signal = Signal(dict)
@@ -2957,7 +3490,11 @@ class MainWindow(QMainWindow):
         self._ai_ps2 = ps2
         # spusti spinner pre online rozhodovanie AI
         judge_status = self._format_judge_status(words)
-        self._start_status_spinner("judge", judge_status, wait_cursor=True)
+        self._start_status_spinner("judge", judge_status, wait_cursor=False)
+        
+        # Update table to show which words are being judged
+        self._update_table_for_judging(words)
+        
         self._ai_judge_thread = QThread(self)
         self._ai_judge_worker = JudgeWorker(
             self.ai_client if self.ai_client else OpenAIClient(),
@@ -3006,43 +3543,14 @@ class MainWindow(QMainWindow):
                         invalid_word = str(it.get("word", ""))
                         invalid_reason = str(it.get("reason", ""))
                         break
-                try:
-                    log.info(
-                        "ai_retry reason=judge_invalid word=%s reason=%s",
-                        invalid_word or self._ai_last_main_word,
-                        invalid_reason,
-                    )
-                except Exception:
-                    pass
-                st = build_ai_state_dict(self.board, self.ai_rack, self.human_score, self.ai_score, turn="AI")
-                compact = (
-                    "grid:\n" + "\n".join(st["grid"]) +
-                    f"\nblanks:{st['blanks']}\n"
-                    f"ai_rack:{st['ai_rack']}\n"
-                    f"scores: H={st['human_score']} AI={st['ai_score']}\nturn:{st['turn']}\n"
-                )
+                # Judge rejected move - AI pasuje bez retry
                 summary_word = invalid_word or self._ai_last_main_word or ""
                 summary_reason = invalid_reason or self._ai_last_anchor or ""
-                if summary_reason:
-                    hint_reason = f" (reason: {summary_reason})"
-                else:
-                    hint_reason = ""
-                hint = (
-                    f"Judge rejected your previous move '{summary_word}'.{hint_reason} "
-                    f"Propose a different move that forms a single valid {self.variant_language} word; prefer proper hooks or overlaps. Return JSON only."
+                log.warning(
+                    "Judge zamietol AI ťah: word=%s reason=%s",
+                    summary_word,
+                    summary_reason,
                 )
-                try:
-                    new_prop = ai_propose_move(
-                        self.ai_client if self.ai_client else OpenAIClient(),
-                        compact_state=compact,
-                        variant=self.variant_definition,
-                        retry_hint=hint,
-                    )
-                except Exception as e:  # noqa: BLE001
-                    self._on_ai_fail(e)
-                    return
-                self._on_ai_proposal(new_prop)
-                return
             # inak: pass
             self.board.clear_letters(getattr(self, "_ai_ps2"))
             self._refresh_board_view()
@@ -3187,9 +3695,14 @@ class MainWindow(QMainWindow):
         dlg = SettingsDialog(self, repro_mode=self.repro_mode, repro_seed=self.repro_seed)
         ok = dlg.exec()
         if ok:
+            new_ai_tokens, from_env = self._load_ai_move_max_tokens()
+            self.ai_move_max_tokens = new_ai_tokens
+            self._ai_tokens_from_env = from_env
+            self._user_defined_ai_tokens = False
+            self._update_max_tokens_label()
             try:
                 if self.ai_client is not None:
-                    self.ai_client.ai_move_max_output_tokens = int(os.getenv("AI_MOVE_MAX_OUTPUT_TOKENS", "3600"))
+                    self.ai_client.ai_move_max_output_tokens = new_ai_tokens
                     self.ai_client.judge_max_output_tokens = int(os.getenv("JUDGE_MAX_OUTPUT_TOKENS", "800"))
             except Exception:
                 pass
@@ -3271,6 +3784,7 @@ class MainWindow(QMainWindow):
                 last_move_cells=getattr(self.board_view, "_last_move_cells", []),
                 last_move_points=self.last_move_points,
                 last_move_reason=self._last_move_reason,
+                last_move_reason_is_html=self._last_move_reason_is_html,
                 consecutive_passes=self._consecutive_passes,
                 human_pass_streak=self._pass_streak.get("HUMAN", 0),
                 ai_pass_streak=self._pass_streak.get("AI", 0),
@@ -3338,8 +3852,13 @@ class MainWindow(QMainWindow):
             # repro info
             self.repro_mode = bool(st.get("repro", False))
             self.repro_seed = int(st.get("seed", 0))
-            self._last_move_reason = str(st.get("last_move_reason", ""))
+            saved_reason = str(st.get("last_move_reason", ""))
+            saved_reason_is_html = bool(st.get("last_move_reason_is_html", False))
             self._clear_last_move_word_details()
+            if saved_reason:
+                self._set_last_move_reason(saved_reason, is_html=saved_reason_is_html)
+            else:
+                self._set_last_move_reason("")
             # UI refresh
             self.rack.set_letters(self.human_rack)
             self._set_game_ui_visible(True)
@@ -3351,6 +3870,92 @@ class MainWindow(QMainWindow):
         except Exception as e:  # noqa: BLE001
             log.exception("Load failed: %s", e)
             QMessageBox.critical(self, "Otvoriť", f"Zlyhalo načítanie: {e}")
+
+    def create_iq_test(self) -> None:
+        """Otvorí okno pre vytvorenie IQ testu."""
+        from .iq_creator import IQTestCreatorWindow
+        
+        if not self.ai_rack:
+            QMessageBox.warning(
+                self,
+                "IQ test",
+                "AI nemá žiadne písmená na racku. Začni novú hru najprv.",
+            )
+            return
+        
+        dialog = IQTestCreatorWindow(
+            board=self.board,
+            ai_rack=self.ai_rack,
+            variant_definition=self.variant_definition,
+            ai_client=self.ai_client,
+            parent=self,
+        )
+        dialog.exec()
+
+    def edit_ai_prompt(self) -> None:
+        """Open AI prompt editor dialog."""
+        dialog = PromptEditorDialog(parent=self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            # Reload prompt file in player.py will happen automatically
+            # since it reads AI_PROMPT_FILE env var on each call
+            QMessageBox.information(
+                self,
+                "Prompt aktualizovaný",
+                f"Prompt bol úspešne aktualizovaný.\n"
+                f"Používaný súbor: {dialog.get_current_prompt_file()}"
+            )
+    
+    def configure_ai_models(self) -> None:
+        """Configure AI models for multi-model gameplay."""
+        from .ai_config import AIConfigDialog
+        
+        lock_default = self._ai_tokens_from_env or self._user_defined_ai_tokens
+        dialog = AIConfigDialog(
+            parent=self,
+            default_tokens=self.ai_move_max_tokens,
+            lock_default=lock_default,
+        )
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.selected_ai_models = dialog.get_selected_models()
+            self.use_multi_model = len(self.selected_ai_models) > 0
+            shared_tokens = dialog.get_shared_tokens_value()
+            self.ai_move_max_tokens = shared_tokens
+            self._user_defined_ai_tokens = True
+            self._update_max_tokens_label()
+            try:
+                if self.ai_client is not None:
+                    self.ai_client.ai_move_max_output_tokens = shared_tokens
+            except Exception:
+                pass
+            
+            # Display selected models in the table immediately
+            if self.use_multi_model:
+                # Create result entries showing the selected models as "Ready"
+                model_entries = []
+                for model in self.selected_ai_models:
+                    model_entries.append({
+                        "model": model.get("id", ""),
+                        "model_name": model.get("name", model.get("id", "Unknown")),
+                        "move": None,
+                        "score": 0,
+                        "status": "ready",
+                        "judge_valid": None,
+                        "words": [],
+                    })
+                self.model_results_table.set_results(model_entries)
+                
+                # Update status bar
+                model_count = len(self.selected_ai_models)
+                self.status.showMessage(
+                    f"✓ Aktivované {model_count} modelov (max tokeny: {shared_tokens})",
+                    5000,
+                )
+            else:
+                # Clear table when multi-model is disabled
+                self.model_results_table.clear_results()
+                self.status.showMessage(
+                    "Multi-model režim deaktivovaný. Používa sa GPT-5-mini.", 5000
+                )
 
 def main() -> None:
     app = QApplication(sys.argv)
