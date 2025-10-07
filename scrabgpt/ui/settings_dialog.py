@@ -1,0 +1,1307 @@
+"""Settings dialog for game configuration."""
+
+from __future__ import annotations
+
+import logging
+import os
+from pathlib import Path
+from typing import Optional, Sequence, TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from .app import MainWindow
+
+from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtGui import QIntValidator, QFont, QMouseEvent
+from PySide6.QtWidgets import (
+    QDialog, QVBoxLayout, QHBoxLayout, QPushButton,
+    QLabel, QTabWidget, QWidget, QMessageBox, QFormLayout,
+    QLineEdit, QCheckBox, QComboBox, QTextEdit, QInputDialog,
+)
+
+from ..core.opponent_mode import OpponentMode
+from ..core.variant_store import (
+    VariantDefinition,
+    get_active_variant_slug,
+    list_installed_variants,
+    load_variant,
+    set_active_variant_slug,
+)
+from ..ai.variants import (
+    LanguageInfo,
+    download_and_store_variant,
+    fetch_supported_languages,
+    get_languages_for_ui,
+    match_language,
+)
+from ..ai.client import OpenAIClient
+from ..ai.language_agent import LanguageAgent, AgentProgress
+from .agents_dialog import AsyncAgentWorker, AgentActivityWidget
+from .settings_dialog_helper import update_lang_status_animation
+from .opponent_mode_selector import OpponentModeSelector
+from .ai_config import AIConfigDialog
+from .agent_config_dialog import AgentConfigDialog
+
+log = logging.getLogger("scrabgpt.ui")
+
+ROOT_DIR = Path(__file__).resolve().parents[2]
+ENV_PATH = str(ROOT_DIR / ".env")
+EUR_PER_TOKEN = 0.00000186  # 1 token ≈ 0.00000186 EUR
+
+
+class ClickableLabel(QLabel):
+    """Label that emits clicked signal when clicked."""
+    
+    clicked = Signal()
+    
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        """Handle mouse press event."""
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(event)
+
+
+class SettingsDialog(QDialog):
+    """Settings dialog for game configuration."""
+    
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        *,
+        current_mode: OpponentMode | None = None,
+        current_agent_name: Optional[str] = None,
+        available_agents: list[dict[str, Any]] | None = None,
+        game_in_progress: bool = False,
+        ai_move_max_tokens: int = 3600,
+        ai_tokens_from_env: bool = False,
+        user_defined_ai_tokens: bool = False,
+        repro_mode: bool = False,
+        repro_seed: int = 0,
+        active_tab_index: int = 0,
+    ) -> None:
+        """Initialize settings dialog.
+        
+        Args:
+            parent: Parent widget
+            current_mode: Current opponent mode
+            current_agent_name: Current agent name (if AGENT mode)
+            available_agents: List of available agent configurations
+            game_in_progress: Whether a game is currently in progress
+            ai_move_max_tokens: Max tokens for AI moves
+            ai_tokens_from_env: Whether tokens from env
+            user_defined_ai_tokens: Whether user defined tokens
+        """
+        super().__init__(parent)
+        
+        self.current_mode = current_mode or OpponentMode.BEST_MODEL
+        self.current_agent_name = current_agent_name
+        self.available_agents = available_agents or []
+        self.game_in_progress = game_in_progress
+        self.ai_move_max_tokens = ai_move_max_tokens
+        self.ai_tokens_from_env = ai_tokens_from_env
+        self.user_defined_ai_tokens = user_defined_ai_tokens
+        self.repro_mode = repro_mode
+        self.repro_seed = repro_seed
+        self.active_tab_index = active_tab_index
+        
+        # Store OpenRouter config from nested dialog
+        self.selected_openrouter_models: list[dict[str, Any]] = []
+        self.openrouter_tokens: int = ai_move_max_tokens
+        
+        # API settings state
+        self.selected_variant_slug = get_active_variant_slug()
+        self._installed_variants: list[VariantDefinition] = []
+        self._languages: list[LanguageInfo] = []
+        
+        # Prompt editor state
+        self.prompts_dir = Path("prompts")
+        self.prompts_dir.mkdir(exist_ok=True)
+        self.current_prompt_file = os.getenv("AI_PROMPT_FILE", "prompts/default.txt")
+        self.default_prompt_file = "prompts/default.txt"
+        self.prompt_modified = False
+        
+        # Language fetch animation state
+        self._lang_dot_count = 0
+        self._lang_status_timer: QTimer | None = None
+        self._lang_current_status = ""
+        
+        self.setWindowTitle("⚙️ Nastavenia Hry")
+        self.setModal(True)
+        self.resize(700, 600)
+        
+        self._setup_ui()
+    
+    def _setup_ui(self) -> None:
+        """Setup UI components."""
+        self.setStyleSheet(
+            "QDialog { background-color: #0f1a12; color: #e8f5e9; }"
+            "QLabel { color: #e8f5e9; }"
+            "QTabWidget::pane { border: 1px solid #2f5c39; background: #0f1a12; }"
+            "QTabBar::tab { "
+            "background: #1a2f1f; color: #b6e0bd; padding: 8px 16px; "
+            "border: 1px solid #2f5c39; margin-right: 2px; "
+            "} "
+            "QTabBar::tab:selected { "
+            "background: #295c33; color: #e8f5e9; font-weight: bold; "
+            "border-bottom: 2px solid #4caf50; "
+            "} "
+            "QTabBar::tab:hover { background: #213f29; }"
+        )
+        
+        layout = QVBoxLayout(self)
+        layout.setSpacing(16)
+        layout.setContentsMargins(16, 16, 16, 16)
+        
+        # Title
+        title = QLabel("⚙️ Nastavenia Hry")
+        title.setStyleSheet(
+            "font-size: 18px; font-weight: bold; color: #e8f5e9; "
+            "padding: 8px 0px;"
+        )
+        layout.addWidget(title)
+        
+        # Tab widget
+        self.tabs = QTabWidget()
+        
+        # General tab (most important settings)
+        general_tab = self._create_general_tab()
+        self.tabs.addTab(general_tab, "🎮 Všeobecné")
+        
+        # AI Opponent tab
+        ai_tab = self._create_ai_tab()
+        self.tabs.addTab(ai_tab, "🤖 AI Protivník")
+        
+        # API Settings tab
+        api_tab = self._create_api_tab()
+        self.tabs.addTab(api_tab, "⚡ Nastavenia API")
+        
+        # Prompt Editor tab
+        prompt_tab = self._create_prompt_tab()
+        self.tabs.addTab(prompt_tab, "📝 Upraviť prompt protihráča")
+        
+        # Set active tab
+        self.tabs.setCurrentIndex(self.active_tab_index)
+        
+        layout.addWidget(self.tabs)
+        
+        # Agent status bar at bottom (hidden by default, clickable)
+        self.lang_fetch_status = ClickableLabel("")
+        self.lang_fetch_status.clicked.connect(self._on_status_bar_clicked)
+        self.lang_fetch_status.setStyleSheet(
+            "QLabel { "
+            "color: #4caf50; font-size: 14px; font-weight: bold; "
+            "padding: 12px 16px; background: #000000; "
+            "border-top: 1px solid #2f5c39; "
+            "} "
+            "QLabel:hover { background: #0a0a0a; cursor: pointer; }"
+        )
+        self.lang_fetch_status.setVisible(False)
+        self.lang_fetch_status.setWordWrap(True)
+        self.lang_fetch_status.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.lang_fetch_status.setToolTip("Kliknite pre otvorenie okna s aktivitou agentov")
+        layout.addWidget(self.lang_fetch_status)
+        
+        # Warning if game in progress
+        if self.game_in_progress:
+            warning = QLabel(
+                "⚠️ Hra je v priebehu. Zmeny sa uplatnia až v novej hre."
+            )
+            warning.setWordWrap(True)
+            warning.setStyleSheet(
+                "background: #3d2a0f; color: #ffd54f; padding: 10px; "
+                "border: 2px solid #ff9800; border-radius: 6px; font-weight: bold;"
+            )
+            layout.addWidget(warning)
+        
+        # Buttons
+        button_layout = QHBoxLayout()
+        button_layout.setSpacing(8)
+        
+        button_layout.addStretch()
+        
+        cancel_btn = QPushButton("✗ Zrušiť")
+        cancel_btn.clicked.connect(self.reject)
+        cancel_btn.setStyleSheet(
+            "QPushButton { "
+            "padding: 10px 20px; font-size: 13px; border-radius: 6px; "
+            "background-color: #182c1d; color: #b6e0bd; border: 1px solid #2f5c39; "
+            "} "
+            "QPushButton:hover { background-color: #213f29; border-color: #4caf50; } "
+            "QPushButton:pressed { background-color: #152820; }"
+        )
+        button_layout.addWidget(cancel_btn)
+        
+        ok_btn = QPushButton("✓ Uložiť")
+        ok_btn.clicked.connect(self._on_ok_clicked)
+        ok_btn.setStyleSheet(
+            "QPushButton { "
+            "padding: 10px 20px; font-size: 13px; font-weight: bold; border-radius: 6px; "
+            "background-color: #2e7d32; color: #e8f5e9; border: 2px solid #4caf50; "
+            "} "
+            "QPushButton:hover { background-color: #388e3c; } "
+            "QPushButton:pressed { background-color: #1b5e20; }"
+        )
+        button_layout.addWidget(ok_btn)
+        
+        layout.addLayout(button_layout)
+    
+    def _create_ai_tab(self) -> QWidget:
+        """Create AI opponent configuration tab.
+        
+        Returns:
+            Widget with AI opponent settings
+        """
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setSpacing(16)
+        layout.setContentsMargins(16, 16, 16, 16)
+        
+        # Opponent mode selector
+        self.mode_selector = OpponentModeSelector(
+            parent=widget,
+            available_agents=self.available_agents,
+        )
+        
+        # Set current mode
+        self.mode_selector.set_mode(self.current_mode)
+        
+        # Connect configuration signals
+        self.mode_selector.configure_openrouter_requested.connect(self._configure_openrouter)
+        self.mode_selector.configure_agent_requested.connect(self._configure_agent)
+        
+        # Disable if game in progress
+        if self.game_in_progress:
+            self.mode_selector.set_enabled(False)
+        
+        layout.addWidget(self.mode_selector)
+        
+        layout.addStretch()
+        
+        return widget
+    
+    def _on_ok_clicked(self) -> None:
+        """Handle OK button click."""
+        # Validate configuration
+        selected_mode = self.mode_selector.get_selected_mode()
+        
+        if selected_mode == OpponentMode.AGENT:
+            agent_name = self.mode_selector.get_selected_agent_name()
+            if not agent_name:
+                QMessageBox.warning(
+                    self,
+                    "Chyba",
+                    "Prosím vyberte agenta pre Agent mód.",
+                )
+                return
+        
+        # Accept dialog
+        self.accept()
+    
+    def get_selected_mode(self) -> OpponentMode:
+        """Get selected opponent mode.
+        
+        Returns:
+            Selected opponent mode
+        """
+        return self.mode_selector.get_selected_mode()
+    
+    def get_selected_agent_name(self) -> Optional[str]:
+        """Get selected agent name (if AGENT mode).
+        
+        Returns:
+            Agent name or None
+        """
+        return self.mode_selector.get_selected_agent_name()
+    
+    def get_selected_openrouter_models(self) -> list[dict[str, Any]]:
+        """Get selected OpenRouter models (if configured).
+        
+        Returns:
+            List of selected model dicts
+        """
+        return self.selected_openrouter_models
+    
+    def get_openrouter_tokens(self) -> int:
+        """Get OpenRouter token limit (if configured).
+        
+        Returns:
+            Token limit
+        """
+        return self.openrouter_tokens
+    
+    def _configure_openrouter(self) -> None:
+        """Open OpenRouter model configuration dialog."""
+        # Use OpenRouter-specific token limit (default 8000)
+        openrouter_tokens = int(os.getenv("OPENROUTER_MAX_TOKENS", "8000"))
+        
+        dialog = AIConfigDialog(
+            parent=self,
+            default_tokens=openrouter_tokens,
+            lock_default=False,  # Token limit managed in settings
+        )
+        
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            # Store selected models for parent to retrieve
+            self.selected_openrouter_models = dialog.get_selected_models()
+            self.openrouter_tokens = dialog.get_shared_tokens_value()
+            
+            # Show confirmation
+            model_count = len(self.selected_openrouter_models)
+            QMessageBox.information(
+                self,
+                "OpenRouter Nastavené",
+                f"Vybrané: {model_count} modelov pre OpenRouter režim.",
+            )
+    
+    def _configure_agent(self) -> None:
+        """Open Agent configuration dialog."""
+        dialog = AgentConfigDialog(
+            parent=self,
+            available_agents=self.available_agents,
+            current_agent_name=self.current_agent_name,
+        )
+        
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            # Store selected agent
+            agent_name = dialog.get_selected_agent_name()
+            if agent_name:
+                self.current_agent_name = agent_name
+                
+                # Show confirmation
+                QMessageBox.information(
+                    self,
+                    "Agent Nastavený",
+                    f"Vybraný agent: {agent_name}",
+                )
+    
+    def _create_general_tab(self) -> QWidget:
+        """Create general game settings tab.
+        
+        Returns:
+            Widget with general settings
+        """
+        widget = QWidget()
+        layout = QFormLayout(widget)
+        layout.setSpacing(12)
+        layout.setContentsMargins(16, 16, 16, 16)
+        
+        # Variant selection
+        self.variant_combo = QComboBox(widget)
+        self.variant_combo.setEditable(False)
+        self.variant_combo.currentIndexChanged.connect(self._on_variant_changed)
+        self.variant_combo.setStyleSheet(
+            "QComboBox { "
+            "background: #1a2f1f; color: #e8f5e9; padding: 6px; "
+            "border: 1px solid #2f5c39; border-radius: 4px; "
+            "} "
+            "QComboBox:hover { border-color: #4caf50; } "
+            "QComboBox::drop-down { border: none; width: 20px; } "
+            "QComboBox QAbstractItemView { "
+            "background: #1a2f1f; color: #e8f5e9; "
+            "selection-background-color: #295c33; "
+            "}"
+        )
+        layout.addRow(
+            self._styled_label("Aktívny Scrabble variant:"),
+            self.variant_combo,
+        )
+        
+        # Languages with buttons
+        self.languages_combo = QComboBox(widget)
+        self.languages_combo.setEditable(False)
+        self.languages_combo.setStyleSheet(self.variant_combo.styleSheet())
+        lang_row = QHBoxLayout()
+        lang_row.addWidget(self.languages_combo, 2)
+        self.refresh_languages_btn = QPushButton("Aktualizovať jazyky", widget)
+        self.refresh_languages_btn.clicked.connect(self._refresh_languages)
+        self.refresh_languages_btn.setStyleSheet(
+            "QPushButton { "
+            "padding: 6px 12px; font-size: 11px; border-radius: 4px; "
+            "background-color: #182c1d; color: #b6e0bd; border: 1px solid #2f5c39; "
+            "} "
+            "QPushButton:hover { background-color: #213f29; }"
+        )
+        lang_row.addWidget(self.refresh_languages_btn)
+        self.new_variant_btn = QPushButton("Nový variant", widget)
+        self.new_variant_btn.clicked.connect(self._on_new_variant)
+        self.new_variant_btn.setStyleSheet(self.refresh_languages_btn.styleSheet())
+        lang_row.addWidget(self.new_variant_btn)
+        lang_container = QWidget(widget)
+        lang_container.setLayout(lang_row)
+        layout.addRow(
+            self._styled_label("Jazyky:"),
+            lang_container,
+        )
+        
+        # Repro mode
+        self.repro_check = QCheckBox("Repro mód (deterministický seed)", widget)
+        self.repro_check.setChecked(self.repro_mode)
+        self.repro_check.setStyleSheet("QCheckBox { color: #e8f5e9; }")
+        layout.addRow(self.repro_check)
+        
+        # Seed
+        self.seed_edit = QLineEdit(widget)
+        self.seed_edit.setValidator(QIntValidator(0, 2_147_483_647, widget))
+        self.seed_edit.setText(str(self.repro_seed))
+        self.seed_edit.setStyleSheet(
+            "QLineEdit { "
+            "background: #1a2f1f; color: #e8f5e9; padding: 8px; "
+            "border: 1px solid #2f5c39; border-radius: 4px; "
+            "} "
+            "QLineEdit:focus { border-color: #4caf50; }"
+        )
+        layout.addRow(
+            self._styled_label("Seed:"),
+            self.seed_edit,
+        )
+        
+        # Agent activity auto-show
+        self.agent_auto_show_check = QCheckBox(
+            "Zobrazovať automaticky aktivitu agentov",
+            widget
+        )
+        self.agent_auto_show_check.setChecked(self._load_agent_auto_show())
+        self.agent_auto_show_check.setStyleSheet("QCheckBox { color: #e8f5e9; }")
+        layout.addRow(self.agent_auto_show_check)
+        
+        # Load variants and languages
+        self._load_installed_variants(select_slug=self.selected_variant_slug)
+        self._init_languages()
+        
+        return widget
+    
+    def _create_api_tab(self) -> QWidget:
+        """Create API and game settings tab.
+        
+        Returns:
+            Widget with API settings
+        """
+        widget = QWidget()
+        layout = QFormLayout(widget)
+        layout.setSpacing(12)
+        layout.setContentsMargins(16, 16, 16, 16)
+        
+        # Load .env to prefill API key
+        try:
+            from dotenv import load_dotenv as _load_dotenv
+            _load_dotenv(ENV_PATH, override=False)
+        except Exception:
+            pass
+        
+        # OpenAI API key
+        self.key_edit = QLineEdit(widget)
+        self.key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.key_edit.setText(os.getenv("OPENAI_API_KEY", ""))
+        self.key_edit.setStyleSheet(
+            "QLineEdit { "
+            "background: #1a2f1f; color: #e8f5e9; padding: 8px; "
+            "border: 1px solid #2f5c39; border-radius: 4px; "
+            "} "
+            "QLineEdit:focus { border-color: #4caf50; }"
+        )
+        layout.addRow(
+            self._styled_label("OpenAI API kľúč:"),
+            self.key_edit,
+        )
+        
+        # AI tokens with cost
+        self.ai_tokens_edit = QLineEdit(widget)
+        self.ai_tokens_edit.setValidator(QIntValidator(1, 1_000_000, widget))
+        self.ai_tokens_edit.setText(os.getenv("AI_MOVE_MAX_OUTPUT_TOKENS", "3600"))
+        self.ai_tokens_edit.setStyleSheet(self.key_edit.styleSheet())
+        self.ai_tokens_cost = QLabel("")
+        self.ai_tokens_cost.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.ai_tokens_cost.setStyleSheet("color: #ffd54f; font-size: 12px;")
+        ai_row = QHBoxLayout()
+        ai_row.addWidget(self.ai_tokens_edit, 2)
+        ai_row.addWidget(self.ai_tokens_cost, 1)
+        ai_row_w = QWidget(widget)
+        ai_row_w.setLayout(ai_row)
+        layout.addRow(
+            self._styled_label("AI ťah — max výstupných tokenov:"),
+            ai_row_w,
+        )
+        
+        # Judge tokens with cost
+        self.judge_tokens_edit = QLineEdit(widget)
+        self.judge_tokens_edit.setValidator(QIntValidator(1, 1_000_000, widget))
+        self.judge_tokens_edit.setText(os.getenv("JUDGE_MAX_OUTPUT_TOKENS", "800"))
+        self.judge_tokens_edit.setStyleSheet(self.key_edit.styleSheet())
+        self.judge_tokens_cost = QLabel("")
+        self.judge_tokens_cost.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.judge_tokens_cost.setStyleSheet("color: #ffd54f; font-size: 12px;")
+        j_row = QHBoxLayout()
+        j_row.addWidget(self.judge_tokens_edit, 2)
+        j_row.addWidget(self.judge_tokens_cost, 1)
+        j_row_w = QWidget(widget)
+        j_row_w.setLayout(j_row)
+        layout.addRow(
+            self._styled_label("Rozhodca — max výstupných tokenov:"),
+            j_row_w,
+        )
+        
+        # OpenRouter max tokens per move
+        self.openrouter_tokens_edit = QLineEdit(widget)
+        self.openrouter_tokens_edit.setValidator(QIntValidator(1, 1_000_000, widget))
+        self.openrouter_tokens_edit.setText(os.getenv("OPENROUTER_MAX_TOKENS", "8000"))
+        self.openrouter_tokens_edit.setStyleSheet(self.key_edit.styleSheet())
+        self.openrouter_tokens_cost = QLabel("")
+        self.openrouter_tokens_cost.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.openrouter_tokens_cost.setStyleSheet("color: #ffd54f; font-size: 12px;")
+        or_row = QHBoxLayout()
+        or_row.addWidget(self.openrouter_tokens_edit, 2)
+        or_row.addWidget(self.openrouter_tokens_cost, 1)
+        or_row_w = QWidget(widget)
+        or_row_w.setLayout(or_row)
+        layout.addRow(
+            self._styled_label("OpenRouter — max tokenov na ťah:"),
+            or_row_w,
+        )
+        
+        # Test connection button
+        self.test_btn = QPushButton("🔌 Testovať pripojenie", widget)
+        self.test_btn.clicked.connect(self._test_connection)
+        self.test_btn.setStyleSheet(
+            "QPushButton { "
+            "padding: 8px 16px; font-size: 12px; border-radius: 4px; "
+            "background-color: #182c1d; color: #b6e0bd; border: 1px solid #2f5c39; "
+            "} "
+            "QPushButton:hover { background-color: #213f29; border-color: #4caf50; }"
+        )
+        layout.addRow("", self.test_btn)
+        
+        # Connect cost updates
+        self.ai_tokens_edit.textChanged.connect(self._update_costs)
+        self.judge_tokens_edit.textChanged.connect(self._update_costs)
+        self.openrouter_tokens_edit.textChanged.connect(self._update_costs)
+        self._update_costs()
+        
+        return widget
+    
+    def _styled_label(self, text: str) -> QLabel:
+        """Create a styled label for form rows.
+        
+        Args:
+            text: Label text
+            
+        Returns:
+            Styled label
+        """
+        label = QLabel(text)
+        label.setStyleSheet("color: #b6e0bd; font-weight: bold;")
+        return label
+    
+    def _update_costs(self) -> None:
+        """Update cost estimates for token fields."""
+        def fmt(tokens_text: str) -> str:
+            try:
+                t = int(tokens_text)
+                if t <= 0:
+                    return ""
+                eur = t * EUR_PER_TOKEN
+                if eur < 0.01:
+                    return f"≈ {eur:.6f} €"
+                return f"≈ {eur:.2f} €"
+            except ValueError:
+                return ""
+        
+        self.ai_tokens_cost.setText(fmt(self.ai_tokens_edit.text()))
+        self.judge_tokens_cost.setText(fmt(self.judge_tokens_edit.text()))
+        self.openrouter_tokens_cost.setText(fmt(self.openrouter_tokens_edit.text()))
+    
+    def _load_installed_variants(self, *, select_slug: str | None = None) -> None:
+        """Load installed variants into combo box."""
+        variants = sorted(list_installed_variants(), key=lambda v: v.language.lower())
+        self._installed_variants = variants
+        slug_to_select = select_slug or self.selected_variant_slug
+        
+        self.variant_combo.blockSignals(True)
+        self.variant_combo.clear()
+        for variant in variants:
+            label = f"{variant.language} ({variant.slug})"
+            self.variant_combo.addItem(label, variant.slug)
+        self.variant_combo.blockSignals(False)
+        
+        if slug_to_select:
+            idx = self.variant_combo.findData(slug_to_select)
+            if idx >= 0:
+                self.variant_combo.setCurrentIndex(idx)
+        if self.variant_combo.count() and self.variant_combo.currentIndex() < 0:
+            self.variant_combo.setCurrentIndex(0)
+        
+        data = self.variant_combo.currentData()
+        if isinstance(data, str):
+            self.selected_variant_slug = data
+        self._sync_language_with_variant(self.selected_variant_slug)
+    
+    def _init_languages(self) -> None:
+        """Initialize languages combo box."""
+        languages = get_languages_for_ui()
+        self._set_languages(languages)
+        self._sync_language_with_variant(self.selected_variant_slug)
+    
+    def _set_languages(self, languages: Sequence[LanguageInfo], *, keep_selection: bool = False) -> None:
+        """Set languages in combo box."""
+        previous = self._current_language() if keep_selection else None
+        self._languages = list(languages)
+        self.languages_combo.blockSignals(True)
+        self.languages_combo.clear()
+        for lang in self._languages:
+            self.languages_combo.addItem(lang.display_label(), lang)
+        self.languages_combo.blockSignals(False)
+        if previous:
+            idx = self._index_for_language(previous)
+            if idx >= 0:
+                self.languages_combo.setCurrentIndex(idx)
+                return
+        if self.languages_combo.count():
+            self.languages_combo.setCurrentIndex(0)
+    
+    def _current_language(self) -> LanguageInfo | None:
+        """Get currently selected language."""
+        data = self.languages_combo.currentData()
+        return data if isinstance(data, LanguageInfo) else None
+    
+    def _index_for_language(self, language: LanguageInfo) -> int:
+        """Find index for language in combo box."""
+        for idx in range(self.languages_combo.count()):
+            data = self.languages_combo.itemData(idx)
+            if not isinstance(data, LanguageInfo):
+                continue
+            if data.name.casefold() == language.name.casefold():
+                code_a = (data.code or "").casefold()
+                code_b = (language.code or "").casefold()
+                if code_a == code_b or not code_b:
+                    return idx
+        return -1
+    
+    def _on_variant_changed(self, index: int) -> None:
+        """Handle variant selection change."""
+        data = self.variant_combo.itemData(index)
+        if isinstance(data, str):
+            self.selected_variant_slug = data
+            self._sync_language_with_variant(data)
+    
+    def _sync_language_with_variant(self, slug: str | None) -> None:
+        """Sync language selection with variant."""
+        if not slug:
+            return
+        try:
+            variant = load_variant(slug)
+        except Exception:
+            return
+        match = match_language(variant.language, self._languages)
+        if match:
+            idx = self._index_for_language(match)
+            if idx >= 0:
+                self.languages_combo.setCurrentIndex(idx)
+                return
+        new_lang = LanguageInfo(name=variant.language, code=None)
+        self._languages.append(new_lang)
+        self.languages_combo.addItem(new_lang.display_label(), new_lang)
+        self.languages_combo.setCurrentIndex(self.languages_combo.count() - 1)
+    
+    def _refresh_languages(self) -> None:
+        """Refresh languages list from OpenAI using async agent."""
+        # Get main window to access agents dialog
+        from .app import MainWindow
+        main_window_qobj = self.parent()
+        while main_window_qobj and not isinstance(main_window_qobj, MainWindow):
+            main_window_qobj = main_window_qobj.parent()
+        
+        if not isinstance(main_window_qobj, MainWindow):
+            QMessageBox.warning(
+                self,
+                "Chyba",
+                "Nemôžem nájsť hlavné okno pre zobrazenie aktivity agenta."
+            )
+            return
+        
+        main_window: MainWindow = main_window_qobj
+        
+        # Get or create agents dialog
+        agents_dialog = main_window.get_agents_dialog()
+        agent_widget = agents_dialog.get_or_create_agent_tab(
+            agent_name="language_fetcher",
+            display_name="🌍 Získavanie jazykov",
+        )
+        
+        # Show agents dialog only if auto-show is enabled
+        # But always show toolbar animation
+        if agents_dialog.should_auto_show():
+            agents_dialog.show()
+            agents_dialog.raise_()
+        
+        # Clear previous log
+        agent_widget.clear_log()
+        agent_widget.set_status("Spúšťam...", is_working=True)
+        agent_widget.append_activity("Začínam získavať jazyky z OpenAI API...")
+        
+        # Create agent
+        try:
+            agent = LanguageAgent()
+        except Exception as exc:
+            agent_widget.set_status(f"Chyba: {exc}", is_working=False)
+            agent_widget.append_activity(f"Inicializácia zlyhala: {exc}", prefix="❌")
+            # Error shown in agent widget - no modal alert needed
+            return
+        
+        # Get main window for toolbar animation
+        toolbar_widget = None
+        if main_window and hasattr(main_window, 'agent_status_widget'):
+            toolbar_widget = main_window.agent_status_widget
+            toolbar_widget.show_agent_activity("Jazyky", "Získavam")
+        
+        # Create worker thread and store in MainWindow so it continues even if dialog closes
+        worker = AsyncAgentWorker(agent.fetch_languages, use_cache=False, min_languages=40)
+        main_window.agent_workers['language_fetcher'] = worker
+        
+        # Define progress handler (runs in main thread via signal/slot)
+        def on_progress_update(update: AgentProgress) -> None:
+            """Handle progress updates from agent - RUNS IN MAIN THREAD."""
+            agent_widget.set_status(update.status, is_working=True)
+            if update.thinking:
+                agent_widget.append_thinking(update.thinking)
+            if update.prompt_text:
+                # Show actual prompt in green
+                agent_widget.append_prompt(update.prompt_text)
+            
+            # Update inline status in settings dialog
+            self._lang_current_status = update.status
+            
+            # Update toolbar animation
+            if toolbar_widget:
+                # Extract short status for toolbar
+                short_status = update.status.split("...")[0] if "..." in update.status else update.status
+                toolbar_widget.update_status(short_status)
+        
+        # Connect signals (these run in main thread)
+        worker.progress_update.connect(on_progress_update)
+        worker.agent_finished.connect(
+            lambda result: self._on_languages_fetched(result, agent_widget)
+        )
+        worker.agent_error.connect(
+            lambda error: self._on_language_fetch_error(error, agent_widget)
+        )
+        
+        # Start worker
+        worker.start()
+        
+        # Disable refresh button and show status while working
+        self.refresh_languages_btn.setEnabled(False)
+        self.lang_fetch_status.setVisible(True)
+        self.lang_fetch_status.setText("🤖 Získavam jazyky...")
+        
+        # Start animation timer for dots
+        self._lang_dot_count = 0
+        self._lang_status_timer = QTimer(self)
+        self._lang_status_timer.timeout.connect(self._update_lang_status_animation)
+        self._lang_status_timer.start(500)  # Update every 500ms
+    
+    def _on_languages_fetched(
+        self,
+        languages: list[LanguageInfo],
+        agent_widget: AgentActivityWidget,
+    ) -> None:
+        """Handle successful language fetch."""
+        agent_widget.set_status(f"Hotovo! ({len(languages)} jazykov)", is_working=False)
+        agent_widget.append_status(f"Úspešne načítaných {len(languages)} jazykov")
+        
+        # Format response
+        response_text = "Načítané jazyky:\\n\\n"
+        for lang in languages[:10]:  # Show first 10
+            response_text += f"• {lang.display_label()}\\n"
+        if len(languages) > 10:
+            response_text += f"\\n... a ďalších {len(languages) - 10} jazykov"
+        
+        agent_widget.set_response(response_text)
+        
+        # Update UI
+        self._set_languages(languages, keep_selection=True)
+        self._sync_language_with_variant(self.selected_variant_slug)
+        
+        # Stop animation timer
+        if self._lang_status_timer:
+            self._lang_status_timer.stop()
+        
+        # Hide status and re-enable button
+        self.lang_fetch_status.setVisible(False)
+        self.refresh_languages_btn.setEnabled(True)
+        
+        # Hide toolbar animation and cleanup worker
+        main_window = self.parent()
+        while main_window and not hasattr(main_window, 'agent_status_widget'):
+            main_window = main_window.parent()
+        if main_window and hasattr(main_window, 'agent_status_widget'):
+            main_window.agent_status_widget.hide_agent_activity(delay_ms=2000)
+        
+        # Cleanup worker from MainWindow
+        if main_window and hasattr(main_window, 'agent_workers'):
+            main_window.agent_workers.pop('language_fetcher', None)
+        
+        # Success - no modal alert needed, agent widget shows the status
+    
+    def _on_language_fetch_error(
+        self,
+        error: str,
+        agent_widget: AgentActivityWidget,
+    ) -> None:
+        """Handle language fetch error."""
+        agent_widget.set_status(f"Chyba: {error}", is_working=False)
+        agent_widget.append_activity(f"Zlyhalo: {error}", prefix="❌")
+        agent_widget.set_response(f"Chyba:\\n{error}")
+        
+        # Stop animation timer
+        if self._lang_status_timer:
+            self._lang_status_timer.stop()
+        
+        # Show error in status
+        self.lang_fetch_status.setText(f"❌ Chyba: {error}")
+        self.lang_fetch_status.setStyleSheet(
+            "QLabel { "
+            "color: #ff5252; font-size: 14px; font-weight: bold; "
+            "padding: 12px 16px; background: #000000; "
+            "border-top: 1px solid #5c2f2f; "
+            "} "
+            "QLabel:hover { background: #0a0a0a; cursor: pointer; }"
+        )
+        
+        # Re-enable button
+        self.refresh_languages_btn.setEnabled(True)
+        
+        # Hide toolbar animation and cleanup worker
+        main_window = self.parent()
+        while main_window and not hasattr(main_window, 'agent_status_widget'):
+            main_window = main_window.parent()
+        if main_window and hasattr(main_window, 'agent_status_widget'):
+            main_window.agent_status_widget.hide_agent_activity(delay_ms=0)
+        
+        # Cleanup worker from MainWindow
+        if main_window and hasattr(main_window, 'agent_workers'):
+            main_window.agent_workers.pop('language_fetcher', None)
+        
+        # Error shown in agent widget and status bar - no modal alert needed
+    
+    def _on_new_variant(self) -> None:
+        """Handle new variant creation."""
+        # Import dialog locally to avoid circular dependency
+        from .app import NewVariantDialog
+        
+        current_lang = self._current_language()
+        dialog = NewVariantDialog(self, self._languages or get_languages_for_ui(), current_lang)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        query = dialog.query_text().strip()
+        if not query:
+            QMessageBox.warning(self, "Nový variant", "Zadaj jazyk alebo popis variantu.")
+            return
+        try:
+            client = OpenAIClient()
+        except Exception as exc:
+            QMessageBox.critical(self, "Nový variant", f"OpenAI client sa nepodarilo inicializovať: {exc}")
+            return
+        language_hint = dialog.selected_language()
+        try:
+            definition = download_and_store_variant(
+                client,
+                language_request=query,
+                language_hint=language_hint,
+            )
+        except Exception as exc:
+            log.exception("download_variant_failed", exc_info=exc)
+            QMessageBox.critical(self, "Nový variant", f"Získavanie variantu zlyhalo: {exc}")
+            return
+        self.selected_variant_slug = definition.slug
+        if not match_language(definition.language, self._languages):
+            inferred_code = language_hint.code if language_hint else None
+            new_language = LanguageInfo(name=definition.language, code=inferred_code)
+            self._languages.append(new_language)
+            self.languages_combo.addItem(new_language.display_label(), new_language)
+        self._load_installed_variants(select_slug=definition.slug)
+        self._sync_language_with_variant(definition.slug)
+        QMessageBox.information(
+            self,
+            "Nový variant",
+            f"Variant '{definition.language}' bol uložený (slug {definition.slug}).",
+        )
+    
+    def _test_connection(self) -> None:
+        """Test OpenAI connection."""
+        k = self.key_edit.text().strip()
+        if not k:
+            QMessageBox.warning(self, "Test", "Zadaj API key.")
+            return
+        os.environ["OPENAI_API_KEY"] = k
+        try:
+            _ = OpenAIClient()
+            QMessageBox.information(
+                self,
+                "Test",
+                "Kľúč uložený do prostredia. Reálne volanie sa vykoná počas hry.",
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Test zlyhal", str(e))
+    
+    def _create_prompt_tab(self) -> QWidget:
+        """Create prompt editor tab.
+        
+        Returns:
+            Widget with prompt editor
+        """
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setSpacing(12)
+        layout.setContentsMargins(16, 16, 16, 16)
+        
+        # Header with prompt selector
+        header_layout = QHBoxLayout()
+        
+        prompt_label = QLabel("Vyberte prompt:")
+        prompt_label.setStyleSheet("color: #b6e0bd; font-weight: bold; font-size: 13px;")
+        header_layout.addWidget(prompt_label)
+        
+        self.prompt_combo = QComboBox(widget)
+        self.prompt_combo.currentTextChanged.connect(self._on_prompt_selected)
+        self.prompt_combo.setStyleSheet(
+            "QComboBox { "
+            "background: #1a2f1f; color: #e8f5e9; padding: 6px; "
+            "border: 1px solid #2f5c39; border-radius: 4px; "
+            "min-width: 250px; font-size: 13px; "
+            "} "
+            "QComboBox:hover { border-color: #4caf50; } "
+            "QComboBox::drop-down { border: none; width: 20px; } "
+            "QComboBox QAbstractItemView { "
+            "background: #1a2f1f; color: #e8f5e9; "
+            "selection-background-color: #295c33; "
+            "}"
+        )
+        header_layout.addWidget(self.prompt_combo)
+        
+        header_layout.addStretch()
+        
+        # Load available prompts
+        self._load_available_prompts()
+        
+        layout.addLayout(header_layout)
+        
+        # Info label
+        info_label = QLabel(
+            "Upravte prompt podľa potreby. Použite {language}, {tile_summary}, {compact_state}, {premium_legend}"
+        )
+        info_label.setStyleSheet("color: #8a9d8f; font-size: 11px; font-style: italic;")
+        info_label.setWordWrap(True)
+        layout.addWidget(info_label)
+        
+        # Text editor
+        self.prompt_text_edit = QTextEdit(widget)
+        font = QFont("Monospace")
+        font.setPointSize(11)
+        self.prompt_text_edit.setFont(font)
+        self.prompt_text_edit.textChanged.connect(self._on_prompt_text_changed)
+        self.prompt_text_edit.setStyleSheet(
+            "QTextEdit { "
+            "background: #0f1a12; color: #e8f5e9; "
+            "border: 2px solid #2f5c39; border-radius: 6px; "
+            "padding: 12px; font-family: 'Monospace', 'Courier New'; "
+            "font-size: 11pt; line-height: 1.5; "
+            "} "
+            "QTextEdit:focus { border-color: #4caf50; }"
+        )
+        layout.addWidget(self.prompt_text_edit, 1)  # Stretch factor 1
+        
+        # Load current prompt
+        self._load_prompt(self.current_prompt_file)
+        
+        # Bottom buttons
+        button_layout = QHBoxLayout()
+        
+        revert_btn = QPushButton("🔄 Vrátiť na pôvodný", widget)
+        revert_btn.clicked.connect(self._revert_prompt_to_default)
+        revert_btn.setStyleSheet(
+            "QPushButton { "
+            "padding: 8px 16px; font-size: 12px; border-radius: 4px; "
+            "background-color: #3d2a0f; color: #ffd54f; border: 1px solid #8a6a4a; "
+            "} "
+            "QPushButton:hover { background-color: #4d3a1f; border-color: #ff9800; }"
+        )
+        button_layout.addWidget(revert_btn)
+        
+        button_layout.addStretch()
+        
+        save_btn = QPushButton("💾 Uložiť", widget)
+        save_btn.clicked.connect(self._save_current_prompt)
+        save_btn.setStyleSheet(
+            "QPushButton { "
+            "padding: 8px 16px; font-size: 12px; border-radius: 4px; "
+            "background-color: #1b5e20; color: #e8f5e9; border: 1px solid #2e7d32; "
+            "} "
+            "QPushButton:hover { background-color: #2e7d32; border-color: #4caf50; }"
+        )
+        button_layout.addWidget(save_btn)
+        
+        save_as_btn = QPushButton("💾 Uložiť ako...", widget)
+        save_as_btn.clicked.connect(self._save_prompt_as)
+        save_as_btn.setStyleSheet(
+            "QPushButton { "
+            "padding: 8px 16px; font-size: 12px; border-radius: 4px; "
+            "background-color: #182c1d; color: #b6e0bd; border: 1px solid #2f5c39; "
+            "} "
+            "QPushButton:hover { background-color: #213f29; border-color: #4caf50; }"
+        )
+        button_layout.addWidget(save_as_btn)
+        
+        layout.addLayout(button_layout)
+        
+        return widget
+    
+    def _load_available_prompts(self) -> None:
+        """Load all available prompt files from prompts/ directory."""
+        self.prompt_combo.clear()
+        
+        if not self.prompts_dir.exists():
+            return
+        
+        prompt_files = sorted(self.prompts_dir.glob("*.txt"))
+        
+        for prompt_file in prompt_files:
+            display_name = prompt_file.stem
+            self.prompt_combo.addItem(display_name, str(prompt_file))
+        
+        # Select current file
+        for i in range(self.prompt_combo.count()):
+            if self.prompt_combo.itemData(i) == self.current_prompt_file:
+                self.prompt_combo.setCurrentIndex(i)
+                break
+    
+    def _load_prompt(self, filepath: str) -> None:
+        """Load prompt from file."""
+        try:
+            path = Path(filepath)
+            if path.exists():
+                content = path.read_text(encoding="utf-8")
+                self.prompt_text_edit.blockSignals(True)
+                self.prompt_text_edit.setPlainText(content)
+                self.prompt_text_edit.blockSignals(False)
+                self.current_prompt_file = filepath
+                self.prompt_modified = False
+                log.info("Loaded prompt from %s", filepath)
+            else:
+                log.warning("Prompt file not found: %s", filepath)
+                QMessageBox.warning(
+                    self,
+                    "Súbor nenájdený",
+                    f"Prompt súbor nenájdený: {filepath}"
+                )
+        except Exception as e:
+            log.exception("Failed to load prompt: %s", e)
+            QMessageBox.critical(
+                self,
+                "Chyba načítania",
+                f"Nepodarilo sa načítať prompt: {e}"
+            )
+    
+    def _save_prompt(self, filepath: str) -> bool:
+        """Save current prompt to file."""
+        try:
+            path = Path(filepath)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            
+            content = self.prompt_text_edit.toPlainText()
+            path.write_text(content, encoding="utf-8")
+            
+            self.current_prompt_file = filepath
+            self.prompt_modified = False
+            log.info("Saved prompt to %s", filepath)
+            return True
+        except Exception as e:
+            log.exception("Failed to save prompt: %s", e)
+            QMessageBox.critical(
+                self,
+                "Chyba uloženia",
+                f"Nepodarilo sa uložiť prompt: {e}"
+            )
+            return False
+    
+    def _on_prompt_selected(self, display_name: str) -> None:
+        """Handle prompt selection from dropdown."""
+        if not display_name:
+            return
+        
+        filepath = self.prompt_combo.currentData()
+        if filepath and filepath != self.current_prompt_file:
+            if self.prompt_modified:
+                reply = QMessageBox.question(
+                    self,
+                    "Neuložené zmeny",
+                    "Máte neuložené zmeny. Chcete ich uložiť pred načítaním iného promptu?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No | QMessageBox.StandardButton.Cancel
+                )
+                
+                if reply == QMessageBox.StandardButton.Cancel:
+                    # Revert combo selection
+                    for i in range(self.prompt_combo.count()):
+                        if self.prompt_combo.itemData(i) == self.current_prompt_file:
+                            self.prompt_combo.blockSignals(True)
+                            self.prompt_combo.setCurrentIndex(i)
+                            self.prompt_combo.blockSignals(False)
+                            break
+                    return
+                elif reply == QMessageBox.StandardButton.Yes:
+                    self._save_current_prompt()
+            
+            self._load_prompt(filepath)
+    
+    def _on_prompt_text_changed(self) -> None:
+        """Mark prompt as modified when text changes."""
+        self.prompt_modified = True
+    
+    def _revert_prompt_to_default(self) -> None:
+        """Revert current prompt to default."""
+        reply = QMessageBox.question(
+            self,
+            "Potvrdiť obnovenie",
+            "Naozaj chcete obnoviť pôvodný prompt? Všetky neuložené zmeny budú stratené.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        
+        if reply == QMessageBox.StandardButton.Yes:
+            self._load_prompt(self.default_prompt_file)
+    
+    def _save_current_prompt(self) -> None:
+        """Save current prompt to current file."""
+        if self._save_prompt(self.current_prompt_file):
+            QMessageBox.information(
+                self,
+                "Uložené",
+                f"Prompt bol úspešne uložený do {Path(self.current_prompt_file).name}"
+            )
+    
+    def _save_prompt_as(self) -> None:
+        """Save current prompt to a new file."""
+        name, ok = QInputDialog.getText(
+            self,
+            "Uložiť ako",
+            "Zadajte názov pre nový prompt (bez prípony):"
+        )
+        
+        if ok and name:
+            # Sanitize filename
+            name = "".join(c for c in name if c.isalnum() or c in (' ', '-', '_')).strip()
+            if not name:
+                QMessageBox.warning(
+                    self,
+                    "Neplatný názov",
+                    "Názov musí obsahovať aspoň jeden alfanumerický znak."
+                )
+                return
+            
+            filepath = str(self.prompts_dir / f"{name}.txt")
+            
+            if Path(filepath).exists():
+                reply = QMessageBox.question(
+                    self,
+                    "Súbor existuje",
+                    f"Súbor {name}.txt už existuje. Chcete ho prepísať?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                )
+                
+                if reply != QMessageBox.StandardButton.Yes:
+                    return
+            
+            if self._save_prompt(filepath):
+                # Reload available prompts and select the new one
+                self._load_available_prompts()
+                QMessageBox.information(
+                    self,
+                    "Uložené",
+                    f"Prompt bol úspešne uložený ako {name}.txt"
+                )
+    
+    def _load_agent_auto_show(self) -> bool:
+        """Load agent auto-show setting from environment.
+        
+        Returns:
+            True if auto-show enabled (default: True)
+        """
+        value = os.getenv("SHOW_AGENT_ACTIVITY_AUTO", "true").lower()
+        return value in ("true", "1", "yes", "on")
+    
+    def _update_lang_status_animation(self) -> None:
+        """Update language fetch status with animated dots."""
+        update_lang_status_animation(self)
+    
+    def _on_status_bar_clicked(self) -> None:
+        """Handle status bar click - open agents dialog."""
+        # Get main window
+        from .app import MainWindow
+        main_window_qobj = self.parent()
+        while main_window_qobj and not isinstance(main_window_qobj, MainWindow):
+            main_window_qobj = main_window_qobj.parent()
+        
+        if isinstance(main_window_qobj, MainWindow):
+            main_window: MainWindow = main_window_qobj
+            agents_dialog = main_window.get_agents_dialog()
+            agents_dialog.show()
+            agents_dialog.raise_()
+            agents_dialog.activateWindow()
+    
+    def accept(self) -> None:
+        """Handle accept - save API settings to .env."""
+        # Save API key
+        key_str = self.key_edit.text().strip()
+        try:
+            if not os.path.exists(ENV_PATH):
+                Path(ENV_PATH).open("a", encoding="utf-8").close()
+        except Exception:
+            pass
+        if key_str:
+            os.environ["OPENAI_API_KEY"] = key_str
+            try:
+                from dotenv import set_key as _set_key
+                _set_key(ENV_PATH, "OPENAI_API_KEY", key_str)
+            except Exception:
+                pass
+        
+        # Save token limits
+        ai_tokens = self.ai_tokens_edit.text().strip() or "3600"
+        judge_tokens = self.judge_tokens_edit.text().strip() or "800"
+        openrouter_tokens = self.openrouter_tokens_edit.text().strip() or "8000"
+        os.environ["AI_MOVE_MAX_OUTPUT_TOKENS"] = ai_tokens
+        os.environ["JUDGE_MAX_OUTPUT_TOKENS"] = judge_tokens
+        os.environ["OPENROUTER_MAX_TOKENS"] = openrouter_tokens
+        try:
+            from dotenv import set_key as _set_key2
+            _set_key2(ENV_PATH, "AI_MOVE_MAX_OUTPUT_TOKENS", ai_tokens)
+            _set_key2(ENV_PATH, "JUDGE_MAX_OUTPUT_TOKENS", judge_tokens)
+            _set_key2(ENV_PATH, "OPENROUTER_MAX_TOKENS", openrouter_tokens)
+        except Exception:
+            pass
+        
+        # Save variant
+        slug_data = self.variant_combo.currentData()
+        if isinstance(slug_data, str) and slug_data:
+            try:
+                variant = set_active_variant_slug(slug_data)
+                self.selected_variant_slug = variant.slug
+                from dotenv import set_key as _set_key_variant
+                _set_key_variant(ENV_PATH, "SCRABBLE_VARIANT", variant.slug)
+            except Exception:
+                os.environ["SCRABBLE_VARIANT"] = slug_data
+        
+        # Save agent auto-show setting
+        agent_auto_show = "true" if self.agent_auto_show_check.isChecked() else "false"
+        os.environ["SHOW_AGENT_ACTIVITY_AUTO"] = agent_auto_show
+        try:
+            from dotenv import set_key as _set_key_agent
+            _set_key_agent(ENV_PATH, "SHOW_AGENT_ACTIVITY_AUTO", agent_auto_show)
+        except Exception:
+            pass
+        
+        # Save prompt if modified
+        if self.prompt_modified:
+            self._save_current_prompt()
+        
+        # Update environment variable for prompt
+        os.environ["AI_PROMPT_FILE"] = self.current_prompt_file
+        
+        # Call parent accept
+        super().accept()

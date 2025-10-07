@@ -1,21 +1,26 @@
 
 # ScrabGPT
 
-Cross‑platform Python desktop app to play Scrabble vs **GPT‑5‑mini**.  
+Cross‑platform Python desktop app to play Scrabble vs **GPT‑5‑mini** with multi-model AI support and agent-based gameplay.
+
 MVP demonstrates:
 - clean domain core (board, scoring, rules),
 - **structured** OpenAI calls (AI player + batched judge),
-- PySide6 UI,
+- **async agent system** with background execution and real-time progress tracking,
+- **unified settings dialog** with tabbed interface and green theme,
+- **agent activity monitoring** with non-blocking dialogs and toolbar animations,
+- PySide6 UI with thread-safe signal/slot architecture,
 - TDD for scoring and rules.
 
 ## Quick start (Poetry)
 ```bash
 poetry install
-cp .env.example .env  # add your key
+cp .env.example .env  # add your keys
 poetry run python -m scrabgpt.ui.app
 ```
 
 > All OpenAI requests/responses are pretty-printed to the terminal (key masked).
+> Agent activities are tracked in real-time with OpenAI-style animations.
 
 ## AI player prompt rules
 
@@ -31,6 +36,81 @@ To reproduce games or debug reliably:
 3. Each new game logs `game_start seed=<X> repro=<true|false>` to console and `scrabgpt.log`.
 
 This is runtime-only; no values are persisted to `.env`.
+
+## Agent System with Background Execution
+
+ScrabGPT features a sophisticated async agent system for background operations:
+
+### Key Features
+- **Non-blocking dialogs**: Agents Dialog can be closed while operations continue in background
+- **Real-time progress tracking**: OpenAI-style animations with fading text and animated dots
+- **Thread-safe architecture**: Qt signals/slots for safe cross-thread communication
+- **Progress callbacks**: Agents report thinking process, status updates, and results
+- **Toolbar integration**: Animated status widget shows current agent activity
+- **Multiple concurrent agents**: Global agent dispatcher tracks all running agents
+
+### Components
+
+#### Agents Dialog (`scrabgpt/ui/agents_dialog.py`)
+- Tabbed interface with one tab per agent
+- Activity log showing thinking process
+- Progress bar and status updates
+- Response viewer with results
+- Can be closed anytime - agents continue in background
+
+#### Language Agent (`scrabgpt/ai/language_agent.py`)
+- Async/await MCP pattern implementation
+- Fetches supported languages from OpenAI API
+- Uses `asyncio.to_thread()` for blocking operations
+- Progress callbacks at each step
+- 1-hour caching for efficiency
+
+#### Agent Status Widget (`scrabgpt/ui/agent_status_widget.py`)
+- OpenAI-style fading animation
+- Shows "🤖 Agent: Status..." with animated dots (1-3 cycling)
+- Auto-hides after completion (2 second delay)
+- Smooth fade in/out with QPropertyAnimation
+
+### Thread Safety
+All agent operations use proper Qt threading patterns:
+```python
+# Worker thread emits signals (thread-safe)
+worker.progress_update.emit(update)
+
+# Main thread receives via signal/slot (safe for UI updates)
+worker.progress_update.connect(on_progress_handler)
+```
+
+Workers are owned by MainWindow (`agent_workers` dict), not dialogs, ensuring they survive dialog closure.
+
+### Usage Example
+```python
+# Create agent
+agent = LanguageAgent()
+
+# Create worker with auto-injected progress callback
+worker = AsyncAgentWorker(
+    agent.fetch_languages,
+    use_cache=False,
+    min_languages=40
+)
+
+# Connect signals
+worker.progress_update.connect(on_progress)
+worker.agent_finished.connect(on_finished)
+worker.agent_error.connect(on_error)
+
+# Start in background
+worker.start()
+
+# Dialog can be closed - worker continues!
+```
+
+### Settings Integration
+- **Auto-show agents**: `SHOW_AGENT_ACTIVITY_AUTO=true` in `.env`
+- Settings accessible from "⚙️ Nastavenia" toolbar button
+- 4 tabs: Všeobecné, AI Protivník, Nastavenia API, Upraviť prompt protihráča
+- Green forest theme matching game aesthetic
 
 ## Save/Load
 
@@ -52,6 +132,18 @@ Notes:
 ---
 
 ## Changelist - Recent Features & Improvements
+
+### Agent System & Background Execution (Latest)
+- **Unified Settings Dialog**: Tabbed interface with 4 tabs (Všeobecné, AI Protivník, Nastavenia API, Upraviť prompt)
+- **Agents Activity Dialog**: Non-blocking dialog showing real-time agent progress, thinking, and results
+- **Agent Status Widget**: Toolbar animation with OpenAI-style fading text and animated dots
+- **Language Agent**: Async implementation fetching supported languages with progress callbacks
+- **Background Execution**: Agents continue running when dialogs closed (workers owned by MainWindow)
+- **Thread-Safe UI Updates**: Qt signals/slots pattern prevents UI freezing
+- **Progress Tracking**: Real-time status updates with timestamps in activity log
+- **Green Theme Consistency**: All dialogs match forest green aesthetic
+- **Click-to-Open**: Clickable status bar in settings opens agents dialog even when modal
+- **Auto-Show Config**: SHOW_AGENT_ACTIVITY_AUTO environment variable controls visibility
 
 ### Multi-Model AI Support
 - **OpenRouter Integration**: Support for multiple AI models via OpenRouter API with concurrent execution

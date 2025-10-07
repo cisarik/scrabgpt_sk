@@ -71,6 +71,8 @@ from ..ai.player import should_auto_trigger_ai_opening, is_board_empty
 from ..ai.openrouter import OpenRouterClient
 from ..ai.multi_model import propose_move_multi_model
 from .prompt_editor import PromptEditorDialog
+from .agents_dialog import AgentsDialog
+from .agent_status_widget import AgentStatusWidget
 from ..core.state import build_ai_state_dict
 from ..core.rack import consume_rack, restore_rack
 from ..core.state import build_save_state_dict, parse_save_state_dict, restore_board_from_save, restore_bag_from_save
@@ -81,6 +83,7 @@ from ..core.variant_store import (
     load_variant,
     set_active_variant_slug,
 )
+from ..core.opponent_mode import OpponentMode
 from ..ai.variants import (
     LanguageInfo,
     download_and_store_variant,
@@ -88,6 +91,8 @@ from ..ai.variants import (
     get_languages_for_ui,
     match_language,
 )
+from ..ai.agent_config import discover_agents, get_default_agents_dir, get_agent_by_name
+from ..ai.internet_tools import register_internet_tools
 from .model_results import AIModelResultsTable
 
 ASSETS = str(Path(__file__).parent / ".." / "assets")
@@ -1456,6 +1461,15 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("ScrabGPT")
         self.resize(1000, 800)
 
+        # Register internet tools
+        register_internet_tools()
+        
+        # Opponent mode configuration
+        self.opponent_mode = OpponentMode.BEST_MODEL
+        self.selected_agent_name: Optional[str] = None
+        self.available_agents = discover_agents(get_default_agents_dir())
+        self.game_in_progress = False
+        
         # Modely
         self._set_variant(get_active_variant_slug())
         self.board = Board(PREMIUMS_PATH)
@@ -1479,6 +1493,12 @@ class MainWindow(QMainWindow):
         # Pozn.: Nastavuje sa v dialógu Nastavenia a používa pri "Nová hra".
         self.repro_mode: bool = False
         self.repro_seed: int = 0
+        
+        # Agents dialog (non-modal, can stay open)
+        self.agents_dialog: AgentsDialog | None = None
+        
+        # Agent workers (run in background even when dialog closed)
+        self.agent_workers: dict[str, Any] = {}
 
         # OpenAI klient (lazy init po prvom pouziti ak treba)
         self.ai_client: Optional[OpenAIClient] = None
@@ -1517,14 +1537,19 @@ class MainWindow(QMainWindow):
         self.act_create_iq_test = QAction("🧠 Uložiť ako test", self)
         self.act_create_iq_test.triggered.connect(self.create_iq_test)
         self.toolbar.addAction(self.act_create_iq_test)
-
-        self.act_config_ai = QAction("🤖 Nastaviť AI", self)
-        self.act_config_ai.triggered.connect(self.configure_ai_models)
-        self.toolbar.addAction(self.act_config_ai)
         
-        self.act_edit_prompt = QAction("📝 Upraviť prompt", self)
-        self.act_edit_prompt.triggered.connect(self.edit_ai_prompt)
-        self.toolbar.addAction(self.act_edit_prompt)
+        # Add spacer to push following items to the right
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.toolbar.addWidget(spacer)
+        
+        # Create animated agent status widget
+        self.agent_status_widget = AgentStatusWidget(self)
+        self.toolbar.addWidget(self.agent_status_widget)
+        
+        self.act_agents = QAction("⚙️ Agenti", self)
+        self.act_agents.triggered.connect(self.open_agents_dialog)
+        self.toolbar.addAction(self.act_agents)
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -1950,6 +1975,9 @@ class MainWindow(QMainWindow):
         # Základný placeholder pre žreb štartéra (MVP skeleton)
         from ..core.tiles import TileBag
         self._exit_exchange_mode()
+        
+        # Mark game as in progress
+        self.game_in_progress = True
         self.board = Board(PREMIUMS_PATH)
         self.board_view.board = self.board
         self._set_game_ui_visible(True)
@@ -3663,6 +3691,9 @@ class MainWindow(QMainWindow):
         self._disable_human_inputs()
         self._ai_thinking = False
 
+        # Mark game as no longer in progress
+        self.game_in_progress = False
+        
         if reason == GameEndReason.BAG_EMPTY_AND_PLAYER_OUT:
             if not self.human_rack and self.ai_rack:
                 winner = "Hráč"
@@ -3692,7 +3723,21 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "Koniec", msg + _format_leftover())
 
     def open_settings(self) -> None:
-        dlg = SettingsDialog(self, repro_mode=self.repro_mode, repro_seed=self.repro_seed)
+        from .settings_dialog import SettingsDialog as UnifiedSettingsDialog
+        
+        dlg = UnifiedSettingsDialog(
+            self,
+            current_mode=self.opponent_mode,
+            current_agent_name=self.selected_agent_name,
+            available_agents=self.available_agents,
+            game_in_progress=self.game_in_progress,
+            ai_move_max_tokens=self.ai_move_max_tokens,
+            ai_tokens_from_env=self._ai_tokens_from_env,
+            user_defined_ai_tokens=self._user_defined_ai_tokens,
+            repro_mode=self.repro_mode,
+            repro_seed=self.repro_seed,
+            active_tab_index=0,  # Open General tab (default, most important settings)
+        )
         ok = dlg.exec()
         if ok:
             new_ai_tokens, from_env = self._load_ai_move_max_tokens()
@@ -3905,15 +3950,81 @@ class MainWindow(QMainWindow):
                 f"Používaný súbor: {dialog.get_current_prompt_file()}"
             )
     
-    def configure_ai_models(self) -> None:
-        """Configure AI models for multi-model gameplay."""
+    def open_agents_dialog(self) -> None:
+        """Open agents activity dialog (non-modal)."""
+        if self.agents_dialog is None:
+            self.agents_dialog = AgentsDialog(parent=self)
+        
+        self.agents_dialog.show()
+        self.agents_dialog.raise_()
+        self.agents_dialog.activateWindow()
+    
+    def get_agents_dialog(self) -> AgentsDialog:
+        """Get or create agents dialog instance."""
+        if self.agents_dialog is None:
+            self.agents_dialog = AgentsDialog(parent=self)
+        return self.agents_dialog
+    
+    def open_opponent_settings(self) -> None:
+        """Open opponent mode settings dialog."""
+        from .settings_dialog import SettingsDialog as OpponentSettingsDialog
+        
+        dialog = OpponentSettingsDialog(
+            parent=self,
+            current_mode=self.opponent_mode,
+            current_agent_name=self.selected_agent_name,
+            available_agents=self.available_agents,
+            game_in_progress=self.game_in_progress,
+            ai_move_max_tokens=self.ai_move_max_tokens,
+            ai_tokens_from_env=self._ai_tokens_from_env,
+            user_defined_ai_tokens=self._user_defined_ai_tokens,
+            repro_mode=self.repro_mode,
+            repro_seed=self.repro_seed,
+            active_tab_index=1,  # Open AI opponent tab
+        )
+        
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            new_mode = dialog.get_selected_mode()
+            new_agent = dialog.get_selected_agent_name()
+            
+            # Store settings
+            self.opponent_mode = new_mode
+            self.selected_agent_name = new_agent
+            
+            # Check if OpenRouter models were configured
+            openrouter_models = dialog.get_selected_openrouter_models()
+            if openrouter_models:
+                self.selected_ai_models = openrouter_models
+                self.use_multi_model = True
+                self.ai_move_max_tokens = dialog.get_openrouter_tokens()
+                self._user_defined_ai_tokens = True
+                self._update_max_tokens_label()
+                try:
+                    if self.ai_client is not None:
+                        self.ai_client.ai_move_max_output_tokens = self.ai_move_max_tokens
+                except Exception:
+                    pass
+                log.info("OpenRouter models updated: %d models", len(openrouter_models))
+            
+            # Update status message
+            mode_name = new_mode.display_name_sk
+            if new_mode == OpponentMode.AGENT and new_agent:
+                self.status.showMessage(f"AI Režim: {mode_name} ({new_agent})")
+            else:
+                self.status.showMessage(f"AI Režim: {mode_name}")
+            
+            log.info("Opponent settings changed: mode=%s, agent=%s", new_mode.value, new_agent)
+    
+    def configure_openrouter_models(self) -> None:
+        """Configure OpenRouter models for multi-model gameplay."""
         from .ai_config import AIConfigDialog
         
-        lock_default = self._ai_tokens_from_env or self._user_defined_ai_tokens
+        # Use OpenRouter-specific token limit (default 8000)
+        openrouter_tokens = int(os.getenv("OPENROUTER_MAX_TOKENS", "8000"))
         dialog = AIConfigDialog(
             parent=self,
-            default_tokens=self.ai_move_max_tokens,
-            lock_default=lock_default,
+            default_tokens=openrouter_tokens,
+            lock_default=False,  # Token limit managed in settings
         )
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self.selected_ai_models = dialog.get_selected_models()

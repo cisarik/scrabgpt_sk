@@ -1,0 +1,20 @@
+{
+  "name": "Plný Prístup",
+  "description": "Agent s prístupom ku všetkým nástrojom - najlepšia schopnosť",
+  "model": "gpt-4o",
+  "tools": [
+    "rules_first_move_must_cover_center",
+    "rules_placements_in_line",
+    "rules_connected_to_existing",
+    "rules_no_gaps_in_line",
+    "rules_extract_all_words",
+    "scoring_score_words",
+    "get_board_state",
+    "get_rack_letters",
+    "get_premium_squares",
+    "get_tile_values",
+    "validate_word_slovak",
+    "validate_move_legality",
+    "calculate_move_score"
+  ]
+}

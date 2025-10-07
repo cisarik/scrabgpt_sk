@@ -70,12 +70,8 @@ class AIConfigDialog(QDialog):
         self.sort_combo: QComboBox | None = None
         self.free_models_label: QLabel | None = None
         self.select_free_btn: QPushButton | None = None
-        self.shared_tokens_spinbox: QSpinBox | None = None
-        self.shared_tokens_label: QLabel | None = None
-        self._shared_tokens_customized = False
-        self._updating_shared_tokens = False
+        self.total_tokens_label: QLabel | None = None
         self._default_shared_tokens = self._clamp_shared_tokens(default_tokens)
-        self._lock_shared_default = lock_default
         self.search_edit: QLineEdit | None = None
         self._search_text: str = ""
         self._selection_state: dict[str, bool] = {}
@@ -203,26 +199,17 @@ class AIConfigDialog(QDialog):
         )
         button_layout.addWidget(self.cancel_btn)
 
-        self.shared_tokens_label = QLabel("")
-        self.shared_tokens_label.setStyleSheet("font-size: 12px; font-weight: bold; color: #9ad0a2;")
-        self.shared_tokens_label.setToolTip("Aktuálna hodnota AI_MOVE_MAX_OUTPUT_TOKENS použitá pre každý model")
-        button_layout.addWidget(self.shared_tokens_label)
-
-        self.shared_tokens_spinbox = QSpinBox()
-        self.shared_tokens_spinbox.setRange(500, 20000)
-        self.shared_tokens_spinbox.setSingleStep(100)
-        self.shared_tokens_spinbox.setStyleSheet(
-            "QSpinBox { padding: 6px 10px; font-size: 12px; background: #173422; "
-            "color: #e6f7eb; border: 1px solid #2f5c39; border-radius: 6px; }"
-            "QSpinBox::up-button, QSpinBox::down-button { width: 20px; background: #1f4329; border: none; }"
-            "QSpinBox::up-button:hover, QSpinBox::down-button:hover { background: #285836; }"
+        # Total tokens cost calculation (yellow label)
+        self.total_tokens_label = QLabel("Celkový max tokenov: 0")
+        self.total_tokens_label.setStyleSheet(
+            "font-size: 13px; font-weight: bold; color: #ffd54f; "
+            "padding: 6px 12px; background: #3d2a0f; border: 1px solid #8a6a4a; border-radius: 4px;"
         )
-        self.shared_tokens_spinbox.setToolTip("Maximálny počet tokenov odoslaný každému modelu")
-        self._set_shared_tokens_value(self._default_shared_tokens)
-        if self._lock_shared_default:
-            self._shared_tokens_customized = True
-        self.shared_tokens_spinbox.valueChanged.connect(self._on_shared_tokens_changed)
-        button_layout.addWidget(self.shared_tokens_spinbox)
+        self.total_tokens_label.setToolTip(
+            "Celkový počet tokenov, ktoré budú použité pri volaní všetkých vybraných modelov súčasne\\n"
+            "(počet modelov × max tokenov na ťah)"
+        )
+        button_layout.addWidget(self.total_tokens_label)
 
         button_layout.addStretch()
 
@@ -414,7 +401,7 @@ class AIConfigDialog(QDialog):
             for model in models
             if model.get("id")
         }
-        self._maybe_update_shared_tokens_default()
+        # Token limit is now managed in settings, not dynamically updated
         current_sort_key = self._current_sort_key()
         self._apply_sort(current_sort_key)
 
@@ -815,5 +802,4 @@ class AIConfigDialog(QDialog):
 
     def get_shared_tokens_value(self) -> int:
         """Return the shared max token setting for selected models."""
-
-        return self._shared_tokens_value()
+        return self._default_shared_tokens

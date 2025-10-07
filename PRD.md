@@ -54,8 +54,19 @@
 ## 3) Nefunkčné požiadavky
 - **Cross‑platform:** Python 3.10+, **PySide6** UI; balenie neskôr (PyInstaller), mimo MVP.  
 - **Kvalita:** ruff, mypy (strict), pytest; **UI testy na CI skip**.  
-- **Deterministickosť:** všetky doménové testy bez siete; OpenAI volania sa **mockujú**.  
-- **Bezpečnosť:** `.env` s `OPENAI_API_KEY`; sieť len pri interakcii **AI**/**Rozhodca** v runtime.  
+- **Testovanie:**
+  - **Doménové testy** (core/): offline, bez mocks, deterministické
+  - **Integračné testy** (ai/, ui/): môžu volať real API (označené markermi)
+  - **Pytest markers:**
+    - `@pytest.mark.internet` - testy vyžadujúce internet (httpx, API calls)
+    - `@pytest.mark.openai` - testy volajúce OpenAI API
+    - `@pytest.mark.openrouter` - testy volajúce OpenRouter API  
+    - `@pytest.mark.stress` - stress testy / IQ testy pre AI validáciu
+    - `@pytest.mark.ui` - testy vyžadujúce Qt UI
+  - **CI/CD:** GitHub workflow skipuje testy s markermi `internet`, `openai`, `openrouter`, `ui`
+  - **Lokálny vývoj:** všetky testy sa spúšťajú s real API calls (ak sú nastavené API keys v `.env`)
+  - **Conftest:** `tests/conftest.py` načíta `.env` pre API keys
+- **Bezpečnosť:** `.env` s `OPENAI_API_KEY`, `OPENROUTER_API_KEY`; nikdy necommitovať do gitu.  
 - **Telemetria:** žiadna.  
 
 ---
@@ -76,6 +87,7 @@ scrabgpt/
     player.py     # AI hráč (JSON schema návrhu ťahu)
     openrouter.py # OpenRouter API klient (multi-model)
     multi_model.py # Multi-model orchestrácia, GPT fallback parser
+    language_agent.py # Async agent na získavanie jazykov (MCP pattern)
   ui/
     app.py        # PySide6 hlavné okno
     board_view.py # 2D mriežka, DnD, zvýraznenia prémií
@@ -84,6 +96,9 @@ scrabgpt/
     ai_config.py  # AI model konfiguračný dialóg
     model_results.py # Tabuľka výsledkov multi-model súťaže
     response_detail.py # Detail dialóg pre model responses
+    settings_dialog.py # Unifikovaný nastavovací dialóg (4 taby)
+    agents_dialog.py # Dialóg s aktivitou agentov (non-blocking)
+    agent_status_widget.py # Toolbar widget s animáciou pre agentov
   assets/
     premiums.json # mapa prémií 15×15
   tests/
@@ -102,6 +117,61 @@ scrabgpt/
   - DnD kameňov, snapping, zrušenie ťahu, zvýraznenie vzniknutého slova a jeho skóre „ghost preview“.  
   - Toolbar: **Nová hra**, **Potvrdiť ťah**, **Pasovať**, **Nastavenia**.  
   - Status‑bar: kto je na ťahu, posledný ťah + skóre.  
+
+## 5.5) Agent System – Async Background Execution
+
+ScrabGPT implementuje async agent system pre dlhé operácie (API calls, background tasks) s non-blocking UI.
+
+### Architektúra
+- **AsyncAgentWorker (QThread)**: Spúšťa async funkcie vo vlastnom event loop, emituje signály pre progress updates
+- **AgentsDialog (non-modal)**: Zobrazuje real-time aktivitu agentov, možno zavrieť kedykoľvek – agenti pokračujú na pozadí
+- **AgentStatusWidget**: OpenAI-style animácia v toolbar-e (fading text, animated dots)
+- **Global dispatcher**: MainWindow vlastní `agent_workers` dict – workeri prežijú zatvorenie dialógov
+
+### Thread Safety Pattern
+❌ **WRONG**: Direct UI update z worker thread → UI freeze  
+✅ **CORRECT**: Worker emituje signal → Qt ho doručí do main thread → slot updatne UI safely
+
+```python
+# Worker thread (background)
+worker.progress_update.emit(update)  # Thread-safe signal
+
+# Main thread (UI)  
+def on_progress(update):
+    widget.set_status(update.status)  # Safe!
+worker.progress_update.connect(on_progress)
+```
+
+### Components
+
+#### Language Agent (Example)
+- Async/await pattern s `asyncio.to_thread()` pre blocking operations
+- Progress callbacks: "Kontrolujem cache...", "Volám OpenAI API...", "Spracovávam odpoveď..."
+- 1-hour caching pre efektívnosť
+- Full implementation: `scrabgpt/ai/language_agent.py`
+
+#### Settings Dialog (Unified)
+4 taby v zelenej téme:
+1. **Všeobecné**: Variant, Jazyky (tlačidlo "Aktualizovať"), Repro mód, Auto-show agents checkbox
+2. **AI Protivník**: Opponent mode (budúcnosť)
+3. **Nastavenia API**: OpenAI/OpenRouter keys, max tokens
+4. **Upraviť prompt**: Embedded prompt editor
+
+**Clickable status bar**: Klik v settings otvára Agents dialog (aj keď settings modal).
+
+### Environment Variables
+```bash
+SHOW_AGENT_ACTIVITY_AUTO='true'  # Auto-show agents dialog when agent starts
+OPENROUTER_MAX_TOKENS='8000'     # Max tokens per OpenRouter move
+```
+
+### Key Benefits
+- ✅ UI nikdy nezmrzne (thread-safe signály)
+- ✅ Dialógy možno zavrieť kedykoľvek
+- ✅ Agenti pokračujú na pozadí
+- ✅ Real-time progress tracking
+- ✅ OpenAI-style animácie
+
 
 ---
 

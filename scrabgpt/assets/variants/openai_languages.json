@@ -1,31 +1,29 @@
 {
-  "fetched_at": "2025-09-22T10:17:39",
   "languages": [
-    {
-      "name": "Amharic",
-      "code": "am",
-      "aliases": [
-        "አማርኛ",
-        "Amharčina"
-      ],
-      "script": "Ge'ez (Ethiopic)"
-    },
     {
       "name": "Arabic",
       "code": "ar",
       "aliases": [
         "العربية",
-        "Arabčina"
+        "arabčina"
       ],
       "script": "Arabic"
+    },
+    {
+      "name": "Belarusian",
+      "code": "be",
+      "aliases": [
+        "беларуская",
+        "bieloruština"
+      ],
+      "script": "Cyrillic"
     },
     {
       "name": "Bengali",
       "code": "bn",
       "aliases": [
         "বাংলা",
-        "Bengálčina",
-        "Bangla"
+        "bengálčina"
       ],
       "script": "Bengali"
     },
@@ -33,8 +31,8 @@
       "name": "Bosnian",
       "code": "bs",
       "aliases": [
-        "Bosanski",
-        "Bosnian"
+        "bosanski",
+        "bosenčina"
       ],
       "script": "Latin"
     },
@@ -42,29 +40,17 @@
       "name": "Bulgarian",
       "code": "bg",
       "aliases": [
-        "Български",
-        "Bulharčina"
+        "български",
+        "búlharčina"
       ],
       "script": "Cyrillic"
     },
     {
-      "name": "Burmese",
-      "code": "my",
-      "aliases": [
-        "မြန်မာစာ",
-        "Burmese",
-        "Myanma"
-      ],
-      "script": "Burmese (Myanmar)"
-    },
-    {
-      "name": "Chinese (Mandarin)",
+      "name": "Chinese",
       "code": "zh",
       "aliases": [
         "中文",
-        "Chinese",
-        "Čínština",
-        "Mandarin"
+        "čínština"
       ],
       "script": "Han (Simplified/Traditional)"
     },
@@ -72,8 +58,8 @@
       "name": "Croatian",
       "code": "hr",
       "aliases": [
-        "Hrvatski",
-        "Chorvátčina"
+        "hrvatski",
+        "chorvátčina"
       ],
       "script": "Latin"
     },
@@ -81,8 +67,17 @@
       "name": "Czech",
       "code": "cs",
       "aliases": [
-        "Čeština",
-        "Čeština (Czech)"
+        "čeština",
+        "Czech"
+      ],
+      "script": "Latin"
+    },
+    {
+      "name": "Danish",
+      "code": "da",
+      "aliases": [
+        "dansk",
+        "dánčina"
       ],
       "script": "Latin"
     },
@@ -91,7 +86,7 @@
       "code": "nl",
       "aliases": [
         "Nederlands",
-        "Holandčina"
+        "holandčina"
       ],
       "script": "Latin"
     },
@@ -99,18 +94,17 @@
       "name": "English",
       "code": "en",
       "aliases": [
-        "English",
-        "Angličtina"
+        "angličtina",
+        "English"
       ],
       "script": "Latin"
     },
     {
-      "name": "Filipino",
-      "code": "tl",
+      "name": "Finnish",
+      "code": "fi",
       "aliases": [
-        "Tagalog",
-        "Tagalčina",
-        "Filipino"
+        "suomi",
+        "fínčina"
       ],
       "script": "Latin"
     },
@@ -118,8 +112,8 @@
       "name": "French",
       "code": "fr",
       "aliases": [
-        "Français",
-        "Francúzština"
+        "français",
+        "francúzština"
       ],
       "script": "Latin"
     },
@@ -128,7 +122,7 @@
       "code": "de",
       "aliases": [
         "Deutsch",
-        "Nemčina"
+        "nemčina"
       ],
       "script": "Latin"
     },
@@ -137,7 +131,7 @@
       "code": "el",
       "aliases": [
         "Ελληνικά",
-        "Grečtina"
+        "gréčtina"
       ],
       "script": "Greek"
     },
@@ -146,25 +140,16 @@
       "code": "gu",
       "aliases": [
         "ગુજરાતી",
-        "Gudžarátčina"
+        "gudžarátčina"
       ],
       "script": "Gujarati"
-    },
-    {
-      "name": "Hausa",
-      "code": "ha",
-      "aliases": [
-        "Hausa",
-        "Hausčina"
-      ],
-      "script": "Latin / Arabic"
     },
     {
       "name": "Hebrew",
       "code": "he",
       "aliases": [
         "עברית",
-        "Hebrejčina"
+        "hebrejčina"
       ],
       "script": "Hebrew"
     },
@@ -173,7 +158,7 @@
       "code": "hi",
       "aliases": [
         "हिन्दी",
-        "Hindčina"
+        "hindčina"
       ],
       "script": "Devanagari"
     },
@@ -181,17 +166,8 @@
       "name": "Hungarian",
       "code": "hu",
       "aliases": [
-        "Magyar",
-        "Maďarčina"
-      ],
-      "script": "Latin"
-    },
-    {
-      "name": "Igbo",
-      "code": "ig",
-      "aliases": [
-        "Igbo",
-        "Igbčina"
+        "magyar",
+        "maďarčina"
       ],
       "script": "Latin"
     },
@@ -200,7 +176,7 @@
       "code": "id",
       "aliases": [
         "Bahasa Indonesia",
-        "Indonézčina"
+        "indonézština"
       ],
       "script": "Latin"
     },
@@ -208,8 +184,8 @@
       "name": "Italian",
       "code": "it",
       "aliases": [
-        "Italiano",
-        "Taliančina"
+        "italiano",
+        "taliančina"
       ],
       "script": "Latin"
     },
@@ -218,16 +194,16 @@
       "code": "ja",
       "aliases": [
         "日本語",
-        "Japončina"
+        "japončina"
       ],
-      "script": "Kanji and Kana"
+      "script": "Kanji/Kana"
     },
     {
       "name": "Kannada",
       "code": "kn",
       "aliases": [
         "ಕನ್ನಡ",
-        "Kannaďčina"
+        "kannadčina"
       ],
       "script": "Kannada"
     },
@@ -236,7 +212,7 @@
       "code": "ko",
       "aliases": [
         "한국어",
-        "Kórejčina"
+        "kórejčina"
       ],
       "script": "Hangul"
     },
@@ -245,7 +221,7 @@
       "code": "ms",
       "aliases": [
         "Bahasa Melayu",
-        "Malajčina"
+        "malajčina"
       ],
       "script": "Latin"
     },
@@ -254,7 +230,7 @@
       "code": "ml",
       "aliases": [
         "മലയാളം",
-        "Malayalam"
+        "malajálčina"
       ],
       "script": "Malayalam"
     },
@@ -263,35 +239,34 @@
       "code": "mr",
       "aliases": [
         "मराठी",
-        "Maráthčina"
+        "maráthčina"
       ],
       "script": "Devanagari"
     },
     {
-      "name": "Nepali",
-      "code": "ne",
+      "name": "Norwegian",
+      "code": "no",
       "aliases": [
-        "नेपाली",
-        "Nepálčina"
+        "norsk",
+        "nórčina"
       ],
-      "script": "Devanagari"
+      "script": "Latin"
     },
     {
       "name": "Persian",
       "code": "fa",
       "aliases": [
         "فارسی",
-        "Perzština",
-        "Farsi"
+        "perzština"
       ],
-      "script": "Perso-Arabic"
+      "script": "Arabic"
     },
     {
       "name": "Polish",
       "code": "pl",
       "aliases": [
-        "Polski",
-        "Poľština"
+        "polski",
+        "poľština"
       ],
       "script": "Latin"
     },
@@ -299,8 +274,7 @@
       "name": "Portuguese",
       "code": "pt",
       "aliases": [
-        "Português",
-        "Portugalčina"
+        "português"
       ],
       "script": "Latin"
     },
@@ -309,17 +283,16 @@
       "code": "pa",
       "aliases": [
         "ਪੰਜਾਬੀ",
-        "Pandžábčina",
-        "Punjabi"
+        "pańdžábčina"
       ],
-      "script": "Gurmukhi / Perso-Arabic"
+      "script": "Gurmukhi/Arabic"
     },
     {
       "name": "Romanian",
       "code": "ro",
       "aliases": [
-        "Română",
-        "Rumunčina"
+        "română",
+        "rumunčina"
       ],
       "script": "Latin"
     },
@@ -327,8 +300,8 @@
       "name": "Russian",
       "code": "ru",
       "aliases": [
-        "Русский",
-        "Ruština"
+        "русский",
+        "ruština"
       ],
       "script": "Cyrillic"
     },
@@ -336,27 +309,26 @@
       "name": "Serbian",
       "code": "sr",
       "aliases": [
-        "Српски",
-        "Srpčina",
-        "Srbčina"
+        "српски",
+        "srpski"
       ],
-      "script": "Cyrillic and Latin"
+      "script": "Cyrillic/Latin"
     },
     {
       "name": "Slovak",
       "code": "sk",
       "aliases": [
-        "Slovenčina",
+        "slovenčina",
         "Slovak"
       ],
       "script": "Latin"
     },
     {
-      "name": "Slovenian",
+      "name": "Slovene",
       "code": "sl",
       "aliases": [
-        "Slovenščina",
-        "Slovenčina"
+        "slovenščina",
+        "slovinčina"
       ],
       "script": "Latin"
     },
@@ -364,17 +336,27 @@
       "name": "Spanish",
       "code": "es",
       "aliases": [
-        "Español",
-        "Španielčina"
+        "español",
+        "španielčina"
       ],
       "script": "Latin"
     },
     {
-      "name": "Swahili",
-      "code": "sw",
+      "name": "Swedish",
+      "code": "sv",
       "aliases": [
-        "Kiswahili",
-        "Swahilčina"
+        "svenska",
+        "švédčina"
+      ],
+      "script": "Latin"
+    },
+    {
+      "name": "Tagalog",
+      "code": "tl",
+      "aliases": [
+        "Filipino",
+        "Tagalog",
+        "tagalčina"
       ],
       "script": "Latin"
     },
@@ -383,7 +365,7 @@
       "code": "ta",
       "aliases": [
         "தமிழ்",
-        "Tamilčina"
+        "tamilčina"
       ],
       "script": "Tamil"
     },
@@ -392,7 +374,7 @@
       "code": "te",
       "aliases": [
         "తెలుగు",
-        "Telugčina"
+        "telugčina"
       ],
       "script": "Telugu"
     },
@@ -401,7 +383,7 @@
       "code": "th",
       "aliases": [
         "ไทย",
-        "Thajčina"
+        "thajčina"
       ],
       "script": "Thai"
     },
@@ -410,7 +392,7 @@
       "code": "tr",
       "aliases": [
         "Türkçe",
-        "Turečtina"
+        "turečtina"
       ],
       "script": "Latin"
     },
@@ -418,8 +400,8 @@
       "name": "Ukrainian",
       "code": "uk",
       "aliases": [
-        "Українська",
-        "Ukrajinčina"
+        "українська",
+        "ukrajinčina"
       ],
       "script": "Cyrillic"
     },
@@ -428,36 +410,18 @@
       "code": "ur",
       "aliases": [
         "اردو",
-        "Urdčina"
+        "urdčina"
       ],
-      "script": "Perso-Arabic"
+      "script": "Arabic"
     },
     {
       "name": "Vietnamese",
       "code": "vi",
       "aliases": [
         "Tiếng Việt",
-        "Vietnamčina"
+        "vietnamčina"
       ],
-      "script": "Latin (quốc ngữ)"
-    },
-    {
-      "name": "Yoruba",
-      "code": "yo",
-      "aliases": [
-        "Yorùbá",
-        "Yorubčina"
-      ],
-      "script": "Latin"
-    },
-    {
-      "name": "Zulu",
-      "code": "zu",
-      "aliases": [
-        "isiZulu",
-        "Zulčina"
-      ],
-      "script": "Latin"
+      "script": "Latin (with diacritics)"
     }
   ]
 }

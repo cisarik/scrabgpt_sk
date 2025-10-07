@@ -1,0 +1,10 @@
+{
+  "name": "Minimálny Agent",
+  "description": "Agent s minimálnymi nástrojmi - len základné informácie",
+  "model": "gpt-4o-mini",
+  "tools": [
+    "get_board_state",
+    "get_rack_letters",
+    "validate_move_legality"
+  ]
+}

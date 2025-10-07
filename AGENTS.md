@@ -48,14 +48,154 @@ Multi-model features use `asyncio` for concurrent API calls. Follow these patter
 - Emit signals from worker threads to update UI (never call UI methods directly from threads)
 - Dark theme: Use `#1a1a1a` for backgrounds, `#2a2a2a` for headers, `white` for text, `#444` for borders
 
-## Testing Guidelines
-Tests follow the `tests/test_<feature>.py` pattern and use pytest. Name functions `test_<behavior>_<condition>` to clarify intent. Reuse fixtures that craft boards and racks; place new fixtures in the same module when feature-specific. Always run `poetry run pytest` locally, and do not rely on real OpenAI traffic.
+### Agent System & Background Execution
+ScrabGPT uses async agents for background operations with non-blocking UI.
 
-### Mocking AI Services
-- **OpenAI**: Mock `OpenAIClient` methods to return canned responses. Never make real API calls in tests.
-- **OpenRouter**: Mock `httpx.AsyncClient` responses with structured JSON matching OpenRouter's API format.
-- **Multi-model**: Mock `propose_move_multi_model()` to return a list of result dicts with known moves/scores.
-- **Judge validation**: Mock judge responses for both valid and invalid words to test all code paths.
+#### AsyncAgentWorker Pattern
+```python
+class AsyncAgentWorker(QThread):
+    """QThread worker that runs async agent operations.
+    
+    Automatically injects progress callback that emits signals.
+    Workers are owned by MainWindow, not dialogs.
+    """
+    progress_update = Signal(object)  # AgentProgress object
+    agent_finished = Signal(object)   # result
+    agent_error = Signal(str)         # error message
+    
+    def __init__(self, async_func, *args, **kwargs):
+        super().__init__()
+        self.async_func = async_func
+        self.kwargs = kwargs
+        # Auto-inject progress callback
+        if 'on_progress' not in kwargs:
+            kwargs['on_progress'] = self._emit_progress
+    
+    def _emit_progress(self, update):
+        """Emit from worker thread - Qt handles thread switching."""
+        self.progress_update.emit(update)
+    
+    def run(self):
+        """Run async function in thread's own event loop."""
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            result = loop.run_until_complete(
+                self.async_func(*self.args, **self.kwargs)
+            )
+            self.agent_finished.emit(result)
+        finally:
+            loop.close()
+```
+
+#### Thread-Safe Progress Updates
+**WRONG (UI freezes):**
+```python
+def on_progress(update):
+    # Called from worker thread!
+    widget.set_status(update.status)  # BLOCKS main thread!
+```
+
+**CORRECT (thread-safe):**
+```python
+# Create worker
+worker = AsyncAgentWorker(agent.fetch_languages, use_cache=False)
+
+# Connect signal to slot (runs in main thread)
+def on_progress_update(update):
+    """Runs in main thread via Qt signal/slot."""
+    widget.set_status(update.status)  # Safe!
+
+worker.progress_update.connect(on_progress_update)
+worker.start()
+```
+
+#### Background Agent Management
+Store workers in MainWindow, not dialogs:
+```python
+class MainWindow(QMainWindow):
+    def __init__(self):
+        self.agent_workers: dict[str, AsyncAgentWorker] = {}
+    
+    def start_agent(self, agent_name, worker):
+        # Store worker - survives dialog closure
+        self.agent_workers[agent_name] = worker
+        worker.start()
+    
+    def cleanup_agent(self, agent_name):
+        # Remove after completion
+        self.agent_workers.pop(agent_name, None)
+```
+
+#### Agents Dialog Integration
+```python
+# Dialog is non-modal and can be closed anytime
+class AgentsDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setModal(False)  # Non-modal!
+    
+    def closeEvent(self, event):
+        """Allow closing while agents run."""
+        event.accept()
+        self.hide()  # Just hide, don't stop workers
+    
+    def reject(self):
+        """Handle ESC key and X button."""
+        self.hide()
+```
+
+#### Progress Bar Responsiveness
+```python
+# WRONG - fixed width doesn't stretch
+progress_bar.setFixedWidth(200)
+
+# CORRECT - stretches with window
+progress_bar.setMinimumWidth(200)
+layout.addWidget(progress_bar, stretch=2)
+```
+
+## Testing Guidelines
+Tests follow the `tests/test_<feature>.py` pattern and use pytest. Name functions `test_<behavior>_<condition>` to clarify intent. 
+
+### Test Categories
+1. **Domain tests** (`tests/test_scoring.py`, `test_rules.py`, etc.) - Pure logic, offline, no mocks
+2. **Integration tests** (`tests/test_internet_tools.py`, `test_agent_player.py`, etc.) - Real API calls allowed
+3. **UI tests** - Marked with `@pytest.mark.ui`, skipped on CI
+4. **Stress tests / IQ tests** - Marked with `@pytest.mark.stress`, user-created validation scenarios
+
+### Real API Calls in Tests
+**Philosophy:** Integration tests should use real APIs to validate actual behavior. Mocking is only for unit tests.
+
+- **OpenAI tests**: Mark with `@pytest.mark.openai` - will call real OpenAI API
+- **OpenRouter tests**: Mark with `@pytest.mark.openrouter` - will call real OpenRouter API  
+- **Network tests**: Mark with `@pytest.mark.network` - will use httpx for real HTTP calls
+- **Internet marker**: Auto-applied to all API/network tests via `conftest.py`
+
+**Example:**
+```python
+@pytest.mark.openai
+async def test_judge_validates_english_word(openai_api_key):
+    """Test real OpenAI judge validation."""
+    if not openai_api_key:
+        pytest.skip("OPENAI_API_KEY not set")
+    
+    client = OpenAIClient()
+    result = client.judge_words(["HELLO"], language="English")
+    assert result["all_valid"] is True
+```
+
+### CI/CD Exclusions
+GitHub workflows should skip internet tests to avoid:
+- API costs on every commit
+- Flaky tests due to network issues
+- Secrets management complexity
+
+**Example workflow:**
+```yaml
+- name: Run offline tests only
+  run: poetry run pytest -m "not internet and not ui"
+```
 
 ### Testing Async Code
 - Use `pytest-asyncio` for async test functions: `async def test_something():`

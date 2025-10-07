@@ -1,0 +1,85 @@
+name: Tests
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+    
+    - name: Install Poetry
+      uses: snok/install-poetry@v1
+      with:
+        virtualenvs-create: true
+        virtualenvs-in-project: true
+    
+    - name: Load cached venv
+      id: cached-poetry-dependencies
+      uses: actions/cache@v4
+      with:
+        path: .venv
+        key: venv-${{ runner.os }}-${{ hashFiles('**/poetry.lock') }}
+    
+    - name: Install dependencies
+      if: steps.cached-poetry-dependencies.outputs.cache-hit != 'true'
+      run: poetry install --no-interaction --no-root
+    
+    - name: Install project
+      run: poetry install --no-interaction
+    
+    - name: Run Ruff
+      run: poetry run ruff check .
+    
+    - name: Run Mypy
+      run: poetry run mypy scrabgpt
+    
+    - name: Run offline tests only
+      run: |
+        poetry run pytest -v \
+          -m "not internet and not ui" \
+          --tb=short
+      
+    # Optional: Separate job for integration tests with secrets
+    # Only run on manual trigger or schedule, not on every push
+  
+  integration-tests:
+    runs-on: ubuntu-latest
+    # Only run on manual workflow dispatch or schedule
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+    
+    - name: Install Poetry
+      uses: snok/install-poetry@v1
+      with:
+        virtualenvs-create: true
+        virtualenvs-in-project: true
+    
+    - name: Install dependencies
+      run: poetry install --no-interaction
+    
+    - name: Run integration tests
+      env:
+        OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      run: |
+        poetry run pytest -v \
+          -m "internet and not ui" \
+          --tb=short

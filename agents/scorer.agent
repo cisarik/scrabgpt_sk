@@ -1,0 +1,16 @@
+{
+  "name": "Bodovač",
+  "description": "Agent so zameraním na bodovanie - vidi prémie a vie počítať body presne",
+  "model": "gpt-4o",
+  "tools": [
+    "rules_placements_in_line",
+    "rules_no_gaps_in_line",
+    "rules_extract_all_words",
+    "scoring_score_words",
+    "get_board_state",
+    "get_rack_letters",
+    "get_premium_squares",
+    "get_tile_values",
+    "calculate_move_score"
+  ]
+}

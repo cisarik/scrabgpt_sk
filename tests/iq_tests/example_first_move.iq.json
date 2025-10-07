@@ -1,0 +1,44 @@
+{
+  "name": "Optimal first move with CATS",
+  "description": "AI should find the highest scoring first move using available letters. With rack [C,A,T,S,D,O,G], optimal is CATS or DOGS covering center.",
+  "difficulty": "easy",
+  "created_at": "2024-01-15T10:00:00Z",
+  "author": "system",
+  "scenario": {
+    "board_state": "empty",
+    "rack": ["C", "A", "T", "S", "D", "O", "G"],
+    "variant": "english",
+    "expected_behavior": {
+      "type": "optimal_move",
+      "min_score": 10,
+      "max_iterations": 5,
+      "should_use_center": true,
+      "valid_words": ["CATS", "DOGS", "CODS", "TOGS", "DOTS", "COTS", "GATS"]
+    }
+  },
+  "validation": {
+    "judge_calls": [
+      {
+        "word": "CATS",
+        "language": "English",
+        "expected_valid": true
+      },
+      {
+        "word": "DOGS",
+        "language": "English",
+        "expected_valid": true
+      }
+    ],
+    "scoring": {
+      "expected_min": 10,
+      "expected_max": 30,
+      "note": "Depends on whether DW at center is used"
+    },
+    "rules": {
+      "must_cover_center": true,
+      "must_form_line": true,
+      "no_gaps": true
+    }
+  },
+  "tags": ["first-move", "scoring", "basic", "english"]
+}
