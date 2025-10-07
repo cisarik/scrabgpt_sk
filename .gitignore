@@ -2,6 +2,8 @@
 .env
 poetry.lock
 scrabgpt.log
+# Generated assets
+scrabgpt/assets/lang_summarizations/
 # Python bytecode a cache
 __pycache__/
 *.py[cod]

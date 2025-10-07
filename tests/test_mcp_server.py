@@ -196,8 +196,6 @@ async def test_call_all_tools():
     # Prepare common test data
     board_grid = ["." * 15] * 15
     placements = [{"row": 7, "col": 7, "letter": "A"}]
-    premium_grid = [[None] * 15 for _ in range(15)]
-    
     test_cases = [
         ("rules_first_move_must_cover_center", {"placements": placements}),
         ("rules_placements_in_line", {"placements": placements}),

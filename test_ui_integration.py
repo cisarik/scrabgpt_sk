@@ -10,6 +10,7 @@ from scrabgpt.core.opponent_mode import OpponentMode
 def test_settings_dialog():
     """Test that settings dialog opens and works."""
     app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)
     
     # Load agents
     agents = discover_agents(get_default_agents_dir())
@@ -40,7 +41,7 @@ def test_settings_dialog():
         selected_mode = dialog.get_selected_mode()
         selected_agent = dialog.get_selected_agent_name()
         
-        print(f"\n✓ Settings accepted!")
+        print("\n✓ Settings accepted!")
         print(f"  Mode: {selected_mode.display_name_sk} ({selected_mode.value})")
         if selected_mode == OpponentMode.AGENT and selected_agent:
             print(f"  Agent: {selected_agent}")

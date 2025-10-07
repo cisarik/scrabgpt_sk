@@ -335,7 +335,7 @@ async def main():
                 write_stream,
                 server.create_initialization_options(),
             )
-    except Exception as e:
+    except Exception:
         log.exception("Server error")
         raise
 

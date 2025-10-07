@@ -273,15 +273,18 @@ class TestAgentToolRegistry:
     def test_get_tool_schema_returns_function_signature(self) -> None:
         """Given: Tool registered in MCP
         When: Getting tool schema
-        Then: JSON schema with parameters is returned
+        Then: JSON schema with parameters is returned in OpenAI format
         """
         from scrabgpt.ai.agent_config import get_tool_schema
 
         schema = get_tool_schema("rules_placements_in_line")
         
-        assert schema["name"] == "rules_placements_in_line"
-        assert "parameters" in schema
-        assert "description" in schema
+        # OpenAI function calling format
+        assert schema["type"] == "function"
+        assert "function" in schema
+        assert schema["function"]["name"] == "rules_placements_in_line"
+        assert "parameters" in schema["function"]
+        assert "description" in schema["function"]
 
     def test_get_tool_schema_raises_for_unknown_tool(self) -> None:
         """Given: Unknown tool name

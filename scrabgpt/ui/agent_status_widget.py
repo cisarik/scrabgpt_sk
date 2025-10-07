@@ -8,8 +8,8 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
-from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve, Property
-from PySide6.QtGui import QPainter, QColor, QPaintEvent
+from PySide6.QtCore import QTimer, QPropertyAnimation, QEasingCurve, Property
+from PySide6.QtGui import QPainter, QPaintEvent
 from PySide6.QtWidgets import QWidget, QLabel, QHBoxLayout
 
 log = logging.getLogger("scrabgpt.ui.agent_status")

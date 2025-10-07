@@ -8,12 +8,12 @@ import os
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import QThread, Signal
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QTextEdit, QComboBox, QMessageBox, QWidget, QProgressBar,
 )
-from PySide6.QtGui import QFont, QTextCursor
+from PySide6.QtGui import QTextCursor
 
 from ..ai.model_selector_agent import ModelSelectorAgent, SelectionCriteria
 from ..ai.model_fetcher import fetch_openai_models, enrich_models_with_pricing

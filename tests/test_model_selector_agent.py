@@ -403,10 +403,6 @@ class TestAgentIntegration:
             print(f"  Performance: {best.performance_score:.2f}")
             print(f"  Cost: {best.cost_score:.2f}")
         
-        # Verify results make sense
-        perf_model = results["performance"]["model"]
-        cost_model = results["cost"]["model"]
-        
         # Performance criteria should select more capable model
         assert results["performance"]["performance_score"] >= results["cost"]["performance_score"]
         

@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..core.opponent_mode import OpponentMode
+from ..core.team_config import get_team_manager
 
 log = logging.getLogger("scrabgpt.ui")
 
@@ -22,13 +23,14 @@ class OpponentModeSelector(QWidget):
     mode_changed = Signal(OpponentMode)
     agent_changed = Signal(str)  # Agent name
     configure_openrouter_requested = Signal()  # Request to configure OpenRouter models
+    configure_novita_requested = Signal()  # Request to configure Novita models
     configure_agent_requested = Signal()  # Request to configure AI agent
     
     def __init__(
         self,
         parent: QWidget | None = None,
         *,
-        available_agents: list[dict] | None = None,
+        available_agents: list[dict[str, str]] | None = None,
     ) -> None:
         """Initialize opponent mode selector.
         
@@ -41,6 +43,9 @@ class OpponentModeSelector(QWidget):
         self.available_agents = available_agents or []
         self.current_mode = OpponentMode.BEST_MODEL
         self.current_agent_name: Optional[str] = None
+        self.team_manager = get_team_manager()
+        self.novita_desc_label: QLabel | None = None
+        self.openrouter_desc_label: QLabel | None = None
         
         self._setup_ui()
         
@@ -70,6 +75,7 @@ class OpponentModeSelector(QWidget):
             OpponentMode.OFFLINE,
             OpponentMode.BEST_MODEL,
             OpponentMode.OPENROUTER,
+            OpponentMode.NOVITA,
             OpponentMode.AGENT,
         ]
         
@@ -138,16 +144,35 @@ class OpponentModeSelector(QWidget):
         self.button_group.addButton(radio)
         layout.addWidget(radio)
         
-        # Description with optional button for OpenRouter or Agent
-        if mode in (OpponentMode.OPENROUTER, OpponentMode.AGENT):
+        # Description with optional button for OpenRouter, Novita, or Agent
+        if mode in (OpponentMode.OPENROUTER, OpponentMode.NOVITA, OpponentMode.AGENT):
             desc_layout = QHBoxLayout()
             desc_layout.setSpacing(8)
             desc_layout.setContentsMargins(26, 0, 0, 0)
             
-            desc = QLabel(mode.description_sk)
-            desc.setWordWrap(True)
-            desc.setStyleSheet("font-size: 12px; color: #b6e0bd;")
-            desc.setMinimumHeight(60)  # Increase height so text is readable
+            # For Novita and OpenRouter, show dynamic team info; for others, show static description
+            if mode == OpponentMode.NOVITA:
+                desc = QLabel()
+                desc.setWordWrap(True)
+                desc.setTextFormat(Qt.TextFormat.RichText)
+                desc.setStyleSheet("font-size: 12px; color: #b6e0bd;")
+                desc.setMinimumHeight(60)
+                self.novita_desc_label = desc  # Store reference for updates
+                self._update_novita_description()  # Set initial text
+            elif mode == OpponentMode.OPENROUTER:
+                desc = QLabel()
+                desc.setWordWrap(True)
+                desc.setTextFormat(Qt.TextFormat.RichText)
+                desc.setStyleSheet("font-size: 12px; color: #b6e0bd;")
+                desc.setMinimumHeight(60)
+                self.openrouter_desc_label = desc  # Store reference for updates
+                self._update_openrouter_description()  # Set initial text
+            else:
+                desc = QLabel(mode.description_sk)
+                desc.setWordWrap(True)
+                desc.setStyleSheet("font-size: 12px; color: #b6e0bd;")
+                desc.setMinimumHeight(60)
+            
             desc_layout.addWidget(desc, 1)
             
             # "Nastaviť" button
@@ -164,6 +189,8 @@ class OpponentModeSelector(QWidget):
             
             if mode == OpponentMode.OPENROUTER:
                 config_btn.clicked.connect(lambda: self.configure_openrouter_requested.emit())
+            elif mode == OpponentMode.NOVITA:
+                config_btn.clicked.connect(lambda: self.configure_novita_requested.emit())
             else:  # AGENT mode
                 config_btn.clicked.connect(lambda: self.configure_agent_requested.emit())
             
@@ -316,6 +343,68 @@ class OpponentModeSelector(QWidget):
                     return current_text
             return self.current_agent_name
         return None
+    
+    def _update_novita_description(self) -> None:
+        """Update Novita description to show active team info."""
+        if self.novita_desc_label is None:
+            return
+        
+        # Load active team
+        team = self.team_manager.load_active_team_config("novita")
+        
+        if team and team.model_ids:
+            # Show team name in bold white, larger font
+            team_name_html = f'<span style="font-size: 14px; font-weight: bold; color: #ffffff;">{team.name}</span>'
+            
+            # Show model IDs below in smaller gray text
+            models_html = '<br/>'.join([
+                f'<span style="font-size: 11px; color: #9ad0a2;">• {model_id}</span>'
+                for model_id in team.model_ids
+            ])
+            
+            full_html = f'{team_name_html}<br/>{models_html}'
+            self.novita_desc_label.setText(full_html)
+        else:
+            # No team configured - show default message
+            self.novita_desc_label.setText(
+                '<span style="color: #b6e0bd;">Žiadny team nie je nakonfigurovaný. '
+                'Klikni na "Nastaviť" pre výber modelov.</span>'
+            )
+    
+    def refresh_novita_team_info(self) -> None:
+        """Refresh Novita team info (call after team changes)."""
+        self._update_novita_description()
+    
+    def _update_openrouter_description(self) -> None:
+        """Update OpenRouter description to show active team info."""
+        if self.openrouter_desc_label is None:
+            return
+        
+        # Load active team
+        team = self.team_manager.load_active_team_config("openrouter")
+        
+        if team and team.model_ids:
+            # Show team name in bold white, larger font
+            team_name_html = f'<span style="font-size: 14px; font-weight: bold; color: #ffffff;">{team.name}</span>'
+            
+            # Show model IDs below in smaller gray text
+            models_html = '<br/>'.join([
+                f'<span style="font-size: 11px; color: #9ad0a2;">• {model_id}</span>'
+                for model_id in team.model_ids
+            ])
+            
+            full_html = f'{team_name_html}<br/>{models_html}'
+            self.openrouter_desc_label.setText(full_html)
+        else:
+            # No team configured - show default message
+            self.openrouter_desc_label.setText(
+                '<span style="color: #b6e0bd;">Žiadny team nie je nakonfigurovaný. '
+                'Klikni na "Nastaviť" pre výber modelov.</span>'
+            )
+    
+    def refresh_openrouter_team_info(self) -> None:
+        """Refresh OpenRouter team info (call after team changes)."""
+        self._update_openrouter_description()
     
     def set_mode(self, mode: OpponentMode) -> None:
         """Set opponent mode programmatically.

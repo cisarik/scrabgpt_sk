@@ -8,14 +8,7 @@ from pathlib import Path
 from typing import Sequence
 
 from ..core.assets import get_assets_path
-from ..core.variant_store import (
-    VariantDefinition,
-    VariantLetter,
-    normalise_letter,
-    save_variant,
-    slugify,
-    variant_exists,
-)
+from ..core.variant_store import VariantDefinition, save_variant, slugify, variant_exists
 from .client import OpenAIClient
 
 log = logging.getLogger("scrabgpt.ai.variants")
@@ -47,25 +40,6 @@ class LanguageInfo:
         if self.code and self.code.casefold() == q:
             return True
         return any(alias.casefold() == q for alias in self.aliases)
-
-
-def _coerce_int(value: object) -> int:
-    """Ensure JSON values for counts/points are integers."""
-
-    if value is None or isinstance(value, bool):
-        raise TypeError("numeric value missing")
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float):
-        if not value.is_integer():
-            raise ValueError(f"expected integer, got {value}")
-        return int(value)
-    if isinstance(value, str):
-        stripped = value.strip()
-        if not stripped:
-            raise ValueError("empty string cannot be converted to int")
-        return int(stripped)
-    raise TypeError(f"unsupported numeric value: {value!r}")
 
 
 def _ensure_variants_dir() -> None:
@@ -252,128 +226,29 @@ def fetch_supported_languages(client: OpenAIClient) -> list[LanguageInfo]:
     return normalized
 
 
-_VARIANT_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "language": {"type": "string"},
-        "code": {"type": "string"},
-        "letters": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "letter": {"type": "string"},
-                    "count": {"type": "integer"},
-                    "points": {"type": "integer"},
-                },
-                "required": ["letter", "count", "points"],
-                "additionalProperties": False,
-            },
-        },
-    },
-    "required": ["language", "letters"],
-    "additionalProperties": False,
-}
+def persist_variant(definition: VariantDefinition) -> VariantDefinition:
+    """Persist variant definition ensuring a unique slug on disk."""
 
+    slug = definition.slug or slugify(f"{definition.language} {definition.variant_name or ''}")
+    adjusted = definition
+    if slug != definition.slug:
+        adjusted = replace(definition, slug=slug)
 
-def fetch_variant_definition(
-    client: OpenAIClient,
-    *,
-    language_request: str,
-    iso_code: str | None = None,
-) -> VariantDefinition:
-    """Získa definíciu Scrabble variantu pre daný jazyk cez OpenAI API."""
-
-    query = language_request.strip()
-    if not query:
-        raise ValueError("Jazyk variantu musí byť zadaný")
-
-    lang_part = f"{query}"
-    if iso_code:
-        lang_part += f" (ISO {iso_code})"
-
-    prompt = (
-        "Zisťuješ aké písmená, ich početnosť a bodové ohodnotenie patria do Scrabble "
-        f"variantu pre jazyk {lang_part}. Vráť výhradne JSON so štruktúrou:"
-        " language (string), optional code (string), letters (pole objektov s kľúčmi "
-        "letter, count, points). Použi znak '?' pre blank/žolík, ak je súčasťou variantu. "
-        "Písmená vracaj ako veľké písmená (zachovaj diakritiku). Počty aj body musia byť celé čísla."
-    )
-
-    data = client._call_json(prompt, _VARIANT_SCHEMA)
-    if not isinstance(data, dict):
-        raise ValueError("OpenAI nevrátil JSON objekt variantu")
-
-    language = str(data.get("language", query)).strip() or query
-    code_raw = data.get("code")
-    code = str(code_raw).strip() if isinstance(code_raw, str) and code_raw else (iso_code or None)
-
-    letters_raw = data.get("letters", [])
-    if not isinstance(letters_raw, list):
-        raise ValueError("Pole 'letters' má neplatný formát")
-
-    collected: dict[str, VariantLetter] = {}
-    for idx, item in enumerate(letters_raw):
-        if not isinstance(item, dict):
-            log.warning("variant_letter_invalid idx=%s data=%r", idx, item)
-            continue
-        letter_raw = str(item.get("letter", "")).strip()
-        letter = normalise_letter(letter_raw)
-        if not letter:
-            log.warning("variant_letter_missing idx=%s raw=%r", idx, letter_raw)
-            continue
-        try:
-            count = _coerce_int(item.get("count"))
-            points = _coerce_int(item.get("points"))
-        except (TypeError, ValueError):
-            log.warning("variant_letter_bad_numbers letter=%s raw=%r", letter, item)
-            continue
-        if letter in collected:
-            existing = collected[letter]
-            collected[letter] = VariantLetter(letter=letter, count=existing.count + count, points=points)
-        else:
-            collected[letter] = VariantLetter(letter=letter, count=count, points=points)
-
-    letters = tuple(sorted(collected.values(), key=lambda entry: entry.letter))
-    if not letters:
-        raise ValueError("OpenAI nevrátil žiadne písmená pre variant")
-
-    slug = slugify(language)
-    source = f"openai[{code}]" if code else "openai"
-    fetched_at = datetime.utcnow().isoformat(timespec="seconds")
-    return VariantDefinition(
-        slug=slug,
-        language=language,
-        letters=letters,
-        source=source,
-        fetched_at=fetched_at,
-    )
-
-
-def download_and_store_variant(
-    client: OpenAIClient,
-    *,
-    language_request: str,
-    language_hint: LanguageInfo | None = None,
-) -> VariantDefinition:
-    """Fetch variant and persist it to the variants directory."""
-
-    iso_code = language_hint.code if language_hint else None
-    definition = fetch_variant_definition(client, language_request=language_request, iso_code=iso_code)
-    slug = definition.slug
-    if variant_exists(slug):
-        if language_hint and language_hint.code:
-            candidate = f"{slug}-{language_hint.code.lower()}"
+    if variant_exists(adjusted.slug):
+        if adjusted.language_code:
+            candidate = f"{adjusted.slug}-{adjusted.language_code.lower()}"
             if not variant_exists(candidate):
-                definition = replace(definition, slug=candidate)
-        if variant_exists(definition.slug):
-            base = definition.slug
-            suffix = 2
-            while variant_exists(f"{base}-{suffix}"):
-                suffix += 1
-            definition = replace(definition, slug=f"{base}-{suffix}")
-    save_variant(definition)
-    return definition
+                adjusted = replace(adjusted, slug=candidate)
+
+    if variant_exists(adjusted.slug):
+        base = adjusted.slug
+        suffix = 2
+        while variant_exists(f"{base}-{suffix}"):
+            suffix += 1
+        adjusted = replace(adjusted, slug=f"{base}-{suffix}")
+
+    save_variant(adjusted)
+    return adjusted
 
 
 def match_language(query: str, languages: Sequence[LanguageInfo]) -> LanguageInfo | None:

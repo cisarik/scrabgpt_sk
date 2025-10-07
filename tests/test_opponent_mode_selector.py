@@ -109,7 +109,6 @@ class TestOpponentModeSelector:
         Then: mode_changed signal is emitted
         """
         from scrabgpt.ui.opponent_mode_selector import OpponentModeSelector
-        from PySide6.QtCore import SignalInstance
 
         selector = OpponentModeSelector(available_agents=sample_agents)
 

@@ -14,11 +14,10 @@ import asyncio
 import json
 import logging
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Callable, Optional
 
 from .client import OpenAIClient
-from .variants import LanguageInfo, _VARIANTS_DIR, _LANG_CACHE_PATH, _ensure_variants_dir
+from .variants import LanguageInfo, _LANG_CACHE_PATH, _ensure_variants_dir
 
 log = logging.getLogger("scrabgpt.ai.language_agent")
 

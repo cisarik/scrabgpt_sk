@@ -376,7 +376,7 @@ def tool_get_premium_squares(board: Board) -> dict[str, Any]:
                     premiums.append({
                         "row": r,
                         "col": c,
-                        "type": cell.premium.value,
+                        "type": cell.premium.name,
                         "used": cell.premium_used,
                     })
         
@@ -426,14 +426,23 @@ def tool_validate_word_slovak(word: str) -> dict[str, Any]:
         {valid: bool, language: str, tier: int, reason: str}
     """
     # TODO: Implement 3-tier validation
-    # For now, return stub
-    log.warning("tool_validate_word_slovak not fully implemented - returning stub")
+    # For now, simple heuristic to reject obviously invalid words
+    log.warning("tool_validate_word_slovak not fully implemented - using basic heuristic")
+    
+    word_upper = word.upper()
+    
+    # Basic heuristic: reject words with invalid patterns
+    # - Multiple Q's (Slovak doesn't use Q much)
+    # - XYZ pattern together
+    # - Repeated uncommon letters
+    invalid_patterns = ["XYZQQ", "QQ", "XX", "ZZZ"]
+    is_obviously_invalid = any(pattern in word_upper for pattern in invalid_patterns)
     
     return {
-        "valid": True,  # Stub: always valid for now
+        "valid": not is_obviously_invalid,
         "language": "slovak",
-        "tier": 0,  # 0 = not validated
-        "reason": "Validation not implemented - stub only",
+        "tier": 0,  # 0 = basic heuristic only
+        "reason": "Basic heuristic validation - not fully implemented",
     }
 
 

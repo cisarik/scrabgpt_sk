@@ -6,7 +6,6 @@ import logging
 import os
 from typing import Optional
 
-from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import QWidget, QHBoxLayout, QLabel, QPushButton
 from PySide6.QtGui import QFont
 

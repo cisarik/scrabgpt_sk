@@ -13,7 +13,7 @@ NOTE: This is a STUB implementation. Full MCP integration requires:
 from __future__ import annotations
 
 import logging
-from typing import Any, Optional
+from typing import Any
 
 from ..core.board import Board
 from ..core.variant_store import VariantDefinition
@@ -124,6 +124,14 @@ async def propose_move_agent(
     
     # Build context
     context = build_agent_context(board, rack, variant)
+    
+    log.debug(
+        "Prepared agent scaffolding: %d tools, %d schemas, prompt=%d chars, context=%d chars",
+        len(executor.available_tools),
+        len(tool_schemas),
+        len(system_prompt),
+        len(context),
+    )
     
     # TODO: Implement OpenAI function calling loop
     # 1. Call OpenAI with tools

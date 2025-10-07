@@ -8,14 +8,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Optional, Callable, Any
+from typing import Callable, Any
 from datetime import datetime
 
-from PySide6.QtCore import Qt, QThread, Signal, QObject
+from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtGui import QFont, QTextCursor, QCloseEvent
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QPushButton,
     QLabel, QTabWidget, QWidget, QTextEdit, QProgressBar,
+    QListWidget, QDialogButtonBox,
 )
 
 log = logging.getLogger("scrabgpt.ui.agents")
@@ -100,16 +101,24 @@ class AgentActivityWidget(QWidget):
         super().__init__(parent)
         self.agent_name = agent_name
         self._setup_ui()
-    
+        
     def _setup_ui(self) -> None:
         """Setup UI components."""
         layout = QVBoxLayout(self)
         layout.setSpacing(12)
         layout.setContentsMargins(16, 16, 16, 16)
-        
+
+        button_layout = QHBoxLayout()
+        self.html_snippet_button = QPushButton("Zobraziť HTML snippety", self)
+        self.html_snippet_button.setEnabled(False)
+        self.html_snippet_button.clicked.connect(self._show_html_snippet_dialog)
+        button_layout.addWidget(self.html_snippet_button)
+        button_layout.addStretch()
+        layout.addLayout(button_layout)
+
         # Status bar
         status_layout = QHBoxLayout()
-        
+
         self.status_label = QLabel("Pripravený")
         self.status_label.setStyleSheet(
             "color: #b6e0bd; font-weight: bold; font-size: 13px;"
@@ -119,7 +128,8 @@ class AgentActivityWidget(QWidget):
         status_layout.addStretch()
         
         self.progress_bar = QProgressBar()
-        self.progress_bar.setRange(0, 0)  # Indeterminate
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
         self.progress_bar.setVisible(False)
         self.progress_bar.setMinimumWidth(200)
         self.progress_bar.setStyleSheet(
@@ -176,7 +186,7 @@ class AgentActivityWidget(QWidget):
             "QTextEdit:focus { border-color: #4caf50; }"
         )
         layout.addWidget(self.response_text, 1)  # Stretch factor 1
-        
+
         # Clear button
         clear_btn = QPushButton("🗑️ Vymazať log")
         clear_btn.clicked.connect(self.clear_log)
@@ -188,12 +198,23 @@ class AgentActivityWidget(QWidget):
             "QPushButton:hover { background-color: #4d3a1f; border-color: #ff9800; }"
         )
         layout.addWidget(clear_btn, alignment=Qt.AlignmentFlag.AlignLeft)
-    
+       
+        self._html_snippets: list[dict[str, str]] = []
+        self._current_progress: int = 0
+
     def set_status(self, status: str, is_working: bool = False) -> None:
         """Update status label and progress bar."""
         self.status_label.setText(status)
         self.progress_bar.setVisible(is_working)
-    
+
+    def update_progress(self, percent: int | None) -> None:
+        if percent is None:
+            return
+        clamped = max(0, min(100, percent))
+        self._current_progress = clamped
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(clamped)
+
     def append_activity(self, message: str, prefix: str = "ℹ️", color: str | None = None) -> None:
         """Append message to activity log with timestamp.
         
@@ -202,6 +223,10 @@ class AgentActivityWidget(QWidget):
             prefix: Emoji prefix
             color: Optional color for message (HTML color)
         """
+        # Check if user has manually scrolled up before appending
+        scrollbar = self.activity_log.verticalScrollBar()
+        was_at_bottom = scrollbar.value() >= scrollbar.maximum() - 10  # Within 10px of bottom
+        
         timestamp = datetime.now().strftime("%H:%M:%S")
         
         if color:
@@ -212,10 +237,13 @@ class AgentActivityWidget(QWidget):
             formatted = f"[{timestamp}] {prefix} {message}"
             self.activity_log.append(formatted)
         
-        # Auto-scroll to bottom
-        cursor = self.activity_log.textCursor()
-        cursor.movePosition(QTextCursor.MoveOperation.End)
-        self.activity_log.setTextCursor(cursor)
+        # Auto-scroll to bottom ONLY if user was already at bottom
+        # This allows manual scrolling without being forced back down
+        if was_at_bottom:
+            cursor = self.activity_log.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+            self.activity_log.setTextCursor(cursor)
+            scrollbar.setValue(scrollbar.maximum())
     
     def append_thinking(self, thought: str) -> None:
         """Append agent thinking to activity log."""
@@ -232,11 +260,21 @@ class AgentActivityWidget(QWidget):
         for line in lines:
             if line.strip():
                 self.append_activity(line, prefix="  ", color="#4caf50")
-    
+
+    def add_html_snippet(self, label: str, raw_html: str, summary: str) -> None:
+        snippet = {
+            "label": label,
+            "raw": raw_html,
+            "summary": summary,
+        }
+        self._html_snippets.append(snippet)
+        self.html_snippet_button.setEnabled(True)
+        self.html_snippet_button.setText(f"Zobraziť HTML ({label})")
+
     def set_response(self, response: str) -> None:
         """Set response text (replacing previous)."""
         self.response_text.setPlainText(response)
-    
+
     def append_response(self, response: str) -> None:
         """Append to response text."""
         self.response_text.append(response)
@@ -246,6 +284,54 @@ class AgentActivityWidget(QWidget):
         self.activity_log.clear()
         self.response_text.clear()
         self.set_status("Pripravený", is_working=False)
+        self._html_snippets.clear()
+        self.html_snippet_button.setEnabled(False)
+        self.html_snippet_button.setText("Zobraziť HTML snippety")
+        self._current_progress = 0
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(False)
+
+    def _show_html_snippet_dialog(self) -> None:
+        if not self._html_snippets:
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("HTML snippety")
+        dialog.resize(900, 700)
+
+        layout = QVBoxLayout(dialog)
+        list_widget = QListWidget(dialog)
+        for snippet in self._html_snippets:
+            list_widget.addItem(snippet["label"])
+        layout.addWidget(QLabel("Vyber snippet:"))
+        layout.addWidget(list_widget)
+
+        summary_edit = QTextEdit(dialog)
+        summary_edit.setReadOnly(True)
+        summary_edit.setFont(QFont("Monospace"))
+        layout.addWidget(QLabel("Sumarizovaný text:"))
+        layout.addWidget(summary_edit, stretch=1)
+
+        raw_edit = QTextEdit(dialog)
+        raw_edit.setReadOnly(True)
+        raw_edit.setFont(QFont("Monospace"))
+        layout.addWidget(QLabel("Čisté HTML:"))
+        layout.addWidget(raw_edit, stretch=1)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, parent=dialog)
+        buttons.rejected.connect(dialog.reject)
+        buttons.accepted.connect(dialog.accept)
+        layout.addWidget(buttons)
+
+        def update(index: int) -> None:
+            if index < 0 or index >= len(self._html_snippets):
+                return
+            data = self._html_snippets[index]
+            summary_edit.setPlainText(data.get("summary", ""))
+            raw_edit.setPlainText(data.get("raw", ""))
+
+        list_widget.currentRowChanged.connect(update)
+        list_widget.setCurrentRow(len(self._html_snippets) - 1)
+        dialog.exec()
 
 
 class AgentsDialog(QDialog):

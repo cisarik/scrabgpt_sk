@@ -1,4 +1,5 @@
 from __future__ import annotations
+import asyncio
 import os
 import sys
 import uuid
@@ -49,6 +50,7 @@ from PySide6.QtWidgets import (
     QComboBox, QSizePolicy, QStyleOptionViewItem, QStyledItemDelegate, QStyle, QButtonGroup,
     QFrame,
     QAbstractButton,
+    QTextEdit,
 )
 from ..logging_setup import configure_logging, TRACE_ID_VAR, default_log_path
 
@@ -70,8 +72,10 @@ from ..ai.player import propose_move as ai_propose_move
 from ..ai.player import should_auto_trigger_ai_opening, is_board_empty
 from ..ai.openrouter import OpenRouterClient
 from ..ai.multi_model import propose_move_multi_model
+from ..ai.novita import NovitaClient
+from ..ai.novita_multi_model import propose_move_novita_multi_model
 from .prompt_editor import PromptEditorDialog
-from .agents_dialog import AgentsDialog
+from .agents_dialog import AgentsDialog, AsyncAgentWorker
 from .agent_status_widget import AgentStatusWidget
 from ..core.state import build_ai_state_dict
 from ..core.rack import consume_rack, restore_rack
@@ -84,14 +88,16 @@ from ..core.variant_store import (
     set_active_variant_slug,
 )
 from ..core.opponent_mode import OpponentMode
+from ..core.team_config import get_team_manager
 from ..ai.variants import (
     LanguageInfo,
-    download_and_store_variant,
     fetch_supported_languages,
     get_languages_for_ui,
     match_language,
+    persist_variant,
 )
-from ..ai.agent_config import discover_agents, get_default_agents_dir, get_agent_by_name
+from ..ai.variant_agent import SummaryResult, VariantBootstrapAgent, VariantBootstrapProgress
+from ..ai.agent_config import discover_agents, get_default_agents_dir
 from ..ai.internet_tools import register_internet_tools
 from .model_results import AIModelResultsTable
 
@@ -143,7 +149,7 @@ log = configure_logging()
 # ---------- Jednoduché UI prvky ----------
 
 class NewVariantDialog(QDialog):
-    """Dialog na zadanie parametrov pre stiahnutie nového Scrabble variantu."""
+    """Dialog na výber a stiahnutie Scrabble variantu cez varianta agenta."""
 
     def __init__(
         self,
@@ -152,12 +158,19 @@ class NewVariantDialog(QDialog):
         default_language: LanguageInfo | None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Nový variant Scrabble")
+        self.setWindowTitle("Nový Scrabble variant")
 
-        layout = QFormLayout(self)
-
-        self.language_combo = QComboBox(self)
         self._languages: list[LanguageInfo] = list(languages)
+        self._agent = VariantBootstrapAgent()
+        self._worker: AsyncAgentWorker | None = None
+        self._summaries: list[SummaryResult] = []
+        self.selected_summary: SummaryResult | None = None
+
+        main_layout = QVBoxLayout(self)
+        form_layout = QFormLayout()
+
+        # Jazyk + tlačidlo na načítanie
+        self.language_combo = QComboBox(self)
         for lang in self._languages:
             self.language_combo.addItem(lang.display_label(), lang)
         if default_language:
@@ -166,20 +179,35 @@ class NewVariantDialog(QDialog):
                     self.language_combo.setCurrentIndex(idx)
                     break
 
-        self.query_edit = QLineEdit(self)
-        if default_language:
-            self.query_edit.setText(default_language.name)
-        self.query_edit.setPlaceholderText("Napr. Slovenský Scrabble variant")
+        self.fetch_button = QPushButton("Načítať varianty", self)
+        self.fetch_button.clicked.connect(self._start_variant_fetch)
 
-        layout.addRow("Jazyk:", self.language_combo)
-        layout.addRow("Popis variantu:", self.query_edit)
+        lang_row = QHBoxLayout()
+        lang_row.addWidget(self.language_combo)
+        lang_row.addWidget(self.fetch_button)
+        lang_row_widget = QWidget(self)
+        lang_row_widget.setLayout(lang_row)
 
-        info = QLabel(
-            "Zadaný text sa vloží do promptu pre OpenAI. Pridaj jazyk aj prípadné "
-            "špecifiká (napr. regionálnu verziu)."
+        form_layout.addRow("Jazyk:", lang_row_widget)
+
+        self.variant_combo = QComboBox(self)
+        self.variant_combo.setEnabled(False)
+        self.variant_combo.currentIndexChanged.connect(self._on_variant_selected)
+        form_layout.addRow("Sumarizácia:", self.variant_combo)
+
+        main_layout.addLayout(form_layout)
+
+        self.status_label = QLabel(
+            "Vyber jazyk a klikni na \"Načítať varianty\". Agent stiahne oficiálne údaje z Wikipédie."
         )
-        info.setWordWrap(True)
-        layout.addRow(info)
+        self.status_label.setWordWrap(True)
+        main_layout.addWidget(self.status_label)
+
+        self.details_view = QTextEdit(self)
+        self.details_view.setReadOnly(True)
+        self.details_view.setMinimumHeight(220)
+        self.details_view.setPlaceholderText("Detaily variantu sa zobrazia po načítaní.")
+        main_layout.addWidget(self.details_view)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
@@ -187,18 +215,100 @@ class NewVariantDialog(QDialog):
         )
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
+
+        self.ok_button = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        if self.ok_button:
+            self.ok_button.setEnabled(False)
+
+        main_layout.addWidget(buttons)
 
     def selected_language(self) -> LanguageInfo | None:
         data = self.language_combo.currentData()
         return data if isinstance(data, LanguageInfo) else None
 
-    def query_text(self) -> str:
-        text = self.query_edit.text().strip()
-        if text:
-            return text
-        lang = self.selected_language()
-        return lang.name if lang else ""
+    def selected_variant(self) -> SummaryResult | None:
+        index = self.variant_combo.currentIndex()
+        if index < 0 or index >= len(self._summaries):
+            return None
+        return self._summaries[index]
+
+    def accept(self) -> None:  # noqa: D401 - Qt override
+        summary = self.selected_variant()
+        if not summary:
+            QMessageBox.warning(self, "Nový variant", "Najskôr načítaj sumarizáciu.")
+            return
+        self.selected_summary = summary
+        super().accept()
+
+    def _start_variant_fetch(self) -> None:
+        if self._worker is not None:
+            return
+
+        language = self.selected_language()
+        if not language:
+            QMessageBox.warning(self, "Nový variant", "Vyber jazyk, pre ktorý chceš načítať varianty.")
+            return
+
+        self.fetch_button.setEnabled(False)
+        self.variant_combo.setEnabled(False)
+        if self.ok_button:
+            self.ok_button.setEnabled(False)
+        self.variant_combo.clear()
+        self.details_view.clear()
+        self.status_label.setText("Pripájam sa k agentovi...")
+
+        self._worker = AsyncAgentWorker(self._agent.generate_language, language.name)
+        self._worker.progress_update.connect(self._on_agent_progress)
+        self._worker.agent_finished.connect(self._on_agent_finished)
+        self._worker.agent_error.connect(self._on_agent_error)
+        self._worker.start()
+
+    def _on_agent_progress(self, update: VariantBootstrapProgress) -> None:
+        parts = [update.status]
+        if update.detail:
+            parts.append(update.detail)
+        self.status_label.setText(" - ".join(parts))
+
+    def _on_agent_finished(self, summary: SummaryResult) -> None:
+        self._worker = None
+        self.fetch_button.setEnabled(True)
+        self._summaries = [summary]
+        self.variant_combo.clear()
+        self.variant_combo.setEnabled(True)
+        label = f"{summary.label} ({summary.file_path.name})"
+        self.variant_combo.addItem(label)
+        self.variant_combo.setCurrentIndex(0)
+        self._show_variant_details(summary)
+        self.status_label.setText(f"Sumarizácia uložená do {summary.file_path}")
+        if self.ok_button:
+            self.ok_button.setEnabled(True)
+
+    def _on_agent_error(self, error: str) -> None:
+        self._worker = None
+        self.fetch_button.setEnabled(True)
+        self.status_label.setText(f"❌ Chyba agenta: {error}")
+        QMessageBox.critical(self, "Varianty", f"Nepodarilo sa načítať varianty: {error}")
+
+    def _on_variant_selected(self, index: int) -> None:
+        if index < 0 or index >= len(self._summaries):
+            return
+        self._show_variant_details(self._summaries[index])
+
+    def _show_variant_details(self, summary: SummaryResult) -> None:
+        lines = [
+            f"Jazyk: {summary.language.display_label()}",
+            f"Súbor: {summary.file_path}",
+            "",
+            summary.summary,
+        ]
+        self.details_view.setPlainText("\n".join(lines))
+
+    def done(self, result: int) -> None:  # noqa: D401 - Qt override
+        if self._worker is not None:
+            self._worker.wait()
+            self._worker = None
+        super().done(result)
+
 
 
 class SettingsDialog(QDialog):
@@ -424,39 +534,28 @@ class SettingsDialog(QDialog):
         dialog = NewVariantDialog(self, self._languages or get_languages_for_ui(), current_lang)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
-        query = dialog.query_text().strip()
-        if not query:
-            QMessageBox.warning(self, "Nový variant", "Zadaj jazyk alebo popis variantu.")
+        definition = dialog.selected_variant()
+        if definition is None:
+            QMessageBox.warning(self, "Nový variant", "Žiadny variant nebol vybraný.")
             return
         try:
-            client = OpenAIClient()
+            stored = persist_variant(definition)
         except Exception as exc:  # noqa: BLE001
-            QMessageBox.critical(self, "Nový variant", f"OpenAI client sa nepodarilo inicializovať: {exc}")
+            log.exception("persist_variant_failed", exc_info=exc)
+            QMessageBox.critical(self, "Nový variant", f"Ukladanie variantu zlyhalo: {exc}")
             return
-        language_hint = dialog.selected_language()
-        try:
-            definition = download_and_store_variant(
-                client,
-                language_request=query,
-                language_hint=language_hint,
-            )
-        except Exception as exc:  # noqa: BLE001
-            log.exception("download_variant_failed", exc_info=exc)
-            QMessageBox.critical(self, "Nový variant", f"Získavanie variantu zlyhalo: {exc}")
-            return
-        self.selected_variant_slug = definition.slug
-        # rozšír jazykový zoznam, ak tam ešte nie je
-        if not match_language(definition.language, self._languages):
-            inferred_code = language_hint.code if language_hint else None
-            new_language = LanguageInfo(name=definition.language, code=inferred_code)
+        self.selected_variant_slug = stored.slug
+        if not match_language(stored.language, self._languages):
+            inferred_code = stored.language_code
+            new_language = LanguageInfo(name=stored.language, code=inferred_code)
             self._languages.append(new_language)
             self.languages_combo.addItem(new_language.display_label(), new_language)
-        self._load_installed_variants(select_slug=definition.slug)
-        self._sync_language_with_variant(definition.slug)
+        self._load_installed_variants(select_slug=stored.slug)
+        self._sync_language_with_variant(stored.slug)
         QMessageBox.information(
             self,
             "Nový variant",
-            f"Variant '{definition.language}' bol uložený (slug {definition.slug}).",
+            f"Variant '{stored.display_label}' bol uložený (slug {stored.slug}).",
         )
 
     def test_connection(self) -> None:
@@ -1503,10 +1602,21 @@ class MainWindow(QMainWindow):
         # OpenAI klient (lazy init po prvom pouziti ak treba)
         self.ai_client: Optional[OpenAIClient] = None
         
+        # Team manager for persisting model configurations
+        self.team_manager = get_team_manager()
+        
         # OpenRouter multi-model configuration
         self.use_multi_model: bool = False
         self.selected_ai_models: list[dict[str, Any]] = []
         self.openrouter_timeout_seconds: int = self._load_openrouter_timeout()
+        
+        # Novita multi-model configuration
+        self.use_novita: bool = False
+        self.selected_novita_models: list[dict[str, Any]] = []
+        self.novita_timeout_seconds: int = self._load_novita_timeout()
+        
+        # Load saved teams on startup
+        self._load_saved_teams()
         self.ai_move_max_tokens, self._ai_tokens_from_env = self._load_ai_move_max_tokens()
         self._user_defined_ai_tokens: bool = False
 
@@ -1854,6 +1964,45 @@ class MainWindow(QMainWindow):
         if value < 5:
             value = DEFAULT_OPENROUTER_TIMEOUT
         return value
+    
+    def _load_novita_timeout(self) -> int:
+        raw = os.getenv("NOVITA_TIMEOUT_SECONDS")
+        try:
+            value = int(raw) if raw is not None else DEFAULT_OPENROUTER_TIMEOUT
+        except ValueError:
+            value = DEFAULT_OPENROUTER_TIMEOUT
+        if value < 5:
+            value = DEFAULT_OPENROUTER_TIMEOUT
+        return value
+    
+    def _load_saved_teams(self) -> None:
+        """Load saved team configurations from disk."""
+        # Load ACTIVE OpenRouter team (not default team!)
+        openrouter_team = self.team_manager.load_active_team_config("openrouter")
+        if openrouter_team:
+            # Convert IDs to minimal model objects needed for runtime
+            self.selected_ai_models = [{"id": mid, "name": mid} for mid in openrouter_team.model_ids]
+            self.use_multi_model = len(openrouter_team.model_ids) > 0
+            self.openrouter_timeout_seconds = openrouter_team.timeout_seconds
+            log.info("Loaded ACTIVE OpenRouter team '%s': %d models", openrouter_team.name, len(openrouter_team.model_ids))
+        
+        # Load ACTIVE Novita team (not default team!)
+        novita_team = self.team_manager.load_active_team_config("novita")
+        if novita_team:
+            # Convert IDs to minimal model objects needed for runtime
+            self.selected_novita_models = [{"id": mid, "name": mid} for mid in novita_team.model_ids]
+            self.use_novita = len(novita_team.model_ids) > 0
+            self.novita_timeout_seconds = novita_team.timeout_seconds
+            log.info("Loaded ACTIVE Novita team '%s': %d models", novita_team.name, len(novita_team.model_ids))
+        
+        # Load saved opponent mode
+        saved_mode = self.team_manager.load_opponent_mode()
+        if saved_mode:
+            try:
+                self.opponent_mode = OpponentMode(saved_mode)
+                log.info("Loaded opponent mode from config: %s", self.opponent_mode.value)
+            except ValueError:
+                log.warning("Invalid opponent mode in config: %s", saved_mode)
 
     @staticmethod
     def _load_ai_move_max_tokens() -> tuple[int, bool]:
@@ -1975,6 +2124,9 @@ class MainWindow(QMainWindow):
         # Základný placeholder pre žreb štartéra (MVP skeleton)
         from ..core.tiles import TileBag
         self._exit_exchange_mode()
+        
+        # Reload teams before starting new game (in case settings changed)
+        self._load_saved_teams()
         
         # Mark game as in progress
         self.game_in_progress = True
@@ -3109,6 +3261,8 @@ class MainWindow(QMainWindow):
                 selected_models: list[dict[str, Any]],
                 board: Board,
                 timeout_seconds: int,
+                *,
+                provider_type: str = "openrouter",
             ) -> None:
                 super().__init__()
                 self.client = client
@@ -3119,52 +3273,97 @@ class MainWindow(QMainWindow):
                 self.selected_models = selected_models
                 self.board = board
                 self.timeout_seconds = timeout_seconds
+                self.provider_type = provider_type
             def run(self) -> None:
                 try:
                     TRACE_ID_VAR.set(self.trace_id)
                     if self.use_multi_model and self.selected_models:
-                        import asyncio
                         import os
-                        api_key = os.getenv("OPENROUTER_API_KEY", "")
-                        openrouter_client = OpenRouterClient(
-                            api_key,
-                            timeout_seconds=self.timeout_seconds,
-                        )
                         
-                        async def run_multi() -> tuple[dict[str, Any], list[dict[str, Any]]]:
-                            def on_partial(res: dict[str, Any]) -> None:
-                                self.partial_result.emit(res)
-
-                            try:
-                                move, results = await propose_move_multi_model(
-                                    openrouter_client,
-                                    self.selected_models,
-                                    self.state_str,
-                                    self.variant,
-                                    self.board,
-                                    self.client,
-                                    progress_callback=on_partial,
-                                    timeout_seconds=self.timeout_seconds,
-                                )
-                            finally:
-                                await openrouter_client.close()
-
-                            log.info(
-                                "Multi-model: %d models, best score from %s",
-                                len(results),
-                                next(
-                                    (
-                                        r.get("model_name")
-                                        for r in results
-                                        if r.get("status") == "ok"
-                                    ),
-                                    "?",
-                                ),
+                        if self.provider_type == "novita":
+                            # Novita multi-model
+                            api_key = os.getenv("NOVITA_API_KEY", "")
+                            novita_client = NovitaClient(
+                                api_key,
+                                timeout_seconds=self.timeout_seconds,
                             )
-                            return move, results
-                        
-                        resp, results = asyncio.run(run_multi())
-                        self.multi_model_results.emit(results)
+                            
+                            async def run_novita_multi() -> tuple[dict[str, Any], list[dict[str, Any]]]:
+                                def on_partial(res: dict[str, Any]) -> None:
+                                    self.partial_result.emit(res)
+
+                                try:
+                                    move, results = await propose_move_novita_multi_model(
+                                        novita_client,
+                                        self.selected_models,
+                                        self.state_str,
+                                        self.variant,
+                                        self.board,
+                                        self.client,
+                                        progress_callback=on_partial,
+                                        timeout_seconds=self.timeout_seconds,
+                                    )
+                                finally:
+                                    await novita_client.close()
+
+                                log.info(
+                                    "Novita multi-model: %d models, best score from %s",
+                                    len(results),
+                                    next(
+                                        (
+                                            r.get("model_name")
+                                            for r in results
+                                            if r.get("status") == "ok"
+                                        ),
+                                        "?",
+                                    ),
+                                )
+                                return move, results
+                            
+                            resp, results = asyncio.run(run_novita_multi())
+                            self.multi_model_results.emit(results)
+                        else:
+                            # OpenRouter multi-model
+                            api_key = os.getenv("OPENROUTER_API_KEY", "")
+                            openrouter_client = OpenRouterClient(
+                                api_key,
+                                timeout_seconds=self.timeout_seconds,
+                            )
+                            
+                            async def run_multi() -> tuple[dict[str, Any], list[dict[str, Any]]]:
+                                def on_partial(res: dict[str, Any]) -> None:
+                                    self.partial_result.emit(res)
+
+                                try:
+                                    move, results = await propose_move_multi_model(
+                                        openrouter_client,
+                                        self.selected_models,
+                                        self.state_str,
+                                        self.variant,
+                                        self.board,
+                                        self.client,
+                                        progress_callback=on_partial,
+                                        timeout_seconds=self.timeout_seconds,
+                                    )
+                                finally:
+                                    await openrouter_client.close()
+
+                                log.info(
+                                    "Multi-model: %d models, best score from %s",
+                                    len(results),
+                                    next(
+                                        (
+                                            r.get("model_name")
+                                            for r in results
+                                            if r.get("status") == "ok"
+                                        ),
+                                        "?",
+                                    ),
+                                )
+                                return move, results
+                            
+                            resp, results = asyncio.run(run_multi())
+                            self.multi_model_results.emit(results)
                     else:
                         resp = ai_propose_move(
                             client=self.client,
@@ -3176,19 +3375,46 @@ class MainWindow(QMainWindow):
                     self.failed.emit(e)
 
         self._ai_thread = QThread(self)
+        
+        # Determine provider type and models/timeout based on opponent mode
+        provider_type = "openrouter"  # default
+        selected_models = []
+        timeout_seconds = self.openrouter_timeout_seconds
+        use_multi = False
+        
+        log.info("AI turn: opponent_mode=%s", self.opponent_mode)
+        log.info("Available: OpenRouter models=%d, Novita models=%d", 
+                 len(self.selected_ai_models), len(self.selected_novita_models))
+        
+        if self.opponent_mode == OpponentMode.OPENROUTER and self.selected_ai_models:
+            provider_type = "openrouter"
+            selected_models = self.selected_ai_models
+            timeout_seconds = self.openrouter_timeout_seconds
+            use_multi = True
+            log.info("Using OpenRouter with %d models", len(selected_models))
+        elif self.opponent_mode == OpponentMode.NOVITA and self.selected_novita_models:
+            provider_type = "novita"
+            selected_models = self.selected_novita_models
+            timeout_seconds = self.novita_timeout_seconds
+            use_multi = True
+            log.info("Using Novita with %d models", len(selected_models))
+        else:
+            log.info("Using single-model mode (opponent_mode=%s)", self.opponent_mode)
+        
         self._ai_worker = ProposeWorker(
             self.ai_client,
             compact,
             TRACE_ID_VAR.get(),
             self.variant_definition,
-            self.use_multi_model,
-            self.selected_ai_models,
+            use_multi,
+            selected_models,
             self.board,
-            self.openrouter_timeout_seconds,
+            timeout_seconds,
+            provider_type=provider_type,
         )
 
-        if self.use_multi_model and self.selected_ai_models:
-            self.model_results_table.initialize_models(self.selected_ai_models)
+        if use_multi and selected_models:
+            self.model_results_table.initialize_models(selected_models)
         else:
             self.model_results_table.clear_results()
 
@@ -3204,14 +3430,15 @@ class MainWindow(QMainWindow):
         self._ai_thread.start()
         
         # Update status to show models are being called
-        if self.use_multi_model and self.selected_ai_models:
-            model_count = len(self.selected_ai_models)
+        if use_multi and selected_models:
+            model_count = len(selected_models)
+            provider_name = "Novita" if provider_type == "novita" else "OpenRouter"
             model_names = ", ".join(
-                [m.get("name", m.get("id", "?"))[:20] for m in self.selected_ai_models[:3]]
+                [m.get("name", m.get("id", "?"))[:20] for m in selected_models[:3]]
             )
             if model_count > 3:
                 model_names += f" +{model_count - 3} ďalších"
-            self.status.showMessage(f"Volám {model_count} modelov: {model_names}...")
+            self.status.showMessage(f"[{provider_name}] Volám {model_count} modelov: {model_names}...")
     
     def _on_multi_model_partial(self, result: dict[str, Any]) -> None:
         """Handle incremental model result updates."""
@@ -3738,8 +3965,9 @@ class MainWindow(QMainWindow):
             repro_seed=self.repro_seed,
             active_tab_index=0,  # Open General tab (default, most important settings)
         )
-        ok = dlg.exec()
-        if ok:
+        
+        # Connect accepted signal to handle dialog results
+        def on_settings_accepted():
             new_ai_tokens, from_env = self._load_ai_move_max_tokens()
             self.ai_move_max_tokens = new_ai_tokens
             self._ai_tokens_from_env = from_env
@@ -3767,6 +3995,12 @@ class MainWindow(QMainWindow):
                 )
             else:
                 self.status.showMessage("Nastavenia uložené.", 2000)
+        
+        # Connect signal and show dialog (non-blocking, non-modal)
+        dlg.accepted.connect(on_settings_accepted)
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
 
     def _set_game_ui_visible(self, visible: bool) -> None:
         """Prepína panel so skóre a rackom podľa toho, či je aktívna hra."""
@@ -3983,28 +4217,55 @@ class MainWindow(QMainWindow):
             active_tab_index=1,  # Open AI opponent tab
         )
         
-        if dialog.exec() == QDialog.DialogCode.Accepted:
+        # Connect accepted signal to handle dialog results
+        def on_opponent_settings_accepted():
             new_mode = dialog.get_selected_mode()
             new_agent = dialog.get_selected_agent_name()
+            
+            log.info("=== Settings Accepted: mode=%s, agent=%s ===", new_mode.value, new_agent)
             
             # Store settings
             self.opponent_mode = new_mode
             self.selected_agent_name = new_agent
             
-            # Check if OpenRouter models were configured
+            # Save opponent mode to config
+            self.team_manager.save_opponent_mode(new_mode.value)
+            log.info("Saved opponent mode to config: %s", new_mode.value)
+            
+            # Check if any models were configured
             openrouter_models = dialog.get_selected_openrouter_models()
+            novita_models = dialog.get_selected_novita_models()
+            
+            if openrouter_models or novita_models:
+                # Models were configured - reload everything from disk
+                # This ensures we get the correct team with proper IDs
+                self._load_saved_teams()
+                log.info("Reloaded teams after configuration")
+            
+            # Update token settings if changed
             if openrouter_models:
-                self.selected_ai_models = openrouter_models
-                self.use_multi_model = True
-                self.ai_move_max_tokens = dialog.get_openrouter_tokens()
-                self._user_defined_ai_tokens = True
-                self._update_max_tokens_label()
-                try:
-                    if self.ai_client is not None:
-                        self.ai_client.ai_move_max_output_tokens = self.ai_move_max_tokens
-                except Exception:
-                    pass
-                log.info("OpenRouter models updated: %d models", len(openrouter_models))
+                openrouter_timeout = dialog.get_openrouter_tokens()
+                if openrouter_timeout:
+                    self.ai_move_max_tokens = openrouter_timeout
+                    self._user_defined_ai_tokens = True
+                    self._update_max_tokens_label()
+                    try:
+                        if self.ai_client is not None:
+                            self.ai_client.ai_move_max_output_tokens = self.ai_move_max_tokens
+                    except Exception:
+                        pass
+            
+            if novita_models:
+                novita_tokens = dialog.get_novita_tokens()
+                if novita_tokens:
+                    self.ai_move_max_tokens = novita_tokens
+                    self._user_defined_ai_tokens = True
+                    self._update_max_tokens_label()
+                    try:
+                        if self.ai_client is not None:
+                            self.ai_client.ai_move_max_output_tokens = novita_tokens
+                    except Exception:
+                        pass
             
             # Update status message
             mode_name = new_mode.display_name_sk
@@ -4014,6 +4275,12 @@ class MainWindow(QMainWindow):
                 self.status.showMessage(f"AI Režim: {mode_name}")
             
             log.info("Opponent settings changed: mode=%s, agent=%s", new_mode.value, new_agent)
+        
+        # Show dialog (non-blocking, non-modal)
+        dialog.accepted.connect(on_opponent_settings_accepted)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
     
     def configure_openrouter_models(self) -> None:
         """Configure OpenRouter models for multi-model gameplay."""

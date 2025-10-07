@@ -9,11 +9,12 @@ from typing import Any
 from PySide6.QtCore import Qt, QThread, QObject, Signal
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QCheckBox, QSpinBox, QScrollArea, QWidget, QMessageBox,
-    QProgressBar, QFrame, QComboBox, QLineEdit,
+    QCheckBox, QScrollArea, QWidget, QMessageBox,
+    QProgressBar, QFrame, QComboBox, QLineEdit, QInputDialog,
 )
 
 from ..ai.openrouter import OpenRouterClient, calculate_estimated_cost
+from ..core.team_config import TeamConfig, get_team_manager
 
 log = logging.getLogger("scrabgpt.ui")
 
@@ -53,11 +54,12 @@ class AIConfigDialog(QDialog):
         *,
         default_tokens: int = 3600,
         lock_default: bool = False,
+        current_team_name: str | None = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Nastaviť AI Modely (Top Weekly)")
         self.setModal(True)
-        self.resize(950, 650)
+        self.resize(950, 700)
         
         self.models: list[dict[str, Any]] = []
         self.sorted_models: list[dict[str, Any]] = []
@@ -75,6 +77,10 @@ class AIConfigDialog(QDialog):
         self.search_edit: QLineEdit | None = None
         self._search_text: str = ""
         self._selection_state: dict[str, bool] = {}
+        self.team_manager = get_team_manager()
+        self.current_team_name = current_team_name or self.team_manager.load_active_team("openrouter")
+        self.team_combo: QComboBox | None = None
+        self.ok_btn: QPushButton | None = None
         self.sort_options: list[tuple[str, str]] = [
             ("Top Weekly", "top_weekly"),
             ("Newest", "newest"),
@@ -101,9 +107,41 @@ class AIConfigDialog(QDialog):
 
         controls_layout = QHBoxLayout()
         controls_layout.setSpacing(8)
+        
+        # Team selector
+        team_label = QLabel("Team:")
+        team_label.setStyleSheet("font-size: 13px; font-weight: bold; color: #9ad0a2;")
+        controls_layout.addWidget(team_label)
+        
+        self.team_combo = QComboBox()
+        self.team_combo.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.team_combo.setStyleSheet(
+            "QComboBox { "
+            "font-size: 13px; font-weight: bold; color: #e6f7eb; padding: 6px 12px; "
+            "background: #173422; border: 1px solid #2f5c39; border-radius: 6px;"
+            "} "
+            "QComboBox::drop-down { border: none; width: 24px; } "
+            "QComboBox QAbstractItemView { "
+            "font-size: 13px; background: #0f1a12; color: #e6f7eb; "
+            "selection-background-color: #295c33; selection-color: #e6f7eb; "
+            "border: 1px solid #2f5c39; "
+            "}"
+        )
+        controls_layout.addWidget(self.team_combo)
+        
+        # New/Rename team buttons
+        new_team_btn = QPushButton("+ Nový")
+        new_team_btn.setStyleSheet(self._small_button_style())
+        new_team_btn.clicked.connect(self._create_new_team)
+        controls_layout.addWidget(new_team_btn)
+        
+        rename_team_btn = QPushButton("✎ Premenovať")
+        rename_team_btn.setStyleSheet(self._small_button_style())
+        rename_team_btn.clicked.connect(self._rename_team)
+        controls_layout.addWidget(rename_team_btn)
 
         sort_caption = QLabel("Zoradenie:")
-        sort_caption.setStyleSheet("font-size: 13px; font-weight: bold; color: #9ad0a2;")
+        sort_caption.setStyleSheet("font-size: 13px; font-weight: bold; color: #9ad0a2; margin-left: 16px;")
         controls_layout.addWidget(sort_caption)
 
         self.sort_combo = QComboBox()
@@ -249,6 +287,11 @@ class AIConfigDialog(QDialog):
         button_layout.addWidget(self.ok_btn)
 
         layout.addLayout(button_layout)
+        
+        # Now connect team combo signal and populate (after all widgets exist)
+        if self.team_combo:
+            self._populate_team_combo()
+            self.team_combo.currentIndexChanged.connect(self._on_team_changed)
 
     def _current_sort_key(self) -> str:
         """Return the currently selected sort key."""
@@ -402,6 +445,10 @@ class AIConfigDialog(QDialog):
             if model.get("id")
         }
         # Token limit is now managed in settings, not dynamically updated
+        
+        # Load active team's selections after models are loaded
+        if self.current_team_name:
+            self._load_team_selections(self.current_team_name)
         current_sort_key = self._current_sort_key()
         self._apply_sort(current_sort_key)
 
@@ -648,31 +695,16 @@ class AIConfigDialog(QDialog):
 
     def _shared_tokens_value(self) -> int:
         """Return the token cap shared across selected models."""
-
-        if self.shared_tokens_spinbox is None:
-            return self._default_shared_tokens
-        return self.shared_tokens_spinbox.value()
+        return self._default_shared_tokens
 
     def _set_shared_tokens_value(self, value: int) -> None:
-        """Update the shared spinbox without triggering customization flags."""
-
-        if self.shared_tokens_spinbox is None:
-            return
-
-        self._updating_shared_tokens = True
-        self.shared_tokens_spinbox.setValue(value)
-        self._updating_shared_tokens = False
-        self._update_shared_tokens_caption()
+        """Update the shared tokens value."""
+        self._default_shared_tokens = value
 
     def _update_shared_tokens_caption(self) -> None:
         """Refresh the caption showing the current shared token limit."""
-
-        if self.shared_tokens_label is None:
-            return
-        self.shared_tokens_label.setText("Maximálne tokenov na ťah:")
-        self.shared_tokens_label.setToolTip(
-            f"Aktuálny limit: {self._shared_tokens_value()} tokenov"
-        )
+        # No-op since we don't have a spinbox anymore
+        pass
 
     def _maybe_update_shared_tokens_default(self) -> None:
         """Apply a context-aware default when the user has not changed it yet."""
@@ -794,7 +826,174 @@ class AIConfigDialog(QDialog):
             QMessageBox.warning(self, "Modely", "Vyber aspoň jeden model.")
             return
         
+        # Save team (always save - create default name if needed)
+        from datetime import datetime
+        
+        # If no team name or "[ Nový team ]", create default name
+        if not self.current_team_name or self.current_team_name == "[ Nový team ]":
+            self.current_team_name = "OpenRouter Team"
+            log.info("Auto-creating OpenRouter team with default name: %s", self.current_team_name)
+        
+        selected_ids = [m["id"] for m in self.selected_models if m.get("id")]
+        team = TeamConfig(
+            name=self.current_team_name,
+            provider="openrouter",
+            model_ids=selected_ids,  # Just IDs, not full objects
+            timeout_seconds=120,
+            created_at=datetime.now().isoformat(),
+            updated_at=datetime.now().isoformat(),
+        )
+        self.team_manager.save_team(team)
+        self.team_manager.save_active_team("openrouter", self.current_team_name)
+        log.info("Saved OpenRouter team '%s' with %d model IDs", self.current_team_name, len(selected_ids))
+        
         self.accept()
+    
+    def _small_button_style(self) -> str:
+        return (
+            "QPushButton { "
+            "background: #2f8f46; color: #0b1c00; font-weight: bold; "
+            "padding: 6px 12px; border-radius: 6px; font-size: 11px; border: 1px solid #246c34; "
+            "} "
+            "QPushButton:hover { background: #3fa75a; } "
+            "QPushButton:pressed { background: #236a34; color: #d7f4dd; }"
+        )
+    
+    def _populate_team_combo(self) -> None:
+        """Populate team selector with available teams."""
+        if self.team_combo is None:
+            return
+        
+        # Block signals during population to avoid triggering _on_team_changed
+        self.team_combo.blockSignals(True)
+        try:
+            self.team_combo.clear()
+            
+            # Load existing teams
+            teams = self.team_manager.list_teams("openrouter")
+            
+            # Add "New Team" option first
+            self.team_combo.addItem("[ Nový team ]", None)
+            
+            # Add existing teams
+            for team in teams:
+                self.team_combo.addItem(team.name, team.name)
+            
+            # Select current team if specified
+            if self.current_team_name:
+                for i in range(self.team_combo.count()):
+                    if self.team_combo.itemData(i) == self.current_team_name:
+                        self.team_combo.setCurrentIndex(i)
+                        break
+        finally:
+            self.team_combo.blockSignals(False)
+    
+    def _load_team_selections(self, team_name: str) -> None:
+        """Load team's model selections and check the appropriate checkboxes.
+        
+        Args:
+            team_name: Name of team to load
+        """
+        if not team_name:
+            return
+        
+        # Load this specific team's configuration if it exists
+        team_path = self.team_manager.get_team_path("openrouter", team_name)
+        if not team_path.exists():
+            # Team doesn't exist yet (newly created) - keep current selections
+            log.info("Team '%s' is new, keeping current selections", team_name)
+            return
+        
+        try:
+            import json
+            with team_path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            team = TeamConfig.from_dict(data)
+            
+            # Clear current selections and load team's saved selections
+            self._clear_selection()
+            for model_id in team.model_ids:
+                if model_id in self.model_checkboxes:
+                    self.model_checkboxes[model_id].setChecked(True)
+                    self._selection_state[model_id] = True
+                else:
+                    log.warning("Model '%s' from team not found in available models", model_id)
+            
+            self._update_cost()
+            log.info("Loaded team '%s' with %d models", team_name, len(team.model_ids))
+        except Exception as e:
+            log.warning("Failed to load team '%s': %s", team_name, e)
+            # Don't clear on error - keep current selections
+    
+    def _on_team_changed(self, index: int) -> None:
+        """Handle team selection change."""
+        if self.team_combo is None:
+            return
+        
+        team_name = self.team_combo.itemData(index)
+        
+        if team_name is None:
+            # "[ Nový team ]" selected - clear selections for fresh start
+            self._clear_selection()
+            self.current_team_name = None
+            return
+        
+        # Update current team name
+        self.current_team_name = team_name
+        
+        # Load team selections (only works if models are already loaded)
+        self._load_team_selections(team_name)
+    
+    def _create_new_team(self) -> None:
+        """Create a new team."""
+        team_name, ok = QInputDialog.getText(
+            self,
+            "Nový Team",
+            "Zadajte názov nového teamu:",
+            text="OpenRouter Team"
+        )
+        
+        if ok and team_name:
+            # Add to combo
+            if self.team_combo:
+                # Block signals to prevent _on_team_changed from triggering
+                self.team_combo.blockSignals(True)
+                self.team_combo.addItem(team_name, team_name)
+                # Select the new team
+                self.team_combo.setCurrentIndex(self.team_combo.count() - 1)
+                self.team_combo.blockSignals(False)
+                
+                # Update current team name
+                self.current_team_name = team_name
+                # Don't clear selections - keep what user has already selected
+                log.info("Created new team '%s' with current selections", team_name)
+    
+    def _rename_team(self) -> None:
+        """Rename current team."""
+        if not self.team_combo or not self.current_team_name:
+            QMessageBox.warning(self, "Premenovať", "Vyberte team na premenovanie.")
+            return
+        
+        new_name, ok = QInputDialog.getText(
+            self,
+            "Premenovať Team",
+            "Zadajte nový názov:",
+            text=self.current_team_name
+        )
+        
+        if ok and new_name and new_name != self.current_team_name:
+            # Update combo
+            current_index = self.team_combo.currentIndex()
+            self.team_combo.setItemText(current_index, new_name)
+            self.team_combo.setItemData(current_index, new_name)
+            self.current_team_name = new_name
+    
+    def _clear_selection(self) -> None:
+        """Clear all model selections."""
+        for checkbox in self.model_checkboxes.values():
+            checkbox.setChecked(False)
+        self._selection_state.clear()
+        self._update_cost()
     
     def get_selected_models(self) -> list[dict[str, Any]]:
         """Get selected models with their configurations."""

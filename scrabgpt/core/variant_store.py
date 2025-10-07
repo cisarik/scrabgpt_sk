@@ -4,7 +4,7 @@ import json
 import logging
 import unicodedata
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
@@ -37,6 +37,9 @@ class VariantDefinition:
     letters: tuple[VariantLetter, ...]
     source: str = "openai"
     fetched_at: str | None = None
+    variant_name: str | None = None
+    language_code: str | None = None
+    source_url: str | None = None
 
     @property
     def distribution(self) -> dict[str, int]:
@@ -49,6 +52,14 @@ class VariantDefinition:
     @property
     def total_tiles(self) -> int:
         return sum(letter.count for letter in self.letters)
+
+    @property
+    def display_label(self) -> str:
+        """Label combining language and variant name for UI selections."""
+
+        if self.variant_name:
+            return f"{self.language} – {self.variant_name}"
+        return self.language
 
 
 # --- Interné helpery -----------------------------------------------------
@@ -122,9 +133,19 @@ def _coerce_int(value: object) -> int:
 def _load_variant_from_path(path: Path) -> VariantDefinition:
     data = json.loads(path.read_text(encoding="utf-8"))
     language = str(data.get("language") or data.get("name") or "Unknown")
+    language_code_raw = data.get("language_code") or data.get("code")
+    language_code = (
+        str(language_code_raw).strip() if isinstance(language_code_raw, str) and language_code_raw else None
+    )
+    variant_name_raw = data.get("variant_name") or data.get("variant")
+    variant_name = (
+        str(variant_name_raw).strip() if isinstance(variant_name_raw, str) and variant_name_raw else None
+    )
     slug = slugify(str(data.get("slug") or path.stem))
     source = str(data.get("source", "openai"))
     fetched_at = data.get("fetched_at")
+    source_url_raw = data.get("source_url")
+    source_url = str(source_url_raw).strip() if isinstance(source_url_raw, str) and source_url_raw else None
     letters_raw: Iterable[dict[str, object]] = data.get("letters", [])
 
     letters: list[VariantLetter] = []
@@ -166,6 +187,9 @@ def _load_variant_from_path(path: Path) -> VariantDefinition:
         letters=tuple(sorted(letters, key=lambda letter: letter.letter)),
         source=source,
         fetched_at=str(fetched_at) if fetched_at else None,
+        variant_name=variant_name,
+        language_code=language_code,
+        source_url=source_url,
     )
 
 
@@ -187,7 +211,7 @@ _BUILTIN_ENGLISH_DATA = {
     "language": "English",
     "slug": _DEFAULT_VARIANT_SLUG,
     "source": "builtin",
-    "fetched_at": datetime.utcnow().isoformat(timespec="seconds"),
+    "fetched_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     "letters": [
         {"letter": "?", "count": 2, "points": 0},
         {"letter": "A", "count": 9, "points": 1},
@@ -228,7 +252,7 @@ def ensure_builtin_variant() -> None:
         return
     log.info("creating_builtin_variant path=%s", path)
     payload = dict(_BUILTIN_ENGLISH_DATA)
-    payload["fetched_at"] = datetime.utcnow().isoformat(timespec="seconds")
+    payload["fetched_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
@@ -264,12 +288,19 @@ def save_variant(defn: VariantDefinition) -> Path:
         "language": defn.language,
         "slug": defn.slug,
         "source": defn.source,
-        "fetched_at": defn.fetched_at or datetime.utcnow().isoformat(timespec="seconds"),
+        "fetched_at": defn.fetched_at or datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "letters": [
             {"letter": letter.letter, "count": letter.count, "points": letter.points}
             for letter in defn.letters
         ],
     }
+    if defn.variant_name:
+        payload["variant_name"] = defn.variant_name
+    if defn.language_code:
+        payload["language_code"] = defn.language_code
+        payload["code"] = defn.language_code  # legacy key for compatibility
+    if defn.source_url:
+        payload["source_url"] = defn.source_url
     path = _variant_path(defn.slug)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return path

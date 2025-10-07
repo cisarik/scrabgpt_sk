@@ -12,7 +12,6 @@ import logging
 from typing import Any
 from datetime import datetime, timedelta
 
-import httpx
 from openai import OpenAI
 
 log = logging.getLogger("scrabgpt.ai.model_fetcher")

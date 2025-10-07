@@ -2,24 +2,46 @@
 
 ## Project Structure & Module Organization
 `scrabgpt/` holds all runtime code organized into clear domains:
-- **`core/`** — Pure domain logic: board math, rules, scoring, tile management. Zero dependencies on UI or network.
+- **`core/`** — Pure domain logic (board, scoring, rules, tiles) plus `team_config.py` for
+  persistent teams and opponent mode.
 - **`ai/`** — AI integration layer:
   - `client.py` — OpenAI client wrapper
   - `judge.py`, `player.py` — Single-model AI judge and player
   - `openrouter.py` — OpenRouter API client for multi-model support
   - `multi_model.py` — Multi-model orchestration, concurrent execution, GPT fallback parser
+  - `novita.py` — Novita API client (OpenAI-compatible HTTP surface)
+  - `novita_multi_model.py` — Novita orchestration mirroring OpenRouter flow
   - `schema.py` — Pydantic models for structured AI responses
+  - `variant_agent.py` — Bootstrap agent for Wikipedia Scrabble summaries
+  - `wiki_loader.py` — Cached Wikipedia fetch + fragment parsing helpers
 - **`ui/`** — PySide6 widgets and dialogs:
   - `app.py` — Main application window and game loop
   - `board_view.py`, `rack_view.py` — Game board and tile rack widgets
   - `ai_config.py` — Multi-model configuration dialog
+  - `novita_config_dialog.py` — Novita model browser with search/filter
   - `model_results.py` — Competition results table
   - `response_detail.py` — Raw response viewer with GPT analysis
+  - `team_details_dialog.py` — Saved team overview and management
+  - `opponent_mode_selector.py` — Provider selection radio group
   - `prompt_editor.py`, `iq_creator.py` — Prompt and IQ test management (experimental)
-- **`assets/`** — Static data: `premiums.json` for board premium squares
+- **`assets/`** — Static data: `premiums.json` for board premium squares, cached
+  `variants/wikipedia_scrabble_cache.html`, generated
+  `variants/lang_summarizations/` (gitignored summaries)
 - **`logging_setup.py`** — Rich logging configuration
+- **`docs/`** — Deep dives (`NOVITA_INTEGRATION.md`, `NOVITA_QUICKSTART.md`,
+  `PERSISTENCE_FIX.md`, `TEAMS_FEATURE.md`)
 
 **Tests** live in `tests/`, mirroring domain areas. Add fixtures beside the scenarios they support. **Utility scripts** stay in `tools/` (e.g., `clear.sh`). **Documentation** includes `README.md` (user-facing), `PRD.md` (product spec), and `docs/` (detailed feature documentation). The `prompts/` directory holds prompt templates for AI models.
+
+## Environment Variables
+- `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `NOVITA_API_KEY` set provider access; Novita entries are
+  optional unless the Novita mode is used.
+- `OPENROUTER_MAX_TOKENS` and `NOVITA_MAX_TOKENS` cap per-move completions; defaults exist in
+  `.env.example`.
+- `OPENROUTER_TIMEOUT_SECONDS` and `NOVITA_TIMEOUT_SECONDS` control request budgets and feed the
+  UI sliders.
+- `SHOW_AGENT_ACTIVITY_AUTO` toggles automatic Agents dialog visibility after operations.
+- Config persistence writes to `~/.scrabgpt/config.json` and `~/.scrabgpt/teams/` outside the repo.
 
 ## Build, Test, and Development Commands
 `poetry install` provisions dependencies and the virtualenv. Run the desktop app via `poetry run python -m scrabgpt.ui.app` or the CLI shim `poetry run scrabgpt`. Execute automated checks with `poetry run pytest`, optionally `-k keyword` for a subset. Enforce style through `poetry run ruff check` (add `--fix` when safe) and typing with `poetry run mypy`. Run commands from the repo root so relative paths resolve.
@@ -154,6 +176,35 @@ progress_bar.setFixedWidth(200)
 progress_bar.setMinimumWidth(200)
 layout.addWidget(progress_bar, stretch=2)
 ```
+
+## Key Workflows
+
+### Multi-provider AI
+- `OpponentMode` now includes Novita; UI radio buttons feed provider-specific dialogs.
+- `NovitaConfigDialog` fetches models via `NovitaClient.fetch_models()` with category grouping.
+- `ProposeWorker` chooses `openrouter` vs `novita` orchestration and streams progress updates to UI.
+- Response detail dialog preserves `reasoning_content` for Novita reasoning models.
+
+### Team Persistence
+- `TeamManager` stores per-provider JSON under `~/.scrabgpt/teams/`; helper methods load/save
+  models plus timeout.
+- App startup (`MainWindow._load_saved_teams`) preloads teams and restores opponent mode from
+  `~/.scrabgpt/config.json`.
+- Settings dialog calls `save_provider_models()` after confirmation; alerts replaced with logs.
+- CLI script `tools/test_teams.py` verifies file writes, reloads, and cleanup.
+
+### Variant Bootstrap Pipeline
+- `VariantBootstrapAgent.bootstrap()` downloads or reuses cached Wikipedia HTML and extracts
+  language fragments.
+- Outputs land in `assets/variants/lang_summarizations/`; `.gitignore` excludes the folder.
+- Agents dialog shows HTML snippets via `VariantBootstrapProgress` for transparency.
+- Tests in `tests/test_variant_agent.py` cover parsing, filtering, and file persistence.
+
+### Tooling & Docs
+- Docs: `NOVITA_INTEGRATION.md`, `NOVITA_QUICKSTART.md`, `TEAMS_FEATURE.md`,
+  `PERSISTENCE_FIX.md` describe architecture, setup, and fixes.
+- Utilities: `tools/parse_wikipedia_languages.py`, `tools/test_novita.py`, and
+  `tools/test_teams.py` provide reproducible sanity checks.
 
 ## Testing Guidelines
 Tests follow the `tests/test_<feature>.py` pattern and use pytest. Name functions `test_<behavior>_<condition>` to clarify intent. 

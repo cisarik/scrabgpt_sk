@@ -1,7 +1,10 @@
 
 # ScrabGPT
 
-Cross‑platform Python desktop app to play Scrabble vs **GPT‑5‑mini** with multi-model AI support and agent-based gameplay.
+Cross‑platform Python desktop app to play Scrabble against multiple AI models at once.
+
+Supports OpenRouter and Novita reasoning providers, persists team presets per provider, and ships
+with tooling to bootstrap localized variants from Wikipedia data.
 
 MVP demonstrates:
 - clean domain core (board, scoring, rules),
@@ -22,10 +25,21 @@ poetry run python -m scrabgpt.ui.app
 > All OpenAI requests/responses are pretty-printed to the terminal (key masked).
 > Agent activities are tracked in real-time with OpenAI-style animations.
 
+## Multi-provider AI setup
+- `OpenRouter`: keep `OPENROUTER_API_KEY` in `.env`, configure models in **Nastavenia → AI
+  Protivník**, and use the multi-model dialog to pick up to 10 competitors.
+- `Novita`: add `NOVITA_API_KEY`, optional `NOVITA_MAX_TOKENS`, and
+  `NOVITA_TIMEOUT_SECONDS`; select **Novita AI** in the same settings tab to launch the
+  dedicated model browser with reasoning metadata.
+- `Teams`: selections persist under `~/.scrabgpt/teams/*.json`; the app loads them on
+  startup and also restores the last opponent mode from `~/.scrabgpt/config.json`.
+- Docs: see `docs/NOVITA_INTEGRATION.md`, `docs/NOVITA_QUICKSTART.md`, and
+  `docs/PERSISTENCE_FIX.md` for setup, troubleshooting, and persistence details.
+
 ## AI player prompt rules
 
-- The AI must not “glue” its letters to adjacent existing strings unless the entire resulting contiguous main string is a valid English word. Prefer proper hooks/intersections.
-- The returned `word` must exactly match the final main word formed on the board (existing letters + placements).
+- The AI may hook onto existing strings only when the resulting main word is valid; avoid glueing.
+- The returned `word` must equal the final main word on the board (existing letters + placements).
 
 ## Repro mode (deterministic TileBag)
 
@@ -81,18 +95,17 @@ worker.progress_update.emit(update)
 worker.progress_update.connect(on_progress_handler)
 ```
 
-Workers are owned by MainWindow (`agent_workers` dict), not dialogs, ensuring they survive dialog closure.
+Workers live in MainWindow's `agent_workers` dict so they survive dialog closures.
 
 ### Usage Example
 ```python
 # Create agent
-agent = LanguageAgent()
+agent = VariantBootstrapAgent()
 
 # Create worker with auto-injected progress callback
 worker = AsyncAgentWorker(
-    agent.fetch_languages,
-    use_cache=False,
-    min_languages=40
+    agent.bootstrap,
+    force_refresh=True,
 )
 
 # Connect signals
@@ -111,6 +124,18 @@ worker.start()
 - Settings accessible from "⚙️ Nastavenia" toolbar button
 - 4 tabs: Všeobecné, AI Protivník, Nastavenia API, Upraviť prompt protihráča
 - Green forest theme matching game aesthetic
+
+## Variant bootstrap pipeline
+- `VariantBootstrapAgent` turns Wikipedia Scrabble tables into JSON-like summaries for each
+  language while streaming progress through the Agents dialog.
+- `wiki_loader.py` caches the source page at
+  `scrabgpt/assets/variants/wikipedia_scrabble_cache.html` for offline parsing.
+- Generated summaries live in `scrabgpt/assets/variants/lang_summarizations/` (gitignored) and
+  seed future variant definitions.
+- Tooling: `tools/parse_wikipedia_languages.py`, `tools/test_novita.py`, and
+  `tools/test_teams.py` exercise the new pipelines and persistence logic.
+- Tests: `tests/test_variant_agent.py` plus updates to agent, model, and opponent selector tests
+  cover parsing edge cases, persistence, and Novita provider flows.
 
 ## Save/Load
 
@@ -133,54 +158,54 @@ Notes:
 
 ## Changelist - Recent Features & Improvements
 
-### Agent System & Background Execution (Latest)
-- **Unified Settings Dialog**: Tabbed interface with 4 tabs (Všeobecné, AI Protivník, Nastavenia API, Upraviť prompt)
-- **Agents Activity Dialog**: Non-blocking dialog showing real-time agent progress, thinking, and results
-- **Agent Status Widget**: Toolbar animation with OpenAI-style fading text and animated dots
-- **Language Agent**: Async implementation fetching supported languages with progress callbacks
-- **Background Execution**: Agents continue running when dialogs closed (workers owned by MainWindow)
-- **Thread-Safe UI Updates**: Qt signals/slots pattern prevents UI freezing
-- **Progress Tracking**: Real-time status updates with timestamps in activity log
-- **Green Theme Consistency**: All dialogs match forest green aesthetic
-- **Click-to-Open**: Clickable status bar in settings opens agents dialog even when modal
-- **Auto-Show Config**: SHOW_AGENT_ACTIVITY_AUTO environment variable controls visibility
+### Novita Reasoning Provider & Multi-Model Upgrades
+- Added `NovitaClient` with dynamic model fetch and reasoning content capture.
+- New `NovitaConfigDialog` enables search, filters, and 10-model selection caps.
+- Concurrent orchestration in `novita_multi_model.py` mirrors OpenRouter pipeline.
+- Status bar, medals, and response detail dialog highlight Novita turns.
+- `.env` now supports `NOVITA_API_KEY`, `NOVITA_MAX_TOKENS`, `NOVITA_TIMEOUT_SECONDS`.
+- Deep dives live in `docs/NOVITA_INTEGRATION.md` and `docs/NOVITA_QUICKSTART.md`.
+
+### Persistent Teams & Opponent Mode
+- `TeamManager` saves per-provider teams under `~/.scrabgpt/teams/*.json`.
+- Teams auto-load on startup, restoring selected models and timeouts.
+- Opponent mode persists in `~/.scrabgpt/config.json`, preventing BEST_MODEL resets.
+- Settings dialog syncs selections, logging updates instead of alert popups.
+- New tooling (`tools/test_teams.py`) verifies load/save flows and cleanup.
+
+### Variant Bootstrap Toolkit
+- `VariantBootstrapAgent` streams Wikipedia fragment summaries with progress hooks.
+- Cached HTML lives in `scrabgpt/assets/variants/wikipedia_scrabble_cache.html`.
+- Summaries render to `assets/variants/lang_summarizations/` (ignored by git).
+- `wiki_loader.py` plus `tools/parse_wikipedia_languages.py` parse table fragments.
+- `tests/test_variant_agent.py` covers parsing accuracy and file writes.
+
+### Agent System & Background Execution
+- Non-blocking Agents dialog tracks async workers across providers and variants.
+- Animated toolbar widget reports agent status with dot cycling and fade effects.
+- Language and variant agents run via `AsyncAgentWorker` with auto progress hooks.
+- Signal/slot wiring keeps UI updates on the main thread.
 
 ### Multi-Model AI Support
-- **OpenRouter Integration**: Support for multiple AI models via OpenRouter API with concurrent execution
-- **Model Competition**: Up to 10 AI models compete simultaneously, best valid move is selected
-- **AI Configuration Dialog**: Visual interface to select and configure multiple models with real-time cost estimation
-- **Competition Results Table**: Beautiful dark-themed table showing all model proposals, scores, and judge validation results
-- **Model Tracking**: Status bar displays which model proposed which move throughout gameplay
-- **Click-to-View Details**: Click any model result row to see raw response and GPT analysis
+- OpenRouter multi-model dialog allows picking up to 10 concurrent competitors.
+- Results table shows medals, validity, and scores per model.
+- Response detail dialog reveals raw payloads and GPT fallback analysis.
+- Status bar emits `[model] status` messages through each turn.
 
 ### Intelligent Error Handling & Recovery
-- **GPT Fallback Parser**: When models return non-JSON responses (with thinking/reasoning), GPT-5-mini automatically extracts the move
-- **Response Detail Dialog**: View raw model responses and GPT analysis for transparency
-- **Empty Response Handling**: Graceful handling of empty/invalid responses from models
-- **Slovak Error Messages**: User-friendly error messages in Slovak with full details in tooltips
-- **OpenRouter Reasoning Field**: Support for models that return content in `reasoning` field (like GLM-4.6)
+- GPT fallback parser extracts moves when responses are free-form text.
+- Structured logging groups parse, network, and validation failures.
+- Slovak-facing errors mirror detailed English entries in tooltips and logs.
+- Supports providers that shift content into `reasoning_content`.
 
 ### Performance & UX Improvements
-- **Parallel Judge Validation**: All model moves validated concurrently (3-5x speed improvement)
-- **No UI Freezing**: Background validation keeps UI responsive with multiple models
-- **Dark Mode Styling**: All new UI components match the app's dark theme
-- **Larger Fonts**: Improved readability in AI config dialog and results table
-- **Top Weekly Models**: AI config dialog shows trending models from OpenRouter
-- **Clear on Retry**: Results table clears when AI retries, preventing stale data display
-- **Cost Visibility**: Prominent display of maximum cost per turn with smart decimal formatting
+- Parallel judge validation cuts total turn latency by several seconds.
+- Results table clears on retry to prevent stale rows.
+- Config dialogs use dark theme styling for all providers.
+- Settings forms resize gracefully across desktop platforms.
 
 ### Technical Improvements
-- **GPT-5 Support**: Proper parameter handling for GPT-5 models (`max_completion_tokens` vs `max_tokens`)
-- **Improved Logging**: Detailed logging throughout multi-model pipeline with timing information
-- **Better Prompts**: Enhanced GPT-5 extraction prompts for more reliable move recovery
-- **3-Tier Validation**: Efficient Slovak word validation (local dictionary → simplified check → full OpenAI validation)
-- **Error Classification**: Distinct handling of parse errors, API errors, and validation failures
-
-### UI/UX Enhancements
-- **Compact Layouts**: More efficient use of space in dialogs and tables
-- **Visual Hierarchy**: Important information (cost, winner, status) prominently displayed
-- **Medals for Winners**: Top 3 models shown with 🥇🥈🥉 medals in results table
-- **Status Messages**: Detailed status updates showing current model, phase, and results
-- **Responsive Design**: Proper window sizing (800×650 for config, auto-sizing for results)
-
-See detailed documentation in `docs/` directory for implementation details of each feature.
+- GPT-5 parameter fixes ensure `max_completion_tokens` is passed correctly.
+- Prompt templates refined for resilient extraction under chain-of-thought replies.
+- Timing logs measure per-model latency and total orchestration duration.
+- Team persistence tested end-to-end with new CLI scripts.

@@ -28,13 +28,15 @@ from ..core.variant_store import (
 )
 from ..ai.variants import (
     LanguageInfo,
-    download_and_store_variant,
-    fetch_supported_languages,
     get_languages_for_ui,
     match_language,
 )
 from ..ai.client import OpenAIClient
-from ..ai.language_agent import LanguageAgent, AgentProgress
+from ..ai.variant_agent import (
+    BootstrapResult,
+    VariantBootstrapAgent,
+    VariantBootstrapProgress,
+)
 from .agents_dialog import AsyncAgentWorker, AgentActivityWidget
 from .settings_dialog_helper import update_lang_status_animation
 from .opponent_mode_selector import OpponentModeSelector
@@ -107,6 +109,10 @@ class SettingsDialog(QDialog):
         self.selected_openrouter_models: list[dict[str, Any]] = []
         self.openrouter_tokens: int = ai_move_max_tokens
         
+        # Store Novita config from nested dialog
+        self.selected_novita_models: list[dict[str, Any]] = []
+        self.novita_tokens: int = ai_move_max_tokens
+        
         # API settings state
         self.selected_variant_slug = get_active_variant_slug()
         self._installed_variants: list[VariantDefinition] = []
@@ -125,7 +131,7 @@ class SettingsDialog(QDialog):
         self._lang_current_status = ""
         
         self.setWindowTitle("⚙️ Nastavenia Hry")
-        self.setModal(True)
+        self.setModal(False)  # Non-modal - allow interaction with Agents dialog
         self.resize(700, 600)
         
         self._setup_ui()
@@ -266,6 +272,7 @@ class SettingsDialog(QDialog):
         
         # Connect configuration signals
         self.mode_selector.configure_openrouter_requested.connect(self._configure_openrouter)
+        self.mode_selector.configure_novita_requested.connect(self._configure_novita)
         self.mode_selector.configure_agent_requested.connect(self._configure_agent)
         
         # Disable if game in progress
@@ -343,14 +350,31 @@ class SettingsDialog(QDialog):
             # Store selected models for parent to retrieve
             self.selected_openrouter_models = dialog.get_selected_models()
             self.openrouter_tokens = dialog.get_shared_tokens_value()
+            log.info("OpenRouter models configured: %d models", len(self.selected_openrouter_models))
             
-            # Show confirmation
-            model_count = len(self.selected_openrouter_models)
-            QMessageBox.information(
-                self,
-                "OpenRouter Nastavené",
-                f"Vybrané: {model_count} modelov pre OpenRouter režim.",
-            )
+            # Refresh team info display in mode selector
+            if hasattr(self, 'mode_selector') and self.mode_selector:
+                self.mode_selector.refresh_openrouter_team_info()
+    
+    def _configure_novita(self) -> None:
+        """Open Novita model configuration dialog."""
+        from .novita_config_dialog import NovitaConfigDialog
+        
+        # Use Novita-specific token limit (default 4096)
+        novita_tokens = int(os.getenv("NOVITA_MAX_TOKENS", "4096"))
+        dialog = NovitaConfigDialog(
+            parent=self,
+            default_tokens=novita_tokens,
+        )
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            # Store selected models for parent to retrieve
+            self.selected_novita_models = dialog.get_selected_models()
+            self.novita_tokens = self.selected_novita_models[0]["max_tokens"] if self.selected_novita_models else novita_tokens
+            log.info("Novita models configured: %d models", len(self.selected_novita_models))
+            
+            # Refresh team info display in mode selector
+            if hasattr(self, 'mode_selector') and self.mode_selector:
+                self.mode_selector.refresh_novita_team_info()
     
     def _configure_agent(self) -> None:
         """Open Agent configuration dialog."""
@@ -734,11 +758,11 @@ class SettingsDialog(QDialog):
         # Clear previous log
         agent_widget.clear_log()
         agent_widget.set_status("Spúšťam...", is_working=True)
-        agent_widget.append_activity("Začínam získavať jazyky z OpenAI API...")
-        
+        agent_widget.append_activity("Spúšťam bootstrap variantov z Wikipédie a LLM...")
+
         # Create agent
         try:
-            agent = LanguageAgent()
+            agent = VariantBootstrapAgent()
         except Exception as exc:
             agent_widget.set_status(f"Chyba: {exc}", is_working=False)
             agent_widget.append_activity(f"Inicializácia zlyhala: {exc}", prefix="❌")
@@ -752,22 +776,28 @@ class SettingsDialog(QDialog):
             toolbar_widget.show_agent_activity("Jazyky", "Získavam")
         
         # Create worker thread and store in MainWindow so it continues even if dialog closes
-        worker = AsyncAgentWorker(agent.fetch_languages, use_cache=False, min_languages=40)
+        worker = AsyncAgentWorker(agent.bootstrap, force_refresh=True)
         main_window.agent_workers['language_fetcher'] = worker
         
         # Define progress handler (runs in main thread via signal/slot)
-        def on_progress_update(update: AgentProgress) -> None:
+        def on_progress_update(update: VariantBootstrapProgress) -> None:
             """Handle progress updates from agent - RUNS IN MAIN THREAD."""
             agent_widget.set_status(update.status, is_working=True)
-            if update.thinking:
-                agent_widget.append_thinking(update.thinking)
-            if update.prompt_text:
-                # Show actual prompt in green
-                agent_widget.append_prompt(update.prompt_text)
-            
+            if update.detail:
+                agent_widget.append_activity(update.detail)
+            if update.prompt:
+                agent_widget.append_prompt(update.prompt)
+            if update.html_snippet_raw:
+                agent_widget.add_html_snippet(
+                    update.html_snippet_label or "HTML snippet",
+                    update.html_snippet_raw,
+                    update.html_snippet_text or "",
+                )
+            agent_widget.update_progress(update.progress_percent)
+
             # Update inline status in settings dialog
             self._lang_current_status = update.status
-            
+
             # Update toolbar animation
             if toolbar_widget:
                 # Extract short status for toolbar
@@ -777,7 +807,7 @@ class SettingsDialog(QDialog):
         # Connect signals (these run in main thread)
         worker.progress_update.connect(on_progress_update)
         worker.agent_finished.connect(
-            lambda result: self._on_languages_fetched(result, agent_widget)
+            lambda result: self._on_languages_bootstrapped(result, agent_widget)
         )
         worker.agent_error.connect(
             lambda error: self._on_language_fetch_error(error, agent_widget)
@@ -797,32 +827,42 @@ class SettingsDialog(QDialog):
         self._lang_status_timer.timeout.connect(self._update_lang_status_animation)
         self._lang_status_timer.start(500)  # Update every 500ms
     
-    def _on_languages_fetched(
+    def _on_languages_bootstrapped(
         self,
-        languages: list[LanguageInfo],
+        result: BootstrapResult,
         agent_widget: AgentActivityWidget,
     ) -> None:
-        """Handle successful language fetch."""
+        """Handle successful bootstrap completion."""
+        languages = result.languages
+        summaries = result.summaries
+
         agent_widget.set_status(f"Hotovo! ({len(languages)} jazykov)", is_working=False)
-        agent_widget.append_status(f"Úspešne načítaných {len(languages)} jazykov")
-        
-        # Format response
-        response_text = "Načítané jazyky:\\n\\n"
-        for lang in languages[:10]:  # Show first 10
-            response_text += f"• {lang.display_label()}\\n"
+        agent_widget.append_status(
+            f"Úspešne vytvorených {len(summaries)} sumarizácií"
+        )
+
+        response_lines = ["Načítané jazyky:", ""]
+        for lang in languages[:10]:
+            response_lines.append(f"• {lang.display_label()}")
         if len(languages) > 10:
-            response_text += f"\\n... a ďalších {len(languages) - 10} jazykov"
-        
-        agent_widget.set_response(response_text)
-        
-        # Update UI
+            response_lines.append(f"\n... a ďalších {len(languages) - 10} jazykov")
+
+        if summaries:
+            response_lines.append("\nUložené sumarizácie:")
+            for summary in summaries[:10]:
+                response_lines.append(f"• {summary.file_path.name}")
+            if len(summaries) > 10:
+                response_lines.append(f"\n... a ďalších {len(summaries) - 10} súborov")
+
+        agent_widget.set_response("\n".join(response_lines))
+
         self._set_languages(languages, keep_selection=True)
         self._sync_language_with_variant(self.selected_variant_slug)
-        
+
         # Stop animation timer
         if self._lang_status_timer:
             self._lang_status_timer.stop()
-        
+
         # Hide status and re-enable button
         self.lang_fetch_status.setVisible(False)
         self.refresh_languages_btn.setEnabled(True)
@@ -880,7 +920,7 @@ class SettingsDialog(QDialog):
             main_window.agent_workers.pop('language_fetcher', None)
         
         # Error shown in agent widget and status bar - no modal alert needed
-    
+
     def _on_new_variant(self) -> None:
         """Handle new variant creation."""
         # Import dialog locally to avoid circular dependency
@@ -890,38 +930,20 @@ class SettingsDialog(QDialog):
         dialog = NewVariantDialog(self, self._languages or get_languages_for_ui(), current_lang)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
-        query = dialog.query_text().strip()
-        if not query:
-            QMessageBox.warning(self, "Nový variant", "Zadaj jazyk alebo popis variantu.")
+        summary = dialog.selected_summary
+        if summary is None:
+            QMessageBox.warning(self, "Nová sumarizácia", "Žiadna sumarizácia nebola vytvorená.")
             return
-        try:
-            client = OpenAIClient()
-        except Exception as exc:
-            QMessageBox.critical(self, "Nový variant", f"OpenAI client sa nepodarilo inicializovať: {exc}")
-            return
-        language_hint = dialog.selected_language()
-        try:
-            definition = download_and_store_variant(
-                client,
-                language_request=query,
-                language_hint=language_hint,
-            )
-        except Exception as exc:
-            log.exception("download_variant_failed", exc_info=exc)
-            QMessageBox.critical(self, "Nový variant", f"Získavanie variantu zlyhalo: {exc}")
-            return
-        self.selected_variant_slug = definition.slug
-        if not match_language(definition.language, self._languages):
-            inferred_code = language_hint.code if language_hint else None
-            new_language = LanguageInfo(name=definition.language, code=inferred_code)
+
+        if not match_language(summary.language.name, self._languages):
+            new_language = LanguageInfo(name=summary.language.name, code=summary.language.code)
             self._languages.append(new_language)
             self.languages_combo.addItem(new_language.display_label(), new_language)
-        self._load_installed_variants(select_slug=definition.slug)
-        self._sync_language_with_variant(definition.slug)
+
         QMessageBox.information(
             self,
-            "Nový variant",
-            f"Variant '{definition.language}' bol uložený (slug {definition.slug}).",
+            "Nová sumarizácia",
+            f"Sumarizácia pre jazyk '{summary.language.name}' bola uložená do:\n{summary.file_path}",
         )
     
     def _test_connection(self) -> None:

@@ -206,12 +206,15 @@ def get_tool_schema(tool_name: str) -> dict[str, Any]:
     description = doc.split("\n")[0].strip()
     
     return {
-        "name": tool_name,
-        "description": description,
-        "parameters": {
-            "type": "object",
-            "properties": {},  # TODO: Extract from function signature
-            "required": [],
+        "type": "function",
+        "function": {
+            "name": tool_name,
+            "description": description,
+            "parameters": {
+                "type": "object",
+                "properties": {},  # TODO: Extract from function signature
+                "required": [],
+            },
         },
     }
 

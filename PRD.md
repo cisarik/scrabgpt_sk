@@ -1,7 +1,9 @@
 # ScrabGPT — Product Requirements Document (PRD)
 
 **Projekt:** ScrabGPT  
-**Cieľ:** Cross‑platform Python desktop aplikácia, v ktorej človek odohrá Scrabble partiu proti AI (GPT‑5‑mini). MVP demonštruje kvalitnú architektúru, TDD v doméne bodovania, minimalistickú integráciu OpenAI (structured completions) a čistý UI/UX.
+**Cieľ:** Cross‑platform Python desktop aplikácia, v ktorej človek odohrá Scrabble partiu
+proti AI tímom z OpenRoutera aj Novity. MVP demonštruje kvalitnú architektúru, TDD v doméne
+bodovania, minimalistickú integráciu OpenAI (structured completions) a čistý UI/UX.
 
 ---
 
@@ -14,6 +16,12 @@
   - **TDD** testuje doménové pravidlá výpočtu skóre (vrátane prémií a krížových slov).  
   - **Deterministická náhoda** (seed) pre ťahanie kameňov, aby boli testy opakovateľné.
   - **Ukladanie/obnova hry (Save/Load)** do JSON s `schema_version`.
+- **Rozšírené ciele (Q1 2025):**  
+  - Multi-model konkurencia pre OpenRouter aj Novita s paralelnym volaním a výsledkovou
+    tabuľkou.
+  - Persistované tímové konfigurácie a uložený režim protivníka cez `TeamManager`.
+  - Variant bootstrap agent generujúci jazykové podklady z Wikipédie.
+  - UI bez blokujúcich alertov, logovanie stavov a detailná dokumentácia v `docs/`.
 
 ### 1.1 Demo scénar (akceptačný)
 1. Spustím aplikáciu, zvolím **Nová hra**.  
@@ -23,8 +31,11 @@
    - lokálne spočíta skóre (s prémiami),
    - zavolá **Rozhodcu** na **validáciu jedného nového hlavného slova** (cross‑words v MVP nevalidujeme samostatne – viď 3.3),
    - ak validné → aplikuje ťah (odoberie kocky z racku, doplní do 7, aktualizuje skóre a históriu ťahov).  
-5. **AI ťah**: aplikácia odošle AI hráčovi (GPT‑5‑mini) **aktualizovaný stav** a **AI** vráti **štruktúrovaný JSON s ťahom** (pozície, smer, slovo). Aplikácia ťah **overí a spočíta** a zobrazí.  
-6. Striedame sa, až kým nedôjde na **MVP koniec** (keď jeden hráč klikne **„Ukončiť“** alebo **prázdny zásobník** a obaja pasujú 2×).  
+5. **AI ťah**: aplikácia odošle stav vybranému protivníckemu režimu (OpenRouter multi-model
+   alebo Novita) a **AI** vráti **štruktúrovaný JSON s ťahom** (pozície, smer, slovo).
+   Aplikácia ťah **overí a spočíta** a zobrazí.  
+6. Striedame sa, až kým nedôjde na **MVP koniec** (keď jeden hráč klikne **„Ukončiť“** alebo
+   **prázdny zásobník** a obaja pasujú 2×).  
 
 ---
 
@@ -48,6 +59,16 @@
 6. **Rozhodca (GPT‑5‑mini):** Endpoint na **validáciu hlavného slova** → true/false + stručný dôvod.  
 7. **Skóre & história:** pravý panel so skóre hráča/AI, posledný ťah, tlačidlo **„Undo (1× späť)“** len pre ľudský ťah pred potvrdením.  
 8. **Nastavenia:** seed (voliteľne), prepínač „**Low‑latency judge**“ (skip validačného hovoru pri slove ≥2 a ≤15 s ASCII písmenami → **len lokálne pravidlá**; experimentálny režim pre demo).
+9. **Multi-provider AI:** nastavenia musia podporovať OpenRouter aj Novita, výber až 10 modelov,
+   paralelné volanie, výsledkovú tabuľku a detailný log stavu.
+10. **Reasoning field podpora:** parser musí zvládnuť `content`, `reasoning_content` aj fallback
+    rozbor cez GPT, vrátane ukladania kompletných odpovedí.
+11. **Persistované tímy:** konfigurácie modelov a timeoutov sa ukladajú do
+    `~/.scrabgpt/teams/<provider>_team.json` a nahrávajú sa pri štarte.
+12. **Persistovaný režim protivníka:** posledný zvolený `OpponentMode` sa uloží do
+    `~/.scrabgpt/config.json` a aplikuje pri spustení hry.
+13. **Variant bootstrap pipeline:** automatizovaný agent generuje jazykové súhrny zo
+    `wikipedia_scrabble_cache.html` a ukladá ich do `assets/variants/lang_summarizations/`.
 
 ---
 
@@ -67,6 +88,12 @@
   - **Lokálny vývoj:** všetky testy sa spúšťajú s real API calls (ak sú nastavené API keys v `.env`)
   - **Conftest:** `tests/conftest.py` načíta `.env` pre API keys
 - **Bezpečnosť:** `.env` s `OPENAI_API_KEY`, `OPENROUTER_API_KEY`; nikdy necommitovať do gitu.  
+- **Konfigurácia poskytovateľov:** `.env` dopĺňa `NOVITA_API_KEY`, `NOVITA_MAX_TOKENS`,
+  `NOVITA_TIMEOUT_SECONDS`; hodnoty majú defaulty a sú validované v UI.  
+- **Perzistencia konfigurácií:**
+  - globálny súbor `~/.scrabgpt/config.json` drží `opponent_mode`,
+  - priečinok `~/.scrabgpt/teams/` obsahuje JSON pre každý provider,
+  - cache HTML (`wikipedia_scrabble_cache.html`) žije v `assets/variants/`.  
 - **Telemetria:** žiadna.  
 
 ---
@@ -74,38 +101,57 @@
 ## 4) Architektúra (moduly)
 ```
 scrabgpt/
-  core/            # čistá doména (bez UI, bez siete)
-    board.py      # model dosky, súradnice, prémiá, aplikácia ťahu
-    rack.py       # model hráčovho stojanu (rack)
-    tiles.py      # distribúcia, RNG, taška
-    scoring.py    # výpočet skóre (DL/TL/DW/TW, krížové slová)
-    rules.py      # lokálne pravidlá ťahu (stred, spojitosť…)
-    types.py      # datatypy (Direction, Placement, Move, WordScore…)
+  core/                  # čistá doména (bez UI, bez siete)
+    board.py             # model dosky, súradnice, prémiá, aplikácia ťahu
+    rack.py              # model hráčovho stojanu (rack)
+    tiles.py             # distribúcia, RNG, taška
+    scoring.py           # výpočet skóre
+    rules.py             # lokálne pravidlá ťahu
+    types.py             # datatypy (Direction, Placement, Move…)
+    team_config.py       # persistované tímy + opponent mode
   ai/
-    client.py     # tenký klient pre OpenAI (minimálny)
-    judge.py      # validácia hlavného slova (JSON schema)
-    player.py     # AI hráč (JSON schema návrhu ťahu)
-    openrouter.py # OpenRouter API klient (multi-model)
-    multi_model.py # Multi-model orchestrácia, GPT fallback parser
-    language_agent.py # Async agent na získavanie jazykov (MCP pattern)
+    client.py            # tenký klient pre OpenAI
+    judge.py             # validácia hlavného slova
+    player.py            # AI hráč (JSON schema návrhu ťahu)
+    openrouter.py        # OpenRouter API klient (multi-model)
+    multi_model.py       # OpenRouter orchestrácia + GPT fallback
+    novita.py            # Novita API klient (OpenAI kompatibilný)
+    novita_multi_model.py# Novita orchestrácia
+    language_agent.py    # Async agent na získavanie jazykov
+    variant_agent.py     # Bootstrap jazykových sumarizácií
+    wiki_loader.py       # Wikipedia fetch + parsing
+    schema.py            # Pydantic modely pre AI odpovede
   ui/
-    app.py        # PySide6 hlavné okno
-    board_view.py # 2D mriežka, DnD, zvýraznenia prémií
-    rack_view.py  # DnD kocky
-    dialogs.py    # nastavenia, upozornenia
-    ai_config.py  # AI model konfiguračný dialóg
-    model_results.py # Tabuľka výsledkov multi-model súťaže
-    response_detail.py # Detail dialóg pre model responses
-    settings_dialog.py # Unifikovaný nastavovací dialóg (4 taby)
-    agents_dialog.py # Dialóg s aktivitou agentov (non-blocking)
-    agent_status_widget.py # Toolbar widget s animáciou pre agentov
+    app.py               # PySide6 hlavné okno
+    board_view.py        # 2D mriežka, DnD, prémiá
+    rack_view.py         # DnD kocky
+    ai_config.py         # OpenRouter multi-model dialóg
+    novita_config_dialog.py # Novita model browser
+    model_results.py     # Tabuľka výsledkov multi-model súťaže
+    response_detail.py   # Detail odpovedí modelov
+    opponent_mode_selector.py # Prepínač poskytovateľov
+    team_details_dialog.py    # Prehľad tímov a perzistencie
+    settings_dialog.py   # Unifikovaný nastavovací dialóg
+    agents_dialog.py     # Aktivita agentov (non-blocking)
+    agent_status_widget.py # Toolbar widget s animáciou
   assets/
-    premiums.json # mapa prémií 15×15
+    premiums.json        # mapa prémií 15×15
+    variants/
+      wikipedia_scrabble_cache.html   # cached HTML
+      lang_summarizations/            # generované súhrny (gitignored)
+  docs/
+    NOVITA_INTEGRATION.md
+    NOVITA_QUICKSTART.md
+    PERSISTENCE_FIX.md
+    TEAMS_FEATURE.md
   tests/
     test_scoring.py
     test_rules.py
     test_premiums.py
     test_tiles.py
+    test_variant_agent.py
+    test_agent_player.py
+    test_opponent_mode_selector.py
 ```
 **Zásada:** `core/` nemá závislosť na `ai/` ani `ui/`. Všetky OpenAI hovory sa dajú **mockovať**.
 
@@ -149,6 +195,12 @@ worker.progress_update.connect(on_progress)
 - Progress callbacks: "Kontrolujem cache...", "Volám OpenAI API...", "Spracovávam odpoveď..."
 - 1-hour caching pre efektívnosť
 - Full implementation: `scrabgpt/ai/language_agent.py`
+
+#### Variant Bootstrap Agent
+- Načítava a cache-uje Wikipedia HTML cez `wiki_loader.py`.
+- Parsuje jazykové sekcie, generuje sumarizácie a ukladá ich do assets.
+- Streamuje postup cez `VariantBootstrapProgress` (HTML snippet, stav, percento).
+- Implementácia: `scrabgpt/ai/variant_agent.py`, testy v `tests/test_variant_agent.py`.
 
 #### Settings Dialog (Unified)
 4 taby v zelenej téme:
