@@ -110,11 +110,13 @@ class NovitaConfigDialog(QDialog):
         self.team_combo.setStyleSheet(
             "QComboBox { "
             "font-size: 13px; font-weight: bold; color: #e6f7eb; padding: 6px 12px; "
-            "background: #173422; border: 1px solid #2f5c39; border-radius: 6px;"
+            "background: #000000; border: 1px solid #2f5c39; border-radius: 6px;"
             "} "
+            "QComboBox:hover { border-color: #4caf50; background: #0a0a0a; } "
+            "QComboBox:focus { border-color: #4caf50; } "
             "QComboBox::drop-down { border: none; width: 24px; } "
             "QComboBox QAbstractItemView { "
-            "font-size: 13px; background: #0f1a12; color: #e6f7eb; "
+            "font-size: 13px; background: #000000; color: #e6f7eb; "
             "selection-background-color: #295c33; selection-color: #e6f7eb; "
             "border: 1px solid #2f5c39; "
             "}"
@@ -144,11 +146,13 @@ class NovitaConfigDialog(QDialog):
         self.sort_combo.setStyleSheet(
             "QComboBox { "
             "font-size: 13px; font-weight: bold; color: #e6f7eb; padding: 6px 12px; "
-            "background: #173422; border: 1px solid #2f5c39; border-radius: 6px;"
+            "background: #000000; border: 1px solid #2f5c39; border-radius: 6px;"
             "} "
+            "QComboBox:hover { border-color: #4caf50; background: #0a0a0a; } "
+            "QComboBox:focus { border-color: #4caf50; } "
             "QComboBox::drop-down { border: none; width: 24px; } "
             "QComboBox QAbstractItemView { "
-            "font-size: 13px; background: #0f1a12; color: #e6f7eb; "
+            "font-size: 13px; background: #000000; color: #e6f7eb; "
             "selection-background-color: #295c33; selection-color: #e6f7eb; "
             "border: 1px solid #2f5c39; "
             "}"
@@ -164,10 +168,11 @@ class NovitaConfigDialog(QDialog):
         self.search_edit.setClearButtonEnabled(True)
         self.search_edit.setStyleSheet(
             "QLineEdit { "
-            "background: #080b08; color: #e6f7eb; border: 1px solid #2f5c39; "
+            "background: #000000; color: #e6f7eb; border: 1px solid #2f5c39; "
             "border-radius: 6px; padding: 6px 10px; min-width: 220px; font-size: 12px; "
             "} "
-            "QLineEdit:focus { border-color: #4caf50; }"
+            "QLineEdit:hover { border-color: #4caf50; } "
+            "QLineEdit:focus { border-color: #4caf50; background: #0a0a0a; }"
         )
         self.search_edit.textChanged.connect(self._on_search_changed)
         controls_layout.addWidget(self.search_edit)

@@ -414,13 +414,14 @@ class SettingsDialog(QDialog):
         self.variant_combo.currentIndexChanged.connect(self._on_variant_changed)
         self.variant_combo.setStyleSheet(
             "QComboBox { "
-            "background: #1a2f1f; color: #e8f5e9; padding: 6px; "
+            "background: #000000; color: #e8f5e9; padding: 6px; "
             "border: 1px solid #2f5c39; border-radius: 4px; "
             "} "
-            "QComboBox:hover { border-color: #4caf50; } "
+            "QComboBox:hover { border-color: #4caf50; background: #0a0a0a; } "
+            "QComboBox:focus { border-color: #4caf50; } "
             "QComboBox::drop-down { border: none; width: 20px; } "
             "QComboBox QAbstractItemView { "
-            "background: #1a2f1f; color: #e8f5e9; "
+            "background: #000000; color: #e8f5e9; "
             "selection-background-color: #295c33; "
             "}"
         )
@@ -468,10 +469,11 @@ class SettingsDialog(QDialog):
         self.seed_edit.setText(str(self.repro_seed))
         self.seed_edit.setStyleSheet(
             "QLineEdit { "
-            "background: #1a2f1f; color: #e8f5e9; padding: 8px; "
+            "background: #000000; color: #e8f5e9; padding: 8px; "
             "border: 1px solid #2f5c39; border-radius: 4px; "
             "} "
-            "QLineEdit:focus { border-color: #4caf50; }"
+            "QLineEdit:hover { border-color: #4caf50; } "
+            "QLineEdit:focus { border-color: #4caf50; background: #0a0a0a; }"
         )
         layout.addRow(
             self._styled_label("Seed:"),
@@ -517,10 +519,11 @@ class SettingsDialog(QDialog):
         self.key_edit.setText(os.getenv("OPENAI_API_KEY", ""))
         self.key_edit.setStyleSheet(
             "QLineEdit { "
-            "background: #1a2f1f; color: #e8f5e9; padding: 8px; "
+            "background: #000000; color: #e8f5e9; padding: 8px; "
             "border: 1px solid #2f5c39; border-radius: 4px; "
             "} "
-            "QLineEdit:focus { border-color: #4caf50; }"
+            "QLineEdit:hover { border-color: #4caf50; } "
+            "QLineEdit:focus { border-color: #4caf50; background: #0a0a0a; }"
         )
         layout.addRow(
             self._styled_label("OpenAI API kľúč:"),
@@ -985,14 +988,15 @@ class SettingsDialog(QDialog):
         self.prompt_combo.currentTextChanged.connect(self._on_prompt_selected)
         self.prompt_combo.setStyleSheet(
             "QComboBox { "
-            "background: #1a2f1f; color: #e8f5e9; padding: 6px; "
+            "background: #000000; color: #e8f5e9; padding: 6px; "
             "border: 1px solid #2f5c39; border-radius: 4px; "
             "min-width: 250px; font-size: 13px; "
             "} "
-            "QComboBox:hover { border-color: #4caf50; } "
+            "QComboBox:hover { border-color: #4caf50; background: #0a0a0a; } "
+            "QComboBox:focus { border-color: #4caf50; } "
             "QComboBox::drop-down { border: none; width: 20px; } "
             "QComboBox QAbstractItemView { "
-            "background: #1a2f1f; color: #e8f5e9; "
+            "background: #000000; color: #e8f5e9; "
             "selection-background-color: #295c33; "
             "}"
         )
@@ -1021,12 +1025,13 @@ class SettingsDialog(QDialog):
         self.prompt_text_edit.textChanged.connect(self._on_prompt_text_changed)
         self.prompt_text_edit.setStyleSheet(
             "QTextEdit { "
-            "background: #0f1a12; color: #e8f5e9; "
+            "background: #000000; color: #e8f5e9; "
             "border: 2px solid #2f5c39; border-radius: 6px; "
             "padding: 12px; font-family: 'Monospace', 'Courier New'; "
             "font-size: 11pt; line-height: 1.5; "
             "} "
-            "QTextEdit:focus { border-color: #4caf50; }"
+            "QTextEdit:hover { border-color: #4caf50; } "
+            "QTextEdit:focus { border-color: #4caf50; background: #0a0a0a; }"
         )
         layout.addWidget(self.prompt_text_edit, 1)  # Stretch factor 1
         

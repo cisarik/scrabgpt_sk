@@ -77,6 +77,7 @@ from ..ai.novita_multi_model import propose_move_novita_multi_model
 from .prompt_editor import PromptEditorDialog
 from .agents_dialog import AgentsDialog, AsyncAgentWorker
 from .agent_status_widget import AgentStatusWidget
+from .mcp_test_dialog import MCPTestDialog
 from ..core.state import build_ai_state_dict
 from ..core.rack import consume_rack, restore_rack
 from ..core.state import build_save_state_dict, parse_save_state_dict, restore_board_from_save, restore_bag_from_save
@@ -1660,6 +1661,10 @@ class MainWindow(QMainWindow):
         self.act_agents = QAction("⚙️ Agenti", self)
         self.act_agents.triggered.connect(self.open_agents_dialog)
         self.toolbar.addAction(self.act_agents)
+
+        self.act_mcp_test = QAction("🔧 MCP Test", self)
+        self.act_mcp_test.triggered.connect(self.open_mcp_test_dialog)
+        self.toolbar.addAction(self.act_mcp_test)
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -4198,6 +4203,13 @@ class MainWindow(QMainWindow):
         if self.agents_dialog is None:
             self.agents_dialog = AgentsDialog(parent=self)
         return self.agents_dialog
+    
+    def open_mcp_test_dialog(self) -> None:
+        """Open MCP testing dialog (non-modal)."""
+        dialog = MCPTestDialog(parent=self)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
     
     def open_opponent_settings(self) -> None:
         """Open opponent mode settings dialog."""
