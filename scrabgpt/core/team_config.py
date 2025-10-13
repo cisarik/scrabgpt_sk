@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+import os
 
 log = logging.getLogger("scrabgpt.core.team_config")
 
@@ -285,20 +286,28 @@ class TeamManager:
     def load_opponent_mode(self) -> str | None:
         """Load saved opponent mode from config.
         
+        Priority: config.json > .env
+        
         Returns:
             Opponent mode string if exists, None otherwise
         """
         try:
-            if not self.config_file.exists():
-                return None
+            # Try config.json first (highest priority)
+            if self.config_file.exists():
+                with self.config_file.open("r", encoding="utf-8") as f:
+                    config = json.load(f)
+                
+                mode = config.get("opponent_mode")
+                if mode:
+                    log.info("Loaded opponent mode from config.json: %s", mode)
+                    return str(mode)
             
-            with self.config_file.open("r", encoding="utf-8") as f:
-                config = json.load(f)
-            
-            mode = config.get("opponent_mode")
+            # Fallback to .env
+            mode = os.getenv("OPPONENT_MODE")
             if mode:
-                log.info("Loaded opponent mode: %s", mode)
-                return str(mode) if mode else None
+                log.info("Loaded opponent mode from .env: %s", mode)
+                return str(mode)
+            
             return None
         except Exception as e:
             log.error("Failed to load opponent mode: %s", e)
@@ -332,6 +341,8 @@ class TeamManager:
     def load_active_team(self, provider: str) -> str | None:
         """Load which team is active for a provider.
         
+        Priority: config.json > .env
+        
         Args:
             provider: Provider name
         
@@ -339,18 +350,24 @@ class TeamManager:
             Active team name if set, None otherwise
         """
         try:
-            if not self.config_file.exists():
-                return None
+            # Try config.json first (highest priority)
+            if self.config_file.exists():
+                with self.config_file.open("r", encoding="utf-8") as f:
+                    config = json.load(f)
+                
+                active_teams = config.get("active_teams", {})
+                team_name = active_teams.get(provider)
+                
+                if team_name:
+                    log.info("Loaded active team for %s from config.json: %s", provider, team_name)
+                    return str(team_name)
             
-            with self.config_file.open("r", encoding="utf-8") as f:
-                config = json.load(f)
-            
-            active_teams = config.get("active_teams", {})
-            team_name = active_teams.get(provider)
-            
+            # Fallback to .env
+            team_name = os.getenv(f"ACTIVE_{provider.upper()}_TEAM")
             if team_name:
-                log.info("Loaded active team for %s: %s", provider, team_name)
-                return str(team_name) if team_name else None
+                log.info("Loaded active team for %s from .env: %s", provider, team_name)
+                return str(team_name)
+            
             return None
         except Exception as e:
             log.error("Failed to load active team for %s: %s", provider, e)

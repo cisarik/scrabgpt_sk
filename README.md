@@ -28,13 +28,21 @@ poetry run python -m scrabgpt.ui.app
 ## Multi-provider AI setup
 - `OpenRouter`: keep `OPENROUTER_API_KEY` in `.env`, configure models in **Nastavenia → AI
   Protivník**, and use the multi-model dialog to pick up to 10 competitors.
-- `Novita`: add `NOVITA_API_KEY`, optional `NOVITA_MAX_TOKENS`, and
-  `NOVITA_TIMEOUT_SECONDS`; select **Novita AI** in the same settings tab to launch the
+- `Novita`: add `NOVITA_API_KEY`; the shared `AI_MOVE_MAX_OUTPUT_TOKENS` and
+  `AI_MOVE_TIMEOUT_SECONDS` settings apply automatically to Novita calls. Select **Novita AI**
+  in the same settings tab to launch the
   dedicated model browser with reasoning metadata.
 - `Teams`: selections persist under `~/.scrabgpt/teams/*.json`; the app loads them on
   startup and also restores the last opponent mode from `~/.scrabgpt/config.json`.
 - Docs: see `docs/NOVITA_INTEGRATION.md`, `docs/NOVITA_QUICKSTART.md`, and
   `docs/PERSISTENCE_FIX.md` for setup, troubleshooting, and persistence details.
+
+### Runtime Limits (Unified)
+- `AI_MOVE_MAX_OUTPUT_TOKENS` — hard cap used for every AI move (OpenRouter, Novita, single-model, and agents)
+- `AI_MOVE_TIMEOUT_SECONDS` — single timeout applied to all multi-model calls and background agents
+- `JUDGE_MAX_OUTPUT_TOKENS` — dedicated cap for referee validation responses
+
+Both move-related settings can be adjusted inside **Nastavenia → AI Protivník**; changes sync back into `.env` automatically and propagate to saved team presets.
 
 ## AI player prompt rules
 
@@ -163,7 +171,8 @@ Notes:
 - New `NovitaConfigDialog` enables search, filters, and 10-model selection caps.
 - Concurrent orchestration in `novita_multi_model.py` mirrors OpenRouter pipeline.
 - Status bar, medals, and response detail dialog highlight Novita turns.
-- `.env` now supports `NOVITA_API_KEY`, `NOVITA_MAX_TOKENS`, `NOVITA_TIMEOUT_SECONDS`.
+- `.env` now supports `NOVITA_API_KEY` and reuses the shared `AI_MOVE_MAX_OUTPUT_TOKENS` and
+  `AI_MOVE_TIMEOUT_SECONDS` limits for Novita orchestration.
 - Deep dives live in `docs/NOVITA_INTEGRATION.md` and `docs/NOVITA_QUICKSTART.md`.
 
 ### Persistent Teams & Opponent Mode

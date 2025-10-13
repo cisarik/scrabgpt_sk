@@ -18,6 +18,7 @@ from .openrouter import OpenRouterClient
 from .schema import parse_ai_move, to_move_payload
 from .player import _build_prompt
 from .client import OpenAIClient
+from .parsing_fallbacks import compute_parser_attempts, gpt_fallback_parse
 
 log = logging.getLogger("scrabgpt.ai.multi_model")
 
@@ -59,7 +60,7 @@ async def propose_move_multi_model(
     
     async def call_one_model(model_info: dict[str, Any]) -> dict[str, Any]:
         model_id = model_info["id"]
-        max_tokens = model_info.get("max_tokens", 3600)
+        max_tokens = model_info.get("max_tokens") or client.ai_move_max_output_tokens
 
         log.info("Calling model: %s", model_id)
 
@@ -196,8 +197,47 @@ async def propose_move_multi_model(
             log.debug("Response from %s: %s...", model_id, stripped[:200])
             
             # Parse using stripped content (in case there's trailing whitespace)
-            model_obj = parse_ai_move(stripped)
-            move = to_move_payload(model_obj)
+            gpt_analysis = ""
+            gpt_raw_response = ""
+            try:
+                model_obj, parse_method = parse_ai_move(stripped)
+                move = to_move_payload(model_obj)
+                parser_attempts = compute_parser_attempts(parse_method)
+            except Exception as parse_err:
+                log.warning(
+                    "Primary parse failed for %s (%s) – trying GPT fallback",
+                    model_id,
+                    parse_err,
+                )
+                fallback_move, fallback_meta = await gpt_fallback_parse(
+                    raw_content,
+                    judge_client,
+                )
+                if fallback_move is None:
+                    fallback_error = fallback_meta.get("error", "GPT fallback neuspel.")
+                    log.warning(
+                        "GPT fallback failed for %s: %s",
+                        model_id,
+                        fallback_error,
+                    )
+                    raise ValueError(f"GPT fallback failed: {fallback_error}") from parse_err
+                move = fallback_move
+                parse_method = fallback_meta.get("parse_method", "gpt_fallback")
+                parser_attempts = fallback_meta.get(
+                    "parser_attempts",
+                    compute_parser_attempts(parse_method),
+                )
+                gpt_analysis = fallback_meta.get("analysis", "")
+                gpt_raw_response = fallback_meta.get("raw_gpt_response", "")
+                log.info("✓ GPT fallback extrahoval ťah pre %s", model_id)
+            
+            # Log which parsing method was used
+            if parse_method == "markdown_extraction":
+                log.info("✓ Model %s: JSON extrahovaný z markdown bloku", model_id)
+            elif parse_method == "inline_json":
+                log.info("✓ Model %s: JSON extrahovaný z textu (inline fallback)", model_id)
+            elif parse_method == "gpt_fallback":
+                log.info("✓ Model %s: ťah rekonštruovaný cez GPT fallback", model_id)
             
             if "exchange" not in move:
                 move["exchange"] = []
@@ -245,6 +285,10 @@ async def propose_move_multi_model(
                 "move": move,
                 "score": score,
                 "raw_response": raw_content,  # Store raw response for debugging
+                "parse_method": parse_method,
+                "parser_attempts": parser_attempts,
+                "gpt_analysis": gpt_analysis,
+                "gpt_raw_response": gpt_raw_response,
                 "prompt_tokens": result.get("prompt_tokens", 0),
                 "completion_tokens": result.get("completion_tokens", 0),
                 "words": words,
@@ -271,7 +315,10 @@ async def propose_move_multi_model(
             raw_response = result.get("content", "")
             
             # Provide helpful analysis of what went wrong
-            error_analysis = f"Failed to parse JSON: {e.__class__.__name__}: {str(e)[:100]}"
+            error_message = str(e)[:100]
+            error_analysis = f"Failed to parse JSON: {e.__class__.__name__}: {error_message}"
+            if "GPT fallback failed" in str(e):
+                error_analysis += "\n\nFallback: GPT analýza nedokázala rekonštruovať ťah."
             if raw_response:
                 if "```" in raw_response and "json" not in raw_response.lower():
                     error_analysis += "\n\nTip: Model used code blocks without 'json' marker"

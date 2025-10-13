@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from typing import Any
 
 from PySide6.QtCore import Qt, QThread, QObject, Signal
@@ -53,9 +54,10 @@ class NovitaConfigDialog(QDialog):
         *,
         default_tokens: int = 4096,
         current_team_name: str | None = None,
+        use_env_default: bool = True,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Nastaviť Novita AI Modely")
+        self.setWindowTitle("Nastaviť Novita team")
         self.setModal(True)
         self.resize(950, 700)
         
@@ -65,7 +67,8 @@ class NovitaConfigDialog(QDialog):
         self.model_checkboxes: dict[str, QCheckBox] = {}
         self.selected_models: list[dict[str, Any]] = []
         self.max_selection = 10
-        self._default_shared_tokens = self._clamp_shared_tokens(default_tokens)
+        resolved_tokens = self._resolve_shared_tokens(default_tokens, use_env_default)
+        self._default_shared_tokens = self._clamp_shared_tokens(resolved_tokens)
         self.search_edit: QLineEdit | None = None
         self._search_text: str = ""
         self._selection_state: dict[str, bool] = {}
@@ -75,6 +78,10 @@ class NovitaConfigDialog(QDialog):
         self.team_combo: QComboBox | None = None
         self.sort_combo: QComboBox | None = None
         self.progress: QProgressBar | None = None
+        self.cost_label: QLabel | None = None
+        self.free_models_label: QLabel | None = None
+        self.select_free_btn: QPushButton | None = None
+        self.ok_btn: QPushButton | None = None
         
         self.sort_options: list[tuple[str, str]] = [
             ("Name A-Z", "name_asc"),
@@ -133,6 +140,11 @@ class NovitaConfigDialog(QDialog):
         rename_team_btn.setStyleSheet(self._small_button_style())
         rename_team_btn.clicked.connect(self._rename_team)
         controls_layout.addWidget(rename_team_btn)
+        
+        delete_team_btn = QPushButton("🗑️ Zmazať")
+        delete_team_btn.setStyleSheet(self._small_button_style_danger())
+        delete_team_btn.clicked.connect(self._delete_team)
+        controls_layout.addWidget(delete_team_btn)
         
         # Sort dropdown
         sort_caption = QLabel("Zoradenie:")
@@ -218,13 +230,21 @@ class NovitaConfigDialog(QDialog):
         scroll.setWidget(self.models_container)
         layout.addWidget(scroll, 1)
 
-        # Selection info
-        self.selection_label = QLabel(f"Vybrané: 0 / {self.max_selection}")
-        self.selection_label.setStyleSheet(
-            "font-size: 13px; font-weight: bold; color: #ffd54f; "
-            "padding: 6px 12px; background: #3d2a0f; border: 1px solid #8a6a4a; border-radius: 4px;"
+        # Separator
+        separator = QFrame()
+        separator.setFrameShape(QFrame.Shape.HLine)
+        separator.setFrameShadow(QFrame.Shadow.Sunken)
+        separator.setStyleSheet("background: #2f5c39;")
+        layout.addWidget(separator)
+
+        # Cost label (like OpenRouter)
+        self.cost_label = QLabel("Vyber aspoň jeden model")
+        self.cost_label.setStyleSheet(
+            "padding: 10px; background: #2f2415; border-radius: 6px; "
+            "font-size: 13px; font-weight: bold; color: #f5e6c4; border: 2px solid #d8a02f;"
         )
-        layout.addWidget(self.selection_label)
+        self.cost_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.cost_label)
 
         # Bottom buttons
         buttons_layout = QHBoxLayout()
@@ -241,6 +261,28 @@ class NovitaConfigDialog(QDialog):
         buttons_layout.addWidget(cancel_btn)
 
         buttons_layout.addStretch()
+
+        # Free models indicator and button (like OpenRouter)
+        self.free_models_label = QLabel("Modelov s free volaniami: 0")
+        self.free_models_label.setStyleSheet(
+            "font-size: 12px; font-weight: bold; color: #9ad0a2;"
+        )
+        buttons_layout.addWidget(self.free_models_label)
+
+        self.select_free_btn = QPushButton("Vybrať free modely")
+        self.select_free_btn.setEnabled(False)
+        self.select_free_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.select_free_btn.setStyleSheet(
+            "QPushButton { "
+            "background-color: #2f8f46; color: #0b1c00; font-weight: bold; "
+            "padding: 8px 16px; border-radius: 6px; font-size: 12px; border: 1px solid #246c34; "
+            "} "
+            "QPushButton:hover { background-color: #3fa75a; } "
+            "QPushButton:pressed { background-color: #236a34; color: #d7f4dd; } "
+            "QPushButton:disabled { background-color: #1f3323; color: #4f6f55; border-color: #1f3323; }"
+        )
+        self.select_free_btn.clicked.connect(self._select_free_models)
+        buttons_layout.addWidget(self.select_free_btn)
 
         self.ok_btn = QPushButton("✓ Použiť vybrané modely")
         self.ok_btn.clicked.connect(self._on_ok)
@@ -263,6 +305,26 @@ class NovitaConfigDialog(QDialog):
             self._populate_team_combo()
             self.team_combo.currentIndexChanged.connect(self._on_team_changed)
     
+    @staticmethod
+    def _parse_positive_int(value: Any) -> int | None:
+        """Convert a value to positive int or return None."""
+
+        try:
+            tokens = int(value)
+        except (TypeError, ValueError):
+            return None
+        return tokens if tokens > 0 else None
+    
+    def _resolve_shared_tokens(self, default_tokens: int, use_env_default: bool) -> int:
+        """Resolve initial shared token limit respecting optional env override."""
+
+        resolved = self._parse_positive_int(default_tokens) or 4096
+        if use_env_default:
+            env_tokens = self._parse_positive_int(os.getenv("AI_MOVE_MAX_OUTPUT_TOKENS"))
+            if env_tokens is not None:
+                resolved = env_tokens
+        return resolved
+    
     def _small_button_style(self) -> str:
         return (
             "QPushButton { "
@@ -273,12 +335,21 @@ class NovitaConfigDialog(QDialog):
             "QPushButton:pressed { background: #236a34; color: #d7f4dd; }"
         )
     
+    def _small_button_style_danger(self) -> str:
+        return (
+            "QPushButton { "
+            "background: #c62828; color: white; font-weight: bold; "
+            "padding: 6px 12px; border-radius: 6px; font-size: 11px; border: 1px solid #8e0000; "
+            "} "
+            "QPushButton:hover { background: #d32f2f; } "
+            "QPushButton:pressed { background: #b71c1c; }"
+        )
+    
     def _clamp_shared_tokens(self, val: int) -> int:
         return max(1000, min(val, 16000))
     
     def _load_models(self) -> None:
         """Load models from Novita."""
-        import os
         api_key = os.getenv("NOVITA_API_KEY", "")
         if not api_key:
             QMessageBox.warning(
@@ -314,10 +385,12 @@ class NovitaConfigDialog(QDialog):
         self.models = models
         self.sorted_models = models
         self.filtered_models = models
-        self._populate_models()
         log.info("Loaded %d Novita models", len(models))
         
-        # Load active team's selections after models are loaded
+        # Populate models first to create checkboxes
+        self._populate_models()
+        
+        # Then load active team's selections after checkboxes exist
         if self.current_team_name:
             self._load_team_selections(self.current_team_name)
     
@@ -347,8 +420,18 @@ class NovitaConfigDialog(QDialog):
 
         self.model_checkboxes.clear()
 
-        # Use filtered_models if available (already filtered by _refresh_model_list)
+        # Use filtered_models if available
         visible_models = self.filtered_models if self.filtered_models else self.models
+
+        if not visible_models:
+            empty_label = QLabel("Žiadne modely zodpovedajú hľadaniu.")
+            empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            empty_label.setStyleSheet("color: #8fa6a0; font-size: 12px; padding: 12px;")
+            self.models_layout.addWidget(empty_label)
+            self.models_layout.addStretch()
+            self._update_free_models_indicator()
+            self._update_cost()
+            return
 
         # Group by category
         categories: dict[str, list[dict[str, Any]]] = {}
@@ -379,9 +462,12 @@ class NovitaConfigDialog(QDialog):
         # Restore selection state
         for model_id, checked in self._selection_state.items():
             if model_id in self.model_checkboxes:
+                self.model_checkboxes[model_id].blockSignals(True)
                 self.model_checkboxes[model_id].setChecked(checked)
+                self.model_checkboxes[model_id].blockSignals(False)
         
-        self._update_selection_label()
+        self._update_free_models_indicator()
+        self._update_cost()
     
     def _create_model_widget(self, model: dict[str, Any]) -> QWidget:
         """Create a widget for a single model."""
@@ -389,52 +475,141 @@ class NovitaConfigDialog(QDialog):
         container.setFrameShape(QFrame.Shape.StyledPanel)
         container.setStyleSheet(
             "QFrame { "
-            "background: #132418; border: 1px solid #2f5c39; border-radius: 4px; "
-            "padding: 8px; "
+            "border: 1px solid #2f5c39; border-radius: 6px; "
+            "background: #080b08; padding: 10px; "
             "} "
-            "QFrame:hover { background: #1a3020; border-color: #4caf50; }"
+            "QFrame:hover { border-color: #4caf50; background: #111611; }"
         )
 
         layout = QHBoxLayout(container)
         layout.setSpacing(12)
-        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setContentsMargins(10, 8, 10, 8)
 
         # Checkbox
-        checkbox = QCheckBox()
-        checkbox.setCursor(Qt.CursorShape.PointingHandCursor)
+        model_id = model["id"]
+        model_name = model.get("name", model_id)
+        context_length = int(model.get("context_length", 0) or 0)
+        
+        checkbox = QCheckBox(self._format_checkbox_text(model_name, context_length))
         checkbox.setStyleSheet(
-            "QCheckBox::indicator { width: 20px; height: 20px; } "
-            "QCheckBox::indicator:unchecked { "
-            "border: 2px solid #4caf50; border-radius: 4px; background: #0a0a0a; "
+            "QCheckBox { "
+            "font-size: 13px; font-weight: bold; color: #e6f7eb; "
             "} "
-            "QCheckBox::indicator:checked { "
-            "border: 2px solid #4caf50; border-radius: 4px; background: #4caf50; "
-            "image: none; "
-            "}"
+            "QCheckBox::indicator { width: 18px; height: 18px; }"
+            "QCheckBox::indicator:unchecked { border: 1px solid #4caf50; background: #0f1a12; }"
+            "QCheckBox::indicator:checked { border: 1px solid #4caf50; background: #4caf50; }"
         )
         checkbox.stateChanged.connect(lambda: self._on_model_toggled(model))
-        self.model_checkboxes[model["id"]] = checkbox
-        layout.addWidget(checkbox)
+        self.model_checkboxes[model_id] = checkbox
+        layout.addWidget(checkbox, stretch=1)
 
-        # Model info
-        info_layout = QVBoxLayout()
-        info_layout.setSpacing(4)
-
-        name_label = QLabel(model["name"])
-        name_label.setStyleSheet("font-size: 13px; font-weight: bold; color: #e8f5e9;")
-        info_layout.addWidget(name_label)
-
-        id_label = QLabel(model["id"])
-        id_label.setStyleSheet("font-size: 11px; color: #81c784;")
-        info_layout.addWidget(id_label)
-
-        context_label = QLabel(f"Context: {model.get('context_length', '?'):,} tokens")
-        context_label.setStyleSheet("font-size: 11px; color: #b6e0bd;")
-        info_layout.addWidget(context_label)
-
-        layout.addLayout(info_layout, 1)
+        # Price label (if available)
+        prompt_price = float(model.get("prompt_price", 0) or 0)
+        completion_price = float(model.get("completion_price", 0) or 0)
+        
+        price_label = QLabel(self._format_price_label(prompt_price, completion_price))
+        price_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        price_label.setStyleSheet("font-size: 11px; font-weight: bold; color: #9ad0a2;")
+        layout.addWidget(price_label, alignment=Qt.AlignmentFlag.AlignRight)
 
         return container
+    
+    @staticmethod
+    def _format_checkbox_text(model_name: str, context_length: int) -> str:
+        """Return checkbox caption with model name and context length."""
+        context = NovitaConfigDialog._format_context_length(context_length)
+        if context:
+            return f"{model_name} ({context} context)"
+        return model_name
+    
+    @staticmethod
+    def _format_context_length(context_length: int) -> str:
+        """Format context length in tokens into a compact string."""
+        if context_length <= 0:
+            return "n/a"
+        if context_length >= 1_000_000:
+            return f"{context_length / 1_000_000:.1f}M"
+        if context_length >= 1_000:
+            return f"{context_length // 1_000}K"
+        return str(context_length)
+    
+    @staticmethod
+    def _format_price_label(prompt_price: float, completion_price: float) -> str:
+        """Create a pricing summary showing completion price per token."""
+
+        if prompt_price == 0 and completion_price == 0:
+            return "zadarmo"
+
+        # Show full unrounded price per token (not per 1k)
+        price_per_token = completion_price
+        price_per_million = price_per_token * 1_000_000
+        per_million_str = ""
+        if price_per_million > 0:
+            if price_per_million >= 0.01:
+                per_million_str = f" (${price_per_million:.2f}/M)"
+            else:
+                per_million_str = f" (${price_per_million:.4f}/M)"
+        return f"${price_per_token:.10f}/token{per_million_str}"
+    
+    @staticmethod
+    def _is_free_model(model: dict[str, Any]) -> bool:
+        """Return True when both prompt and completion prices are zero."""
+        prompt_price = float(model.get("prompt_price", 0) or 0)
+        completion_price = float(model.get("completion_price", 0) or 0)
+        return prompt_price == 0 and completion_price == 0
+    
+    def _update_free_models_indicator(self) -> None:
+        """Refresh the badge that shows how many free models are available."""
+        if self.free_models_label is None or self.select_free_btn is None:
+            return
+
+        free_count = sum(1 for model in self.models if self._is_free_model(model))
+        self.free_models_label.setText(f"Modelov s free volaniami: {free_count}")
+        self.select_free_btn.setEnabled(free_count > 0)
+    
+    def _select_free_models(self) -> None:
+        """Select every free model, respecting the maximum selection cap."""
+        search_space = self.filtered_models or self.sorted_models or self.models
+        free_models = [
+            model for model in search_space if self._is_free_model(model)
+        ] or [
+            model for model in self.models if self._is_free_model(model)
+        ]
+
+        if not free_models:
+            return
+
+        # Clear all selections first
+        for model in self.models:
+            self._selection_state[model["id"]] = False
+
+        for checkbox in self.model_checkboxes.values():
+            checkbox.blockSignals(True)
+            checkbox.setChecked(False)
+            checkbox.blockSignals(False)
+
+        # Select free models up to limit
+        for model in free_models[: self.max_selection]:
+            checkbox = self.model_checkboxes.get(model["id"])
+            if checkbox is None:
+                self._selection_state[model["id"]] = True
+                continue
+            checkbox.blockSignals(True)
+            checkbox.setChecked(True)
+            checkbox.blockSignals(False)
+            self._selection_state[model["id"]] = True
+
+        self._update_cost()
+
+        if len(free_models) > self.max_selection:
+            QMessageBox.information(
+                self,
+                "Limit dosiahnutý",
+                (
+                    f"Vybralo sa {self.max_selection} free modelov z {len(free_models)} dostupných.\n"
+                    "Vyber menej modelov alebo uprav limit."
+                ),
+            )
     
     def _on_model_toggled(self, model: dict[str, Any]) -> None:
         """Handle model checkbox toggle."""
@@ -442,7 +617,7 @@ class NovitaConfigDialog(QDialog):
         self._selection_state[model["id"]] = checkbox.isChecked()
 
         # Check selection limit
-        selected_count = sum(1 for cb in self.model_checkboxes.values() if cb.isChecked())
+        selected_count = sum(1 for state in self._selection_state.values() if state)
         
         if selected_count > self.max_selection:
             checkbox.setChecked(False)
@@ -453,16 +628,59 @@ class NovitaConfigDialog(QDialog):
                 f"Môžete vybrať maximálne {self.max_selection} modelov.",
             )
         
-        self._update_selection_label()
+        self._update_cost()
     
-    def _update_selection_label(self) -> None:
-        """Update selection count label."""
-        selected_count = sum(1 for state in self._selection_state.values() if state)
-        self.selection_label.setText(f"Vybrané: {selected_count} / {self.max_selection}")
+    def _update_cost(self) -> None:
+        """Update estimated cost based on selected models (using AI_MOVE_MAX_OUTPUT_TOKENS)."""
+        if self.cost_label is None or self.ok_btn is None:
+            return
         
-        # Enable/disable OK button
-        if self.ok_btn:
-            self.ok_btn.setEnabled(selected_count > 0)
+        selected = []
+        shared_tokens = self._default_shared_tokens
+
+        for model in self.models:
+            model_id = model["id"]
+            if not self._selection_state.get(model_id, False):
+                continue
+            model_copy = model.copy()
+            model_copy["max_tokens"] = shared_tokens
+            selected.append(model_copy)
+        
+        self.ok_btn.setEnabled(len(selected) > 0)
+        
+        if not selected:
+            self.cost_label.setText("⚠️  Vyber aspoň jeden model")
+            self.cost_label.setStyleSheet(
+                "padding: 10px; background: #2f2415; border-radius: 6px; "
+                "font-size: 13px; font-weight: bold; color: #f5e6c4; border: 2px solid #d8a02f;"
+            )
+            return
+        
+        # Calculate max cost per move: sum of (tokens × completion_price) for each model
+        total_cost = 0.0
+        for model in selected:
+            completion_price = float(model.get("completion_price", 0) or 0)
+            # completion_price is per token, multiply by max_tokens for this model
+            model_cost = shared_tokens * completion_price
+            total_cost += model_cost
+        
+        # Format: white text + yellow value
+        if total_cost >= 0.01:
+            cost_str = f"${total_cost:.4f}"
+        elif total_cost >= 0.0001:
+            cost_str = f"${total_cost:.6f}"
+        else:
+            cost_str = f"${total_cost:.10f}"
+        
+        self.cost_label.setText(
+            f'<span style="color: white;">✓ {len(selected)} modelov vybraných  |  '
+            f'💰 Maximálna cena za ťah: </span>'
+            f'<span style="color: #ffd54f; font-weight: bold;">{cost_str}</span>'
+        )
+        self.cost_label.setStyleSheet(
+            "padding: 10px; background: #173422; border-radius: 6px; "
+            "font-size: 13px; font-weight: bold; border: 2px solid #4caf50;"
+        )
     
     def _on_search_changed(self, text: str) -> None:
         """Handle search text change."""
@@ -471,23 +689,6 @@ class NovitaConfigDialog(QDialog):
             return
         self._search_text = cleaned
         self._refresh_model_list()
-    
-    def _select_all(self) -> None:
-        """Select all visible models (up to limit)."""
-        selected_count = 0
-        for model_id, checkbox in self.model_checkboxes.items():
-            if checkbox.isVisible() and selected_count < self.max_selection:
-                checkbox.setChecked(True)
-                self._selection_state[model_id] = True
-                selected_count += 1
-        self._update_selection_label()
-    
-    def _clear_selection(self) -> None:
-        """Clear all selections."""
-        for checkbox in self.model_checkboxes.values():
-            checkbox.setChecked(False)
-        self._selection_state.clear()
-        self._update_selection_label()
     
     def _populate_team_combo(self) -> None:
         """Populate team selector with available teams."""
@@ -502,10 +703,7 @@ class NovitaConfigDialog(QDialog):
             # Load existing teams
             teams = self.team_manager.list_teams("novita")
             
-            # Add "New Team" option first
-            self.team_combo.addItem("[ Nový team ]", None)
-            
-            # Add existing teams
+            # Add existing teams only (no "New Team" placeholder)
             for team in teams:
                 self.team_combo.addItem(team.name, team.name)
             
@@ -550,7 +748,7 @@ class NovitaConfigDialog(QDialog):
                 else:
                     log.warning("Model '%s' from team not found in available models", model_id)
             
-            self._update_selection_label()
+            self._update_cost()
             log.info("Loaded team '%s' with %d models", team_name, len(team.model_ids))
         except Exception as e:
             log.warning("Failed to load team '%s': %s", team_name, e)
@@ -563,20 +761,15 @@ class NovitaConfigDialog(QDialog):
         
         team_name = self.team_combo.itemData(index)
         
-        if team_name is None:
-            # "[ Nový team ]" selected - clear selections for fresh start
-            self._clear_selection()
-            self.current_team_name = None
-            return
-        
         # Update current team name
         self.current_team_name = team_name
         
         # Load team selections (only works if models are already loaded)
-        self._load_team_selections(team_name)
+        if team_name:
+            self._load_team_selections(team_name)
     
     def _create_new_team(self) -> None:
-        """Create a new team."""
+        """Create a new team with empty selection."""
         team_name, ok = QInputDialog.getText(
             self,
             "Nový Team",
@@ -585,6 +778,9 @@ class NovitaConfigDialog(QDialog):
         )
         
         if ok and team_name:
+            # Clear all selections for fresh start
+            self._clear_selection()
+            
             # Add to combo
             if self.team_combo:
                 # Block signals to prevent _on_team_changed from triggering
@@ -596,8 +792,7 @@ class NovitaConfigDialog(QDialog):
                 
                 # Update current team name
                 self.current_team_name = team_name
-                # Don't clear selections - keep what user has already selected
-                log.info("Created new team '%s' with current selections", team_name)
+                log.info("Created new team '%s' with empty selection", team_name)
     
     def _rename_team(self) -> None:
         """Rename current team."""
@@ -618,6 +813,57 @@ class NovitaConfigDialog(QDialog):
             self.team_combo.setItemText(current_index, new_name)
             self.team_combo.setItemData(current_index, new_name)
             self.current_team_name = new_name
+    
+    def _delete_team(self) -> None:
+        """Delete current team with confirmation."""
+        if not self.team_combo or not self.current_team_name:
+            QMessageBox.warning(self, "Zmazať", "Vyberte team na zmazanie.")
+            return
+        
+        # Confirmation dialog
+        reply = QMessageBox.question(
+            self,
+            "Potvrdiť zmazanie",
+            f"Naozaj chcete zmazať team '{self.current_team_name}'?\n\n"
+            "Táto akcia je nevratná.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+        
+        if reply == QMessageBox.StandardButton.Yes:
+            try:
+                deleted_name = self.current_team_name
+                
+                # Delete team file
+                team_path = self.team_manager.get_team_path("novita", self.current_team_name)
+                if team_path.exists():
+                    team_path.unlink()
+                    log.info("Deleted Novita team: %s", self.current_team_name)
+                
+                # Remove from combo
+                current_index = self.team_combo.currentIndex()
+                self.team_combo.removeItem(current_index)
+                
+                # Clear selections and reset current team
+                self.current_team_name = None
+                self._clear_selection()
+                
+                # Select first team if any exist, otherwise leave empty
+                if self.team_combo.count() > 0:
+                    self.team_combo.setCurrentIndex(0)
+                
+                QMessageBox.information(
+                    self,
+                    "Team zmazaný",
+                    f"Team '{deleted_name}' bol úspešne zmazaný."
+                )
+            except Exception as e:
+                log.error("Failed to delete team: %s", e)
+                QMessageBox.critical(
+                    self,
+                    "Chyba",
+                    f"Nepodarilo sa zmazať team:\n{e}"
+                )
     
     def _on_sort_changed(self, _index: int) -> None:
         """Handle sort change."""
@@ -657,6 +903,13 @@ class NovitaConfigDialog(QDialog):
         self.filtered_models = filtered
         self._populate_models()
     
+    def _clear_selection(self) -> None:
+        """Clear all selections."""
+        for checkbox in self.model_checkboxes.values():
+            checkbox.setChecked(False)
+        self._selection_state.clear()
+        self._update_cost()
+    
     def _on_ok(self) -> None:
         """Handle OK button click."""
         selected_ids = [
@@ -689,11 +942,15 @@ class NovitaConfigDialog(QDialog):
             self.current_team_name = "Novita Team"
             log.info("Auto-creating team with default name: %s", self.current_team_name)
         
+        try:
+            timeout_seconds = int(os.getenv("AI_MOVE_TIMEOUT_SECONDS", "120"))
+        except ValueError:
+            timeout_seconds = 120
         team = TeamConfig(
             name=self.current_team_name,
             provider="novita",
             model_ids=selected_ids,  # Just IDs, not full objects
-            timeout_seconds=120,
+            timeout_seconds=max(5, timeout_seconds),
             created_at=datetime.now().isoformat(),
             updated_at=datetime.now().isoformat(),
         )
@@ -707,3 +964,7 @@ class NovitaConfigDialog(QDialog):
     def get_selected_models(self) -> list[dict[str, Any]]:
         """Get selected models with configuration."""
         return self.selected_models
+    
+    def get_shared_tokens_value(self) -> int:
+        """Return the shared max token setting for selected models."""
+        return self._default_shared_tokens

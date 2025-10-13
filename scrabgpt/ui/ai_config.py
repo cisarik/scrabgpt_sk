@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any
+import os
+from typing import Any, Callable
 
 from PySide6.QtCore import Qt, QThread, QObject, Signal
 from PySide6.QtWidgets import (
@@ -57,11 +58,13 @@ class AIConfigDialog(QDialog):
         current_team_name: str | None = None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Nastaviť AI Modely (Top Weekly)")
+        self.setWindowTitle("Nastaviť OpenRouter team")
         self.setModal(True)
         self.resize(950, 700)
         
         self.models: list[dict[str, Any]] = []
+        self.base_models: list[dict[str, Any]] = []
+        self.pinned_models: list[dict[str, Any]] = []
         self.sorted_models: list[dict[str, Any]] = []
         self.filtered_models: list[dict[str, Any]] = []
         self.model_checkboxes: dict[str, QCheckBox] = {}
@@ -72,7 +75,6 @@ class AIConfigDialog(QDialog):
         self.sort_combo: QComboBox | None = None
         self.free_models_label: QLabel | None = None
         self.select_free_btn: QPushButton | None = None
-        self.total_tokens_label: QLabel | None = None
         self._default_shared_tokens = self._clamp_shared_tokens(default_tokens)
         self.search_edit: QLineEdit | None = None
         self._search_text: str = ""
@@ -90,6 +92,13 @@ class AIConfigDialog(QDialog):
             ("Throughput: High to Low", "throughput_high"),
             ("Latency: Low to High", "latency_low"),
         ]
+        self._sort_strategies: dict[str, tuple[Callable[[dict[str, Any]], Any], bool]] = {
+            "price_low": (self._sort_key_total_price, False),
+            "price_high": (self._sort_key_total_price, True),
+            "context_high": (self._sort_key_context_length, True),
+            "throughput_high": (self._sort_key_throughput, True),
+            "latency_low": (self._sort_key_latency, False),
+        }
 
         self._setup_ui()
         self._load_models(order=self.current_order)
@@ -141,6 +150,11 @@ class AIConfigDialog(QDialog):
         rename_team_btn.setStyleSheet(self._small_button_style())
         rename_team_btn.clicked.connect(self._rename_team)
         controls_layout.addWidget(rename_team_btn)
+        
+        delete_team_btn = QPushButton("🗑️ Zmazať")
+        delete_team_btn.setStyleSheet(self._small_button_style_danger())
+        delete_team_btn.clicked.connect(self._delete_team)
+        controls_layout.addWidget(delete_team_btn)
 
         sort_caption = QLabel("Zoradenie:")
         sort_caption.setStyleSheet("font-size: 13px; font-weight: bold; color: #9ad0a2; margin-left: 16px;")
@@ -242,18 +256,6 @@ class AIConfigDialog(QDialog):
         )
         button_layout.addWidget(self.cancel_btn)
 
-        # Total tokens cost calculation (yellow label)
-        self.total_tokens_label = QLabel("Celkový max tokenov: 0")
-        self.total_tokens_label.setStyleSheet(
-            "font-size: 13px; font-weight: bold; color: #ffd54f; "
-            "padding: 6px 12px; background: #3d2a0f; border: 1px solid #8a6a4a; border-radius: 4px;"
-        )
-        self.total_tokens_label.setToolTip(
-            "Celkový počet tokenov, ktoré budú použité pri volaní všetkých vybraných modelov súčasne\\n"
-            "(počet modelov × max tokenov na ťah)"
-        )
-        button_layout.addWidget(self.total_tokens_label)
-
         button_layout.addStretch()
 
         self.free_models_label = QLabel("Modelov s free volaniami: 0")
@@ -335,45 +337,16 @@ class AIConfigDialog(QDialog):
     def _apply_sort(self, sort_key: str) -> None:
         """Sort models according to the selected strategy and refresh UI."""
 
-        if not self.models:
+        if not self.base_models:
             self.sorted_models = []
             self._refresh_model_list()
             return
 
-        models = list(self.models)
-
-        if sort_key == "price_low":
-            models.sort(
-                key=lambda m: (
-                    float(m.get("prompt_price", 0) or 0) + float(m.get("completion_price", 0) or 0),
-                    m.get("name", m.get("id", "")),
-                )
-            )
-        elif sort_key == "price_high":
-            models.sort(
-                key=lambda m: (
-                    float(m.get("prompt_price", 0) or 0) + float(m.get("completion_price", 0) or 0),
-                    m.get("name", m.get("id", "")),
-                ),
-                reverse=True,
-            )
-        elif sort_key == "context_high":
-            models.sort(
-                key=lambda m: int(m.get("context_length", 0) or 0),
-                reverse=True,
-            )
-        elif sort_key == "throughput_high":
-            models.sort(
-                key=lambda m: self._get_metric(m, "throughput", default=0.0),
-                reverse=True,
-            )
-        elif sort_key == "latency_low":
-            models.sort(
-                key=lambda m: self._get_metric(m, "latency", default=float("inf")),
-            )
-        else:
-            # 'top_weekly' and 'newest' keep API ordering
-            pass
+        models = list(self.base_models)
+        sort_strategy = self._sort_strategies.get(sort_key)
+        if sort_strategy is not None:
+            key_func, reverse = sort_strategy
+            models.sort(key=key_func, reverse=reverse)
 
         self.sorted_models = models
         self._refresh_model_list()
@@ -381,18 +354,72 @@ class AIConfigDialog(QDialog):
     def _refresh_model_list(self) -> None:
         """Apply search filter to the sorted models and refresh the UI."""
 
-        base_models = self.sorted_models if self.sorted_models else list(self.models)
+        base_models = self.sorted_models if self.sorted_models else list(self.base_models)
+        pinned_models = list(self.pinned_models)
 
         if self._search_text:
             needle = self._search_text.casefold()
-            filtered = [
+            filtered_base = [
                 model for model in base_models if self._matches_search(model, needle)
             ]
+            filtered = filtered_base
         else:
             filtered = base_models
 
         self.filtered_models = filtered
-        self._populate_models(filtered)
+        self.models = base_models + pinned_models
+        self._sync_selection_state()
+        display_models = filtered + pinned_models
+        self._populate_models(display_models)
+
+    def _build_pinned_models(self) -> list[dict[str, Any]]:
+        """Return synthetic OpenRouter auto-routing entries pinned to the list bottom."""
+
+        # Context length is provider-dependent; show n/a in UI.
+        pinned: list[dict[str, Any]] = [
+            {
+                "id": "openrouter/auto:floor",
+                "name": "OpenRouter Auto – Floor",
+                "display_name": "OpenRouter Auto · Floor (najnižšia cena)",
+                "subtitle": "OpenRouter zvolí najlacnejšieho dostupného poskytovateľa pre každý dotaz.",
+                "description": "Automatické smerovanie podľa ceny – ekvivalent provider.sort = 'price'.",
+                "context_length": None,
+                "prompt_price": None,
+                "completion_price": None,
+                "pricing_display": "dynamické • priorita cena",
+                "tags": ["auto", "routing", "price"],
+                "provider_sort": "price",
+                "is_pinned": True,
+            },
+            {
+                "id": "openrouter/auto:nitro",
+                "name": "OpenRouter Auto – Nitro",
+                "display_name": "OpenRouter Auto · Nitro (priorita rýchlosť)",
+                "subtitle": "OpenRouter preferuje poskytovateľov s najvyšším priepustom – provider.sort = 'throughput'.",
+                "description": "Automatické smerovanie podľa priepustu – vhodné pre čo najrýchlejšie odpovede.",
+                "context_length": None,
+                "prompt_price": None,
+                "completion_price": None,
+                "pricing_display": "dynamické • priorita priepustnosť",
+                "tags": ["auto", "routing", "speed"],
+                "provider_sort": "throughput",
+                "is_pinned": True,
+            },
+        ]
+        return pinned
+
+    def _sync_selection_state(self) -> None:
+        """Ensure selection state matches available model IDs."""
+
+        valid_ids = {model.get("id", "") for model in self.models if model.get("id")}
+        for model in self.models:
+            model_id = model.get("id")
+            if not model_id:
+                continue
+            self._selection_state.setdefault(model_id, False)
+        stale_ids = [model_id for model_id in self._selection_state if model_id not in valid_ids]
+        for model_id in stale_ids:
+            self._selection_state.pop(model_id, None)
 
     def _load_models(self, *, order: str | None = None) -> None:
         """Load models from OpenRouter in background."""
@@ -442,20 +469,25 @@ class AIConfigDialog(QDialog):
 
         # Show all models, sorted by weekly trending (already sorted by API with order=week)
         self.current_order = self.pending_order
-        previous_state = self._selection_state
-        self.models = models
-        self._selection_state = {
-            model.get("id", ""): previous_state.get(model.get("id", ""), False)
-            for model in models
-            if model.get("id")
-        }
+        previous_state = dict(self._selection_state)
+        self.base_models = models
+        self.pinned_models = self._build_pinned_models()
+        self.models = self.base_models + self.pinned_models
+        self._selection_state = {}
+        for model in self.models:
+            model_id = model.get("id")
+            if not model_id:
+                continue
+            self._selection_state[model_id] = previous_state.get(model_id, False)
+        self._sync_selection_state()
         # Token limit is now managed in settings, not dynamically updated
         
-        # Load active team's selections after models are loaded
-        if self.current_team_name:
-            self._load_team_selections(self.current_team_name)
         current_sort_key = self._current_sort_key()
         self._apply_sort(current_sort_key)
+        
+        # Load active team's selections after models are loaded and sorted
+        if self.current_team_name:
+            self._load_team_selections(self.current_team_name)
 
     def _on_models_failed(self, error: str) -> None:
         """Handle model loading failure."""
@@ -496,45 +528,80 @@ class AIConfigDialog(QDialog):
             return
 
         for model in models:
-            model_id = model["id"]
+            model_id = model.get("id")
+            if not model_id:
+                continue
             model_name = model.get("name", model_id)
-            context_length = int(model.get("context_length", 0) or 0)
-            prompt_price = float(model.get("prompt_price", 0) or 0)
-            completion_price = float(model.get("completion_price", 0) or 0)
+            display_name = model.get("display_name", model_name)
+            context_length = model.get("context_length")
+            is_pinned = bool(model.get("is_pinned"))
+            subtitle = model.get("subtitle")
 
             frame = QFrame()
             frame.setFrameShape(QFrame.Shape.StyledPanel)
-            frame.setStyleSheet(
-                "QFrame { "
-                "border: 1px solid #2f5c39; border-radius: 6px; "
-                "background: #080b08; padding: 10px; "
-                "} "
-                "QFrame:hover { border-color: #4caf50; background: #111611; }"
-            )
+            if is_pinned:
+                frame.setStyleSheet(
+                    "QFrame { "
+                    "border: 1px solid #4caf50; border-radius: 6px; "
+                    "background: #0d2415; padding: 10px; "
+                    "} "
+                    "QFrame:hover { border-color: #66d96f; background: #12301c; }"
+                )
+            else:
+                frame.setStyleSheet(
+                    "QFrame { "
+                    "border: 1px solid #2f5c39; border-radius: 6px; "
+                    "background: #080b08; padding: 10px; "
+                    "} "
+                    "QFrame:hover { border-color: #4caf50; background: #111611; }"
+                )
 
             frame_layout = QHBoxLayout(frame)
             frame_layout.setSpacing(12)
             frame_layout.setContentsMargins(10, 8, 10, 8)
 
-            checkbox = QCheckBox(self._format_checkbox_text(model_name, context_length))
-            checkbox.setStyleSheet(
-                "QCheckBox { "
-                "font-size: 13px; font-weight: bold; color: #e6f7eb; "
-                "} "
+            checkbox = QCheckBox(self._format_checkbox_text(display_name, context_length))
+            checkbox_style = (
+                "QCheckBox { font-size: 13px; font-weight: bold; color: #e6f7eb; } "
                 "QCheckBox::indicator { width: 18px; height: 18px; }"
                 "QCheckBox::indicator:unchecked { border: 1px solid #4caf50; background: #0f1a12; }"
                 "QCheckBox::indicator:checked { border: 1px solid #4caf50; background: #4caf50; }"
             )
+            if is_pinned:
+                checkbox_style = checkbox_style.replace("#e6f7eb", "#f3ffee")
+            checkbox.setStyleSheet(checkbox_style)
+            description = model.get("description")
+            if description:
+                checkbox.setToolTip(description)
             checkbox.stateChanged.connect(lambda state, mid=model_id: self._on_checkbox_changed(mid, state))
             self.model_checkboxes[model_id] = checkbox
-            frame_layout.addWidget(checkbox, stretch=1)
 
-            price_label = QLabel(self._format_price_label(prompt_price, completion_price))
+            if is_pinned and subtitle:
+                content_widget = QWidget()
+                content_layout = QVBoxLayout(content_widget)
+                content_layout.setContentsMargins(0, 0, 0, 0)
+                content_layout.setSpacing(2)
+                content_layout.addWidget(checkbox)
+                subtitle_label = QLabel(subtitle)
+                subtitle_label.setWordWrap(True)
+                subtitle_label.setStyleSheet(
+                    "font-size: 11px; color: #9ad0a2; margin-left: 2px;"
+                )
+                content_layout.addWidget(subtitle_label)
+                frame_layout.addWidget(content_widget, stretch=1)
+            else:
+                frame_layout.addWidget(checkbox, stretch=1)
+
+            price_label = QLabel(self._format_price_label(model))
             price_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            price_label.setStyleSheet(
-                "font-size: 11px; font-weight: bold; color: #9ad0a2;"
-            )
-
+            price_label_style = "font-size: 11px; font-weight: bold; color: #9ad0a2;"
+            if is_pinned:
+                price_label_style = (
+                    "font-size: 11px; font-weight: bold; color: #ffd54f; "
+                    "background: rgba(255, 213, 79, 0.10); padding: 4px 8px; border-radius: 4px;"
+                )
+                price_label.setWordWrap(True)
+            price_label.setStyleSheet(price_label_style)
             frame_layout.addWidget(price_label, alignment=Qt.AlignmentFlag.AlignRight)
 
             if self._selection_state.get(model_id, False):
@@ -551,7 +618,7 @@ class AIConfigDialog(QDialog):
         self._update_cost()
     
     @staticmethod
-    def _format_checkbox_text(model_name: str, context_length: int) -> str:
+    def _format_checkbox_text(model_name: str, context_length: int | None) -> str:
         """Return checkbox caption with bold model name and context length."""
 
         context = AIConfigDialog._format_context_length(context_length)
@@ -582,10 +649,10 @@ class AIConfigDialog(QDialog):
         return max(500, min(20000, value))
 
     @staticmethod
-    def _format_context_length(context_length: int) -> str:
+    def _format_context_length(context_length: int | None) -> str:
         """Format context length in tokens into a compact string."""
 
-        if context_length <= 0:
+        if not context_length or context_length <= 0:
             return "n/a"
         if context_length >= 1_000_000:
             return f"{context_length / 1_000_000:.1f}M"
@@ -594,20 +661,71 @@ class AIConfigDialog(QDialog):
         return str(context_length)
 
     @staticmethod
-    def _format_price_label(prompt_price: float, completion_price: float) -> str:
-        """Create a pricing summary shown next to the token spinbox."""
+    def _format_price_label(model: dict[str, Any]) -> str:
+        """Create a pricing summary showing completion price per token."""
 
-        prompt_per_k = prompt_price * 1000
-        completion_per_k = completion_price * 1000
+        special = model.get("pricing_display")
+        if isinstance(special, str) and special.strip():
+            return special
+
+        prompt_price = AIConfigDialog._safe_float(model.get("prompt_price"))
+        completion_price = AIConfigDialog._safe_float(model.get("completion_price"))
+
+        if prompt_price is None or completion_price is None:
+            return "dynamické podľa poskytovateľa"
 
         if prompt_price == 0 and completion_price == 0:
-            return "Tokeny | zadarmo"
+            return "zadarmo"
 
-        return (
-            "Tokeny | "
-            f"${prompt_per_k:.2f}/1k prompt | "
-            f"${completion_per_k:.2f}/1k completion"
+        # Show full unrounded price per token (not per 1k)
+        price_per_token = completion_price
+        return f"${price_per_token:.10f}/token"
+
+    @staticmethod
+    def _safe_float(value: Any) -> float | None:
+        """Convert a value to float, returning None when conversion is not possible."""
+
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _safe_int(value: Any) -> int:
+        """Convert a value to int, returning 0 on failure."""
+
+        if value is None:
+            return 0
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+
+    def _sort_key_total_price(self, model: dict[str, Any]) -> tuple[float, str]:
+        """Sort helper that prefers lower total price (prompt + completion)."""
+
+        total_price = (self._safe_float(model.get("prompt_price")) or 0.0) + (
+            self._safe_float(model.get("completion_price")) or 0.0
         )
+        name = model.get("name", model.get("id", ""))
+        return total_price, name
+
+    def _sort_key_context_length(self, model: dict[str, Any]) -> int:
+        """Sort helper to prioritize larger context windows."""
+
+        return self._safe_int(model.get("context_length"))
+
+    def _sort_key_throughput(self, model: dict[str, Any]) -> float:
+        """Sort helper that prefers higher throughput metrics."""
+
+        return self._get_metric(model, "throughput", default=0.0)
+
+    def _sort_key_latency(self, model: dict[str, Any]) -> float:
+        """Sort helper that prefers lower latency metrics."""
+
+        return self._get_metric(model, "latency", default=float("inf"))
 
     @staticmethod
     def _get_metric(model: dict[str, Any], metric: str, *, default: float) -> float:
@@ -641,8 +759,10 @@ class AIConfigDialog(QDialog):
     def _is_free_model(model: dict[str, Any]) -> bool:
         """Return True when both prompt and completion prices are zero."""
 
-        prompt_price = float(model.get("prompt_price", 0) or 0)
-        completion_price = float(model.get("completion_price", 0) or 0)
+        prompt_price = AIConfigDialog._safe_float(model.get("prompt_price"))
+        completion_price = AIConfigDialog._safe_float(model.get("completion_price"))
+        if prompt_price is None or completion_price is None:
+            return False
         return prompt_price == 0 and completion_price == 0
 
     def _select_free_models(self) -> None:
@@ -769,8 +889,10 @@ class AIConfigDialog(QDialog):
     
     def _update_cost(self) -> None:
         """Update estimated cost based on selected models."""
-        selected = []
+        if self.ok_btn is None or self.cost_label is None:
+            return
         
+        selected = []
         shared_tokens = self._shared_tokens_value()
 
         for model in self.models:
@@ -791,25 +913,42 @@ class AIConfigDialog(QDialog):
             )
             return
         
-        prompt_tokens = 2000
-        max_completion = max(m["max_tokens"] for m in selected)
+        # Calculate max cost per move: sum of (tokens × completion_price) for each model
+        total_cost = 0.0
+        dynamic_pricing = False
+        for model in selected:
+            completion_price = self._safe_float(model.get("completion_price"))
+            if completion_price is None:
+                dynamic_pricing = True
+                continue
+            # completion_price is per token, multiply by max_tokens for this model
+            model_cost = shared_tokens * completion_price
+            total_cost += model_cost
         
-        total_cost = calculate_estimated_cost(selected, prompt_tokens, max_completion)
-        
+        # Format: white text + yellow value
         if total_cost >= 0.01:
             cost_str = f"${total_cost:.4f}"
         elif total_cost >= 0.0001:
             cost_str = f"${total_cost:.6f}"
         else:
-            cost_str = f"${total_cost:.8f}"
-        
+            cost_str = f"${total_cost:.10f}"
+
+        if dynamic_pricing:
+            if total_cost > 0:
+                cost_summary = f"{cost_str} + dynamické"
+            else:
+                cost_summary = "dynamické podľa poskytovateľa"
+        else:
+            cost_summary = cost_str
+
         self.cost_label.setText(
-            f"✓ {len(selected)} modelov vybraných  |  "
-            f"💰 Maximálna cena za ťah: {cost_str}"
+            f'<span style="color: white;">✓ {len(selected)} modelov vybraných  |  '
+            f'💰 Maximálna cena za ťah: </span>'
+            f'<span style="color: #ffd54f; font-weight: bold;">{cost_summary}</span>'
         )
         self.cost_label.setStyleSheet(
             "padding: 10px; background: #173422; border-radius: 6px; "
-            "font-size: 13px; font-weight: bold; color: #9ad0a2; border: 2px solid #4caf50;"
+            "font-size: 13px; font-weight: bold; border: 2px solid #4caf50;"
         )
     
     def _on_ok(self) -> None:
@@ -840,11 +979,15 @@ class AIConfigDialog(QDialog):
             log.info("Auto-creating OpenRouter team with default name: %s", self.current_team_name)
         
         selected_ids = [m["id"] for m in self.selected_models if m.get("id")]
+        try:
+            timeout_seconds = int(os.getenv("AI_MOVE_TIMEOUT_SECONDS", "120"))
+        except ValueError:
+            timeout_seconds = 120
         team = TeamConfig(
             name=self.current_team_name,
             provider="openrouter",
             model_ids=selected_ids,  # Just IDs, not full objects
-            timeout_seconds=120,
+            timeout_seconds=max(5, timeout_seconds),
             created_at=datetime.now().isoformat(),
             updated_at=datetime.now().isoformat(),
         )
@@ -864,6 +1007,16 @@ class AIConfigDialog(QDialog):
             "QPushButton:pressed { background: #236a34; color: #d7f4dd; }"
         )
     
+    def _small_button_style_danger(self) -> str:
+        return (
+            "QPushButton { "
+            "background: #c62828; color: white; font-weight: bold; "
+            "padding: 6px 12px; border-radius: 6px; font-size: 11px; border: 1px solid #8e0000; "
+            "} "
+            "QPushButton:hover { background: #d32f2f; } "
+            "QPushButton:pressed { background: #b71c1c; }"
+        )
+    
     def _populate_team_combo(self) -> None:
         """Populate team selector with available teams."""
         if self.team_combo is None:
@@ -877,10 +1030,7 @@ class AIConfigDialog(QDialog):
             # Load existing teams
             teams = self.team_manager.list_teams("openrouter")
             
-            # Add "New Team" option first
-            self.team_combo.addItem("[ Nový team ]", None)
-            
-            # Add existing teams
+            # Add existing teams only (no "New Team" placeholder)
             for team in teams:
                 self.team_combo.addItem(team.name, team.name)
             
@@ -937,20 +1087,15 @@ class AIConfigDialog(QDialog):
         
         team_name = self.team_combo.itemData(index)
         
-        if team_name is None:
-            # "[ Nový team ]" selected - clear selections for fresh start
-            self._clear_selection()
-            self.current_team_name = None
-            return
-        
         # Update current team name
         self.current_team_name = team_name
         
         # Load team selections (only works if models are already loaded)
-        self._load_team_selections(team_name)
+        if team_name:
+            self._load_team_selections(team_name)
     
     def _create_new_team(self) -> None:
-        """Create a new team."""
+        """Create a new team with empty selection."""
         team_name, ok = QInputDialog.getText(
             self,
             "Nový Team",
@@ -959,6 +1104,9 @@ class AIConfigDialog(QDialog):
         )
         
         if ok and team_name:
+            # Clear all selections for fresh start
+            self._clear_selection()
+            
             # Add to combo
             if self.team_combo:
                 # Block signals to prevent _on_team_changed from triggering
@@ -970,8 +1118,7 @@ class AIConfigDialog(QDialog):
                 
                 # Update current team name
                 self.current_team_name = team_name
-                # Don't clear selections - keep what user has already selected
-                log.info("Created new team '%s' with current selections", team_name)
+                log.info("Created new team '%s' with empty selection", team_name)
     
     def _rename_team(self) -> None:
         """Rename current team."""
@@ -992,6 +1139,57 @@ class AIConfigDialog(QDialog):
             self.team_combo.setItemText(current_index, new_name)
             self.team_combo.setItemData(current_index, new_name)
             self.current_team_name = new_name
+    
+    def _delete_team(self) -> None:
+        """Delete current team with confirmation."""
+        if not self.team_combo or not self.current_team_name:
+            QMessageBox.warning(self, "Zmazať", "Vyberte team na zmazanie.")
+            return
+        
+        # Confirmation dialog
+        reply = QMessageBox.question(
+            self,
+            "Potvrdiť zmazanie",
+            f"Naozaj chcete zmazať team '{self.current_team_name}'?\n\n"
+            "Táto akcia je nevratná.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+        
+        if reply == QMessageBox.StandardButton.Yes:
+            try:
+                deleted_name = self.current_team_name
+                
+                # Delete team file
+                team_path = self.team_manager.get_team_path("openrouter", self.current_team_name)
+                if team_path.exists():
+                    team_path.unlink()
+                    log.info("Deleted OpenRouter team: %s", self.current_team_name)
+                
+                # Remove from combo
+                current_index = self.team_combo.currentIndex()
+                self.team_combo.removeItem(current_index)
+                
+                # Clear selections and reset current team
+                self.current_team_name = None
+                self._clear_selection()
+                
+                # Select first team if any exist, otherwise leave empty
+                if self.team_combo.count() > 0:
+                    self.team_combo.setCurrentIndex(0)
+                
+                QMessageBox.information(
+                    self,
+                    "Team zmazaný",
+                    f"Team '{deleted_name}' bol úspešne zmazaný."
+                )
+            except Exception as e:
+                log.error("Failed to delete team: %s", e)
+                QMessageBox.critical(
+                    self,
+                    "Chyba",
+                    f"Nepodarilo sa zmazať team:\n{e}"
+                )
     
     def _clear_selection(self) -> None:
         """Clear all model selections."""

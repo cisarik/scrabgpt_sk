@@ -96,15 +96,104 @@ class MoveModel(BaseModel):
         return cast(Direction, d)
 
 
-def parse_ai_move(text: str) -> MoveModel:
+def _extract_json_from_markdown(text: str) -> str | None:
+    """Extrahuje JSON z markdown code blocku (```json ... ``` alebo ``` ... ```).
+    
+    Hľadá prvý výskyt code blocku v texte a extrahuje jeho obsah.
+    Vracia None ak žiadny blok nebol nájdený.
+    """
+    import re
+    
+    # Hľadaj ```json ... ``` alebo ``` ... ```
+    # Pattern zachytí všetko medzi značkami
+    patterns = [
+        r'```json\s*\n(.*?)\n```',  # ```json ... ```
+        r'```\s*\n(.*?)\n```',       # ``` ... ```
+        r'```json\s*(.*?)```',       # ```json...``` (bez newline)
+        r'```(.*?)```',               # ```...``` (bez newline)
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, text, re.DOTALL)
+        if match:
+            return match.group(1).strip()
+    
+    return None
+
+
+def _extract_inline_json_object(text: str) -> str | None:
+    """Nájde prvý vyvážený JSON objekt mimo markdown blokov.
+
+    Vyhľadáva prvú složenú zátvorku a snaží sa nájsť zodpovedajúcu koncovú.
+    Ignoruje zátvorky vo vnútri stringov a vráti kandidáta len v prípade,
+    že obsahuje kľúč `placements` (aby sa predišlo nesúvisiacim objektom).
+    """
+    start = 0
+    length = len(text)
+    while start < length:
+        brace_index = text.find("{", start)
+        if brace_index == -1:
+            return None
+        depth = 0
+        in_string = False
+        escape = False
+        for idx in range(brace_index, length):
+            char = text[idx]
+            if in_string:
+                if escape:
+                    escape = False
+                    continue
+                if char == "\\":
+                    escape = True
+                    continue
+                if char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+                continue
+            if char == "{":
+                depth += 1
+                continue
+            if char == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = text[brace_index : idx + 1]
+                    if "placements" not in candidate:
+                        start = brace_index + 1
+                        break
+                    return candidate.strip()
+        else:
+            # Nedokázali nájsť ukončovaciu zátvorku - ukonči prehliadanie
+            return None
+        start = brace_index + 1
+    return None
+
+
+def parse_ai_move(text: str) -> tuple[MoveModel, str]:
     """Napevno očakávaj JSON objekt; pri zlyhaní vyhoď výnimku s dôvodom.
 
     Komentár (SK): Parsuje sa striktne cez `json.loads` a `model_validate`.
     Podporuje markdown code blocks (```json ... ```).
+    
+    Fallback stratégia:
+    1. Skúsi parsovať priamo (s odstránením markdown blokov na začiatku/konci)
+    2. Ak zlyhá, hľadá JSON v markdown blokoch vo vnútri textu
+    3. Ak ani to zlyhá, hľadá prvý JSON objekt priamo v texte
+    4. Ak aj to zlyhá, vyhodí pôvodnú chybu
+    
+    Returns:
+        tuple[MoveModel, str]: (parsed_move, parse_method) kde parse_method je:
+            - "direct": JSON bol parsovaný priamo
+            - "markdown_extraction": JSON bol extrahovaný z markdown bloku
+            - "inline_json": JSON blok nájdený priamo v texte (mimo markdown)
     """
     import json
+    import logging
+    
+    log = logging.getLogger("scrabgpt.ai.schema")
 
-    # Strip markdown code blocks if present
+    # Strip markdown code blocks if present at start/end
     cleaned = text.strip()
     if cleaned.startswith("```json"):
         cleaned = cleaned[7:]  # Remove ```json
@@ -116,8 +205,42 @@ def parse_ai_move(text: str) -> MoveModel:
     
     cleaned = cleaned.strip()
     
-    obj = json.loads(cleaned)
-    return MoveModel.model_validate(obj)
+    # Pokus 1: Parsuj priamo
+    try:
+        obj = json.loads(cleaned)
+        return MoveModel.model_validate(obj), "direct"
+    except json.JSONDecodeError as e:
+        log.debug("Priamy JSON parse zlyhal: %s", e)
+        
+        # Pokus 2: Hľadaj JSON v markdown blokoch
+        extracted = _extract_json_from_markdown(text)
+        if extracted:
+            log.info("Našiel som JSON v markdown bloku, skúšam parsovať...")
+            log.debug("Extrahovaný JSON (prvých 200 znakov): %s", extracted[:200])
+            try:
+                obj = json.loads(extracted)
+                log.info("✓ Úspešne parsovaný JSON z markdown bloku")
+                return MoveModel.model_validate(obj), "markdown_extraction"
+            except (json.JSONDecodeError, ValueError) as e2:
+                log.warning("Parsing extrahovaného JSON zlyhal: %s", e2)
+                # Pokračuj k vyhodeniu pôvodnej chyby
+
+        # Pokus 3: inline JSON objekt mimo markdown blockov
+        inline = _extract_inline_json_object(text)
+        if inline:
+            log.info("Našiel som JSON blok mimo markdown, skúšam inline fallback...")
+            log.debug("Inline JSON kandidát (prvých 200 znakov): %s", inline[:200])
+            try:
+                obj = json.loads(inline)
+                log.info("✓ Úspešne parsovaný JSON z textu (inline fallback)")
+                return MoveModel.model_validate(obj), "inline_json"
+            except (json.JSONDecodeError, ValueError) as e3:
+                log.warning("Parsing inline JSON kandidáta zlyhal: %s", e3)
+                # Pokračuj k vyhodeniu pôvodnej chyby
+        
+        # Žiadny fallback nezabrral, vyhoď pôvodnú chybu
+        log.error("Všetky parsing pokusy zlyhali")
+        raise
 
 
 def to_move_payload(m: MoveModel) -> dict[str, Any]:

@@ -35,8 +35,9 @@ ScrabGPT now supports **Novita AI** as a multi-model reasoning provider alongsid
 Add to `.env`:
 ```bash
 NOVITA_API_KEY='your-api-key-here'
-NOVITA_MAX_TOKENS='4096'        # Default: 4096
-NOVITA_TIMEOUT_SECONDS='120'    # Default: 120
+AI_MOVE_TIMEOUT_SECONDS='120'    # Shared timeout for all AI moves
+# Shared per-move cap (applies to OpenRouter & Novita)
+AI_MOVE_MAX_OUTPUT_TOKENS='5000'
 ```
 
 ### 2. Get API Key
@@ -149,7 +150,7 @@ Provider selection logic in `_start_ai_turn()`:
 if self.opponent_mode == OpponentMode.NOVITA and self.selected_novita_models:
     provider_type = "novita"
     selected_models = self.selected_novita_models
-    timeout_seconds = self.novita_timeout_seconds
+    timeout_seconds = self.ai_move_timeout_seconds
     use_multi = True
 ```
 
@@ -294,7 +295,7 @@ poetry run pytest tests/test_novita_client.py
 - Check Novita API status
 
 ### Timeout Issues
-- Increase `NOVITA_TIMEOUT_SECONDS`
+- Increase `AI_MOVE_TIMEOUT_SECONDS`
 - Use faster models (8B variants)
 - Check network latency
 

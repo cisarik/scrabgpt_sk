@@ -152,7 +152,7 @@ def propose_move(
     raw = client._call_text(prompt, max_output_tokens=client.ai_move_max_output_tokens)
     
     # Parse response - no retry on failure
-    model = parse_ai_move(raw)
+    model, _parse_method = parse_ai_move(raw)  # Single player doesn't need parse method tracking
     move = to_move_payload(model)
 
     # Kompatibilita s UI – udržiavaj 'exchange' kľúč (prázdny zoznam)

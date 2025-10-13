@@ -88,8 +88,9 @@ bodovania, minimalistickú integráciu OpenAI (structured completions) a čistý
   - **Lokálny vývoj:** všetky testy sa spúšťajú s real API calls (ak sú nastavené API keys v `.env`)
   - **Conftest:** `tests/conftest.py` načíta `.env` pre API keys
 - **Bezpečnosť:** `.env` s `OPENAI_API_KEY`, `OPENROUTER_API_KEY`; nikdy necommitovať do gitu.  
-- **Konfigurácia poskytovateľov:** `.env` dopĺňa `NOVITA_API_KEY`, `NOVITA_MAX_TOKENS`,
-  `NOVITA_TIMEOUT_SECONDS`; hodnoty majú defaulty a sú validované v UI.  
+- **Konfigurácia poskytovateľov:** `.env` dopĺňa `NOVITA_API_KEY`,
+  `AI_MOVE_TIMEOUT_SECONDS`; výstupný limit sa riadi jednotnou premennou
+  `AI_MOVE_MAX_OUTPUT_TOKENS`, ktorá platí pre všetkých providerov a je validovaná v UI.  
 - **Perzistencia konfigurácií:**
   - globálny súbor `~/.scrabgpt/config.json` drží `opponent_mode`,
   - priečinok `~/.scrabgpt/teams/` obsahuje JSON pre každý provider,
@@ -213,8 +214,8 @@ worker.progress_update.connect(on_progress)
 
 ### Environment Variables
 ```bash
-SHOW_AGENT_ACTIVITY_AUTO='true'  # Auto-show agents dialog when agent starts
-OPENROUTER_MAX_TOKENS='8000'     # Max tokens per OpenRouter move
+SHOW_AGENT_ACTIVITY_AUTO='true'    # Auto-show agents dialog when agent starts
+AI_MOVE_MAX_OUTPUT_TOKENS='5000'   # Unified per-move cap for all providers
 ```
 
 ### Key Benefits

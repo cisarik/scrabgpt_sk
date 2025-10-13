@@ -337,12 +337,12 @@ class SettingsDialog(QDialog):
     
     def _configure_openrouter(self) -> None:
         """Open OpenRouter model configuration dialog."""
-        # Use OpenRouter-specific token limit (default 8000)
-        openrouter_tokens = int(os.getenv("OPENROUTER_MAX_TOKENS", "8000"))
+        # Use unified AI_MOVE_MAX_OUTPUT_TOKENS (prefer in-dialog value)
+        ai_tokens = self._current_ai_tokens_value()
         
         dialog = AIConfigDialog(
             parent=self,
-            default_tokens=openrouter_tokens,
+            default_tokens=ai_tokens,
             lock_default=False,  # Token limit managed in settings
         )
         
@@ -350,6 +350,8 @@ class SettingsDialog(QDialog):
             # Store selected models for parent to retrieve
             self.selected_openrouter_models = dialog.get_selected_models()
             self.openrouter_tokens = dialog.get_shared_tokens_value()
+            # Sync shared token limit back to settings field for consistency
+            self.ai_tokens_edit.setText(str(self.openrouter_tokens))
             log.info("OpenRouter models configured: %d models", len(self.selected_openrouter_models))
             
             # Refresh team info display in mode selector
@@ -360,16 +362,19 @@ class SettingsDialog(QDialog):
         """Open Novita model configuration dialog."""
         from .novita_config_dialog import NovitaConfigDialog
         
-        # Use Novita-specific token limit (default 4096)
-        novita_tokens = int(os.getenv("NOVITA_MAX_TOKENS", "4096"))
+        # Use unified AI_MOVE_MAX_OUTPUT_TOKENS (prefer in-dialog value)
+        ai_tokens = self._current_ai_tokens_value()
         dialog = NovitaConfigDialog(
             parent=self,
-            default_tokens=novita_tokens,
+            default_tokens=ai_tokens,
+            use_env_default=False,
         )
         if dialog.exec() == QDialog.DialogCode.Accepted:
             # Store selected models for parent to retrieve
             self.selected_novita_models = dialog.get_selected_models()
-            self.novita_tokens = self.selected_novita_models[0]["max_tokens"] if self.selected_novita_models else novita_tokens
+            self.novita_tokens = dialog.get_shared_tokens_value()
+            # Sync shared token limit back to settings field for consistency
+            self.ai_tokens_edit.setText(str(self.novita_tokens))
             log.info("Novita models configured: %d models", len(self.selected_novita_models))
             
             # Refresh team info display in mode selector
@@ -566,24 +571,6 @@ class SettingsDialog(QDialog):
             j_row_w,
         )
         
-        # OpenRouter max tokens per move
-        self.openrouter_tokens_edit = QLineEdit(widget)
-        self.openrouter_tokens_edit.setValidator(QIntValidator(1, 1_000_000, widget))
-        self.openrouter_tokens_edit.setText(os.getenv("OPENROUTER_MAX_TOKENS", "8000"))
-        self.openrouter_tokens_edit.setStyleSheet(self.key_edit.styleSheet())
-        self.openrouter_tokens_cost = QLabel("")
-        self.openrouter_tokens_cost.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        self.openrouter_tokens_cost.setStyleSheet("color: #ffd54f; font-size: 12px;")
-        or_row = QHBoxLayout()
-        or_row.addWidget(self.openrouter_tokens_edit, 2)
-        or_row.addWidget(self.openrouter_tokens_cost, 1)
-        or_row_w = QWidget(widget)
-        or_row_w.setLayout(or_row)
-        layout.addRow(
-            self._styled_label("OpenRouter — max tokenov na ťah:"),
-            or_row_w,
-        )
-        
         # Test connection button
         self.test_btn = QPushButton("🔌 Testovať pripojenie", widget)
         self.test_btn.clicked.connect(self._test_connection)
@@ -599,7 +586,6 @@ class SettingsDialog(QDialog):
         # Connect cost updates
         self.ai_tokens_edit.textChanged.connect(self._update_costs)
         self.judge_tokens_edit.textChanged.connect(self._update_costs)
-        self.openrouter_tokens_edit.textChanged.connect(self._update_costs)
         self._update_costs()
         
         return widget
@@ -633,7 +619,32 @@ class SettingsDialog(QDialog):
         
         self.ai_tokens_cost.setText(fmt(self.ai_tokens_edit.text()))
         self.judge_tokens_cost.setText(fmt(self.judge_tokens_edit.text()))
-        self.openrouter_tokens_cost.setText(fmt(self.openrouter_tokens_edit.text()))
+    
+    @staticmethod
+    def _parse_positive_int(value: Any) -> int | None:
+        """Return positive integer parsed from value, otherwise None."""
+
+        if value is None:
+            return None
+        try:
+            tokens = int(str(value))
+        except (TypeError, ValueError):
+            return None
+        return tokens if tokens > 0 else None
+
+    def _current_ai_tokens_value(self) -> int:
+        """Resolve the current AI token cap from the input or environment."""
+
+        text_value = self.ai_tokens_edit.text().strip()
+        field_tokens = self._parse_positive_int(text_value)
+        if field_tokens is not None:
+            return field_tokens
+
+        env_tokens = self._parse_positive_int(os.getenv("AI_MOVE_MAX_OUTPUT_TOKENS"))
+        if env_tokens is not None:
+            return env_tokens
+
+        return 3600
     
     def _load_installed_variants(self, *, select_slug: str | None = None) -> None:
         """Load installed variants into combo box."""
@@ -1291,15 +1302,12 @@ class SettingsDialog(QDialog):
         # Save token limits
         ai_tokens = self.ai_tokens_edit.text().strip() or "3600"
         judge_tokens = self.judge_tokens_edit.text().strip() or "800"
-        openrouter_tokens = self.openrouter_tokens_edit.text().strip() or "8000"
         os.environ["AI_MOVE_MAX_OUTPUT_TOKENS"] = ai_tokens
         os.environ["JUDGE_MAX_OUTPUT_TOKENS"] = judge_tokens
-        os.environ["OPENROUTER_MAX_TOKENS"] = openrouter_tokens
         try:
             from dotenv import set_key as _set_key2
             _set_key2(ENV_PATH, "AI_MOVE_MAX_OUTPUT_TOKENS", ai_tokens)
             _set_key2(ENV_PATH, "JUDGE_MAX_OUTPUT_TOKENS", judge_tokens)
-            _set_key2(ENV_PATH, "OPENROUTER_MAX_TOKENS", openrouter_tokens)
         except Exception:
             pass
         

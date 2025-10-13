@@ -109,8 +109,8 @@ ENV_PATH = str(ROOT_DIR / ".env")
 LOG_PATH = default_log_path()
 EUR_PER_TOKEN = 0.00000186  # 1 token ≈ 0.00000186 EUR (zadané majiteľom)
 
-DEFAULT_OPENROUTER_TIMEOUT = 120
-OPENROUTER_TIMEOUT_CHOICES: list[tuple[int, str]] = [
+DEFAULT_AI_MOVE_TIMEOUT = 120
+AI_MOVE_TIMEOUT_CHOICES: list[tuple[int, str]] = [
     (30, "30 sekúnd"),
     (60, "1 minúta"),
     (120, "2 minúty"),
@@ -1609,12 +1609,13 @@ class MainWindow(QMainWindow):
         # OpenRouter multi-model configuration
         self.use_multi_model: bool = False
         self.selected_ai_models: list[dict[str, Any]] = []
-        self.openrouter_timeout_seconds: int = self._load_openrouter_timeout()
         
         # Novita multi-model configuration
         self.use_novita: bool = False
         self.selected_novita_models: list[dict[str, Any]] = []
-        self.novita_timeout_seconds: int = self._load_novita_timeout()
+        
+        # Unified AI move timeout configuration
+        self.ai_move_timeout_seconds: int = self._load_ai_move_timeout()
         
         # Load saved teams on startup
         self._load_saved_teams()
@@ -1882,10 +1883,10 @@ class MainWindow(QMainWindow):
             "border: 1px solid #2f3645;"
             "}"
         )
-        for seconds, label in OPENROUTER_TIMEOUT_CHOICES:
+        for seconds, label in AI_MOVE_TIMEOUT_CHOICES:
             self.timeout_combo.addItem(label, seconds)
 
-        current_timeout = self.openrouter_timeout_seconds
+        current_timeout = self.ai_move_timeout_seconds
         current_index = self.timeout_combo.findData(current_timeout)
         if current_index == -1:
             custom_label = self._format_timeout_choice(current_timeout)
@@ -1960,24 +1961,18 @@ class MainWindow(QMainWindow):
 
         self._reset_to_idle_state()
 
-    def _load_openrouter_timeout(self) -> int:
-        raw = os.getenv("OPENROUTER_TIMEOUT_SECONDS")
+    def _load_ai_move_timeout(self) -> int:
+        raw = (
+            os.getenv("AI_MOVE_TIMEOUT_SECONDS")
+            or os.getenv("OPENROUTER_TIMEOUT_SECONDS")
+            or os.getenv("NOVITA_TIMEOUT_SECONDS")
+        )
         try:
-            value = int(raw) if raw is not None else DEFAULT_OPENROUTER_TIMEOUT
+            value = int(raw) if raw is not None else DEFAULT_AI_MOVE_TIMEOUT
         except ValueError:
-            value = DEFAULT_OPENROUTER_TIMEOUT
+            value = DEFAULT_AI_MOVE_TIMEOUT
         if value < 5:
-            value = DEFAULT_OPENROUTER_TIMEOUT
-        return value
-    
-    def _load_novita_timeout(self) -> int:
-        raw = os.getenv("NOVITA_TIMEOUT_SECONDS")
-        try:
-            value = int(raw) if raw is not None else DEFAULT_OPENROUTER_TIMEOUT
-        except ValueError:
-            value = DEFAULT_OPENROUTER_TIMEOUT
-        if value < 5:
-            value = DEFAULT_OPENROUTER_TIMEOUT
+            value = DEFAULT_AI_MOVE_TIMEOUT
         return value
     
     def _load_saved_teams(self) -> None:
@@ -1988,7 +1983,7 @@ class MainWindow(QMainWindow):
             # Convert IDs to minimal model objects needed for runtime
             self.selected_ai_models = [{"id": mid, "name": mid} for mid in openrouter_team.model_ids]
             self.use_multi_model = len(openrouter_team.model_ids) > 0
-            self.openrouter_timeout_seconds = openrouter_team.timeout_seconds
+            self.ai_move_timeout_seconds = openrouter_team.timeout_seconds
             log.info("Loaded ACTIVE OpenRouter team '%s': %d models", openrouter_team.name, len(openrouter_team.model_ids))
         
         # Load ACTIVE Novita team (not default team!)
@@ -1997,7 +1992,10 @@ class MainWindow(QMainWindow):
             # Convert IDs to minimal model objects needed for runtime
             self.selected_novita_models = [{"id": mid, "name": mid} for mid in novita_team.model_ids]
             self.use_novita = len(novita_team.model_ids) > 0
-            self.novita_timeout_seconds = novita_team.timeout_seconds
+            self.ai_move_timeout_seconds = max(
+                self.ai_move_timeout_seconds,
+                novita_team.timeout_seconds,
+            )
             log.info("Loaded ACTIVE Novita team '%s': %d models", novita_team.name, len(novita_team.model_ids))
         
         # Load saved opponent mode
@@ -2260,10 +2258,10 @@ class MainWindow(QMainWindow):
             seconds = int(data)
         except (TypeError, ValueError):
             return
-        if seconds == self.openrouter_timeout_seconds:
+        if seconds == self.ai_move_timeout_seconds:
             return
-        self.openrouter_timeout_seconds = seconds
-        self._update_env_value("OPENROUTER_TIMEOUT_SECONDS", str(seconds))
+        self.ai_move_timeout_seconds = seconds
+        self._update_env_value("AI_MOVE_TIMEOUT_SECONDS", str(seconds))
         display = self._format_timeout_choice(seconds)
         log.info("Timeout updated to %s (%ds)", display, seconds)
         if hasattr(self, "status") and isinstance(self.status, QStatusBar):
@@ -3384,7 +3382,7 @@ class MainWindow(QMainWindow):
         # Determine provider type and models/timeout based on opponent mode
         provider_type = "openrouter"  # default
         selected_models = []
-        timeout_seconds = self.openrouter_timeout_seconds
+        timeout_seconds = self.ai_move_timeout_seconds
         use_multi = False
         
         log.info("AI turn: opponent_mode=%s", self.opponent_mode)
@@ -3394,13 +3392,13 @@ class MainWindow(QMainWindow):
         if self.opponent_mode == OpponentMode.OPENROUTER and self.selected_ai_models:
             provider_type = "openrouter"
             selected_models = self.selected_ai_models
-            timeout_seconds = self.openrouter_timeout_seconds
+            timeout_seconds = self.ai_move_timeout_seconds
             use_multi = True
             log.info("Using OpenRouter with %d models", len(selected_models))
         elif self.opponent_mode == OpponentMode.NOVITA and self.selected_novita_models:
             provider_type = "novita"
             selected_models = self.selected_novita_models
-            timeout_seconds = self.novita_timeout_seconds
+            timeout_seconds = self.ai_move_timeout_seconds
             use_multi = True
             log.info("Using Novita with %d models", len(selected_models))
         else:
@@ -3973,6 +3971,25 @@ class MainWindow(QMainWindow):
         
         # Connect accepted signal to handle dialog results
         def on_settings_accepted():
+            # Get and save opponent mode
+            new_mode = dlg.get_selected_mode()
+            new_agent = dlg.get_selected_agent_name()
+            
+            if new_mode != self.opponent_mode or new_agent != self.selected_agent_name:
+                self.opponent_mode = new_mode
+                self.selected_agent_name = new_agent
+                
+                # Save opponent mode to config.json
+                self.team_manager.save_opponent_mode(new_mode.value)
+                log.info("Saved opponent mode to config: %s", new_mode.value)
+                
+                # Update status message
+                mode_name = new_mode.display_name_sk
+                if new_mode == OpponentMode.AGENT and new_agent:
+                    self.status.showMessage(f"AI Režim: {mode_name} ({new_agent})", 3000)
+                else:
+                    self.status.showMessage(f"AI Režim: {mode_name}", 3000)
+            
             new_ai_tokens, from_env = self._load_ai_move_max_tokens()
             self.ai_move_max_tokens = new_ai_tokens
             self._ai_tokens_from_env = from_env
@@ -3998,7 +4015,7 @@ class MainWindow(QMainWindow):
                     f"Variant nastavený na {self.variant_language}. Spusti novú hru, aby sa zmena prejavila.",
                     5000,
                 )
-            else:
+            elif new_mode == self.opponent_mode and new_agent == self.selected_agent_name:
                 self.status.showMessage("Nastavenia uložené.", 2000)
         
         # Connect signal and show dialog (non-blocking, non-modal)
@@ -4298,11 +4315,11 @@ class MainWindow(QMainWindow):
         """Configure OpenRouter models for multi-model gameplay."""
         from .ai_config import AIConfigDialog
         
-        # Use OpenRouter-specific token limit (default 8000)
-        openrouter_tokens = int(os.getenv("OPENROUTER_MAX_TOKENS", "8000"))
+        # Use unified AI_MOVE_MAX_OUTPUT_TOKENS
+        ai_tokens = int(os.getenv("AI_MOVE_MAX_OUTPUT_TOKENS", "3600"))
         dialog = AIConfigDialog(
             parent=self,
-            default_tokens=openrouter_tokens,
+            default_tokens=ai_tokens,
             lock_default=False,  # Token limit managed in settings
         )
         if dialog.exec() == QDialog.DialogCode.Accepted:

@@ -153,7 +153,7 @@ if novita_models:
     self.team_manager.save_provider_models(
         "novita",
         novita_models,
-        self.novita_timeout_seconds,
+        self.ai_move_timeout_seconds,
     )
     
     log.info("Novita models updated and saved: %d models", len(novita_models))

@@ -43,6 +43,8 @@ class ResponseDetailDialog(QDialog):
         judge_valid = self.result_data.get("judge_valid")
         prompt_tokens = self.result_data.get("prompt_tokens")
         completion_tokens = self.result_data.get("completion_tokens")
+        parse_method = self.result_data.get("parse_method", "")
+        parser_attempts = self.result_data.get("parser_attempts") or []
 
         info_text = f"<b>Status:</b> {status} | <b>Score:</b> {score}"
         if judge_valid is not None:
@@ -51,6 +53,14 @@ class ResponseDetailDialog(QDialog):
             info_text += (
                 f" | <b>Tokens:</b> P {prompt_tokens or 0} / C {completion_tokens or 0}"
             )
+        if parse_method:
+            method_label = {
+                "direct": "priame JSON",
+                "markdown_extraction": "markdown fallback",
+                "inline_json": "inline JSON fallback",
+                "gpt_fallback": "GPT fallback",
+            }.get(parse_method, parse_method)
+            info_text += f" | <b>Parser:</b> {method_label}"
 
         info_label = QLabel(info_text)
         info_label.setStyleSheet("font-size: 12px; padding: 6px; color: #ccc;")
@@ -110,16 +120,34 @@ class ResponseDetailDialog(QDialog):
         
         splitter.addWidget(raw_widget)
         
-        # GPT analysis section
+        # GPT analysis / Move details section
         analysis_widget = QWidget()
         analysis_layout = QVBoxLayout(analysis_widget)
         analysis_layout.setContentsMargins(0, 0, 0, 0)
         analysis_layout.setSpacing(4)
         
-        analysis_title = QLabel("🤖 GPT-5-mini Analysis")
+        # Determine title based on whether GPT was used
+        gpt_analysis = self.result_data.get("gpt_analysis", "")
+        error_analysis = self.result_data.get("error_analysis", "")
+        parser_path = " → ".join(parser_attempts) if parser_attempts else ""
+        
+        if gpt_analysis:
+            title_text = "🤖 GPT-5-mini Fallback Analysis"
+            title_bg = "#1a3a4d"  # Blue for GPT
+        elif parse_method == "markdown_extraction":
+            title_text = "📋 Detaily ťahu (JSON extrahovaný z markdown)"
+            title_bg = "#2a4d2a"  # Green for successful extraction
+        elif parse_method == "inline_json":
+            title_text = "📋 Detaily ťahu (JSON extrahovaný z textu)"
+            title_bg = "#2a3a4d"  # Teal for inline fallback
+        else:
+            title_text = "📋 Detaily ťahu"
+            title_bg = "#2a2a2a"  # Gray for normal parse
+        
+        analysis_title = QLabel(title_text)
         analysis_title.setStyleSheet(
-            "font-size: 13px; font-weight: bold; padding: 6px; "
-            "background: #1a3a4d; color: white; border-radius: 4px;"
+            f"font-size: 13px; font-weight: bold; padding: 6px; "
+            f"background: {title_bg}; color: white; border-radius: 4px;"
         )
         analysis_layout.addWidget(analysis_title)
         
@@ -134,16 +162,21 @@ class ResponseDetailDialog(QDialog):
             "}"
         )
         
-        # Check for error analysis first (for parse errors)
-        error_analysis = self.result_data.get("error_analysis", "")
-        gpt_analysis = self.result_data.get("gpt_analysis", "")
+        # Note: error_analysis, gpt_analysis, parse_method already retrieved above
         
         if error_analysis:
             # Show error analysis for parse errors
-            self.analysis_text.setPlainText(error_analysis)
+            if parser_path:
+                self.analysis_text.setPlainText(f"⚙️ Parser fallback: {parser_path}\n\n{error_analysis}")
+            else:
+                self.analysis_text.setPlainText(error_analysis)
         elif gpt_analysis:
             # Show GPT analysis if available
-            self.analysis_text.setPlainText(gpt_analysis)
+            if parser_path:
+                formatted = f"⚙️ Parser fallback: {parser_path}\n\n{gpt_analysis}"
+            else:
+                formatted = gpt_analysis
+            self.analysis_text.setPlainText(formatted)
         elif status == "ok":
             # Successful parse, show the move details
             try:
@@ -152,7 +185,10 @@ class ResponseDetailDialog(QDialog):
                 judge_valid = self.result_data.get("judge_valid")
                 judge_reason = self.result_data.get("judge_reason", "")
                 
-                analysis_lines = ["✓ Successfully parsed as valid JSON", ""]
+                analysis_lines = ["✓ Successfully parsed as valid JSON"]
+                if parser_path:
+                    analysis_lines.append(f"⚙️ Parser fallback: {parser_path}")
+                analysis_lines.append("")
                 
                 if words:
                     analysis_lines.append(f"📝 Words formed: {', '.join(words)}")
@@ -206,17 +242,26 @@ class ResponseDetailDialog(QDialog):
                 analysis_lines.append(f"Judge reason: {judge_reason}")
             if error:
                 analysis_lines.append(f"Error: {error}")
+            if parser_path:
+                analysis_lines.append(f"Parser fallback: {parser_path}")
             
             self.analysis_text.setPlainText("\n".join(analysis_lines))
         elif status == "timeout":
             limit = openrouter_meta.get("timeout_seconds")
             limit_text = f"{int(limit)}s" if isinstance(limit, (int, float)) else "konfigurovanom limite"
             error = self.result_data.get("error", "Volanie prekročilo časový limit.")
-            self.analysis_text.setPlainText(
-                f"⏱ Model prekročil {limit_text}.\n\n{error}"
-            )
+            text = f"⏱ Model prekročil {limit_text}.\n\n{error}"
+            if parser_path:
+                text = f"⚙️ Parser fallback: {parser_path}\n\n{text}"
+            self.analysis_text.setPlainText(text)
         else:
-            self.analysis_text.setPlainText("No analysis available (model returned error or empty response)")
+            if parser_path:
+                self.analysis_text.setPlainText(
+                    f"⚙️ Parser fallback: {parser_path}\n\n"
+                    "No analysis available (model returned error or empty response)"
+                )
+            else:
+                self.analysis_text.setPlainText("No analysis available (model returned error or empty response)")
         
         analysis_layout.addWidget(self.analysis_text)
         

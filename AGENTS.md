@@ -36,12 +36,29 @@
 ## Environment Variables
 - `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `NOVITA_API_KEY` set provider access; Novita entries are
   optional unless the Novita mode is used.
-- `OPENROUTER_MAX_TOKENS` and `NOVITA_MAX_TOKENS` cap per-move completions; defaults exist in
-  `.env.example`.
-- `OPENROUTER_TIMEOUT_SECONDS` and `NOVITA_TIMEOUT_SECONDS` control request budgets and feed the
-  UI sliders.
+- `AI_MOVE_MAX_OUTPUT_TOKENS` sets the per-move output cap for **all** providers; the same value
+  drives OpenRouter and Novita cost estimates and API requests.
+- `AI_MOVE_TIMEOUT_SECONDS` sets the shared per-move timeout for OpenRouter, Novita, agent workers,
+  and background tooling.
+- `JUDGE_MAX_OUTPUT_TOKENS` limits the referee’s response size.
 - `SHOW_AGENT_ACTIVITY_AUTO` toggles automatic Agents dialog visibility after operations.
 - Config persistence writes to `~/.scrabgpt/config.json` and `~/.scrabgpt/teams/` outside the repo.
+
+### Unified AI Move Budget
+
+The app now enforces a **single pair of limits** for every AI move:
+
+| Setting | Purpose | Where it is read |
+| ------- | ------- | ---------------- |
+| `AI_MOVE_MAX_OUTPUT_TOKENS` | Max completion tokens each competitor may emit | `OpenRouterClient`, `NovitaClient`, `multi_model.py`, `novita_multi_model.py`, saved teams |
+| `AI_MOVE_TIMEOUT_SECONDS`   | Execution timeout applied to OpenRouter, Novita, and agents | `OpenRouterClient`, `NovitaClient`, `MainWindow._start_ai_turn`, async agents |
+
+Guidelines for future work:
+- Always prefer these variables; do **not** introduce provider-specific limits.
+- Clamp user-provided values (tokens ≥500, ≤20 000; timeout ≥5 s) before sending requests.
+- When persisting team presets, store `timeout_seconds` using the unified value so reloading
+  respects the latest configuration.
+- The settings dialog already syncs both knobs back into `.env`.
 
 ## Build, Test, and Development Commands
 `poetry install` provisions dependencies and the virtualenv. Run the desktop app via `poetry run python -m scrabgpt.ui.app` or the CLI shim `poetry run scrabgpt`. Execute automated checks with `poetry run pytest`, optionally `-k keyword` for a subset. Enforce style through `poetry run ruff check` (add `--fix` when safe) and typing with `poetry run mypy`. Run commands from the repo root so relative paths resolve.

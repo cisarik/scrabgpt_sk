@@ -50,7 +50,11 @@ class NovitaClient:
         timeout_seconds: int | None = None,
     ) -> None:
         self.api_key = api_key or os.getenv("NOVITA_API_KEY", "")
-        env_timeout = os.getenv("NOVITA_TIMEOUT_SECONDS")
+        env_timeout = (
+            os.getenv("AI_MOVE_TIMEOUT_SECONDS")
+            or os.getenv("NOVITA_TIMEOUT_SECONDS")
+            or os.getenv("OPENROUTER_TIMEOUT_SECONDS")
+        )
         try:
             env_timeout_value = int(env_timeout) if env_timeout is not None else None
         except ValueError:
@@ -67,6 +71,52 @@ class NovitaClient:
             limits=httpx.Limits(max_keepalive_connections=20, max_connections=50),
         )
         self._call_counter = count(1)
+        self.ai_move_max_output_tokens = self._resolve_ai_move_max_tokens()
+
+    @staticmethod
+    def _parse_positive_int(value: Any) -> int | None:
+        """Return a positive integer parsed from value or None."""
+
+        if value is None:
+            return None
+        try:
+            tokens = int(str(value))
+        except (TypeError, ValueError):
+            return None
+        return tokens if tokens > 0 else None
+
+    def _resolve_ai_move_max_tokens(self) -> int:
+        """Resolve the per-move token cap from environment with sane defaults."""
+
+        env_tokens = self._parse_positive_int(os.getenv("AI_MOVE_MAX_OUTPUT_TOKENS"))
+        if env_tokens is not None:
+            # Clamp to prevent extreme values that could exhaust budgets
+            return max(500, min(env_tokens, 20000))
+        return 4096
+
+    @staticmethod
+    def _price_per_token(value: Any) -> float:
+        """Convert Novita's per-million token pricing into per-token dollars."""
+
+        per_million = NovitaClient._price_per_million(value)
+        if per_million <= 0:
+            return 0.0
+        return per_million / 1_000_000
+
+    @staticmethod
+    def _price_per_million(value: Any) -> float:
+        """Convert Novita's scaled pricing (per million tokens) to USD."""
+
+        try:
+            scaled_value = float(value)
+        except (TypeError, ValueError):
+            return 0.0
+        if scaled_value <= 0:
+            return 0.0
+
+        # Novita reports prices in ten-thousandths of a dollar per million tokens.
+        # Example: 4100 ⇒ $0.41 per 1M tokens.
+        return scaled_value / 10_000
     
     def _next_call_id(self, kind: str) -> str:
         """Return a unique identifier for logging scopes."""
@@ -116,6 +166,7 @@ class NovitaClient:
                 processed_models = []
                 for model in models_list:
                     model_id = model.get("id", "")
+                    display_name = model.get("display_name")
                     
                     # Categorize by prefix
                     category = "other"
@@ -128,16 +179,34 @@ class NovitaClient:
                     elif model_id.startswith("meta-llama/"):
                         category = "llama"
                     
-                    # Extract context length (max_model_len or context_window)
-                    context_length = model.get("max_model_len") or model.get("context_window", 0)
+                    # Extract context length (context_size, max_model_len or context_window)
+                    context_length = (
+                        model.get("context_size")
+                        or model.get("max_model_len")
+                        or model.get("context_window", 0)
+                    )
+
+                    prompt_price_per_million = self._price_per_million(model.get("input_token_price_per_m"))
+                    completion_price_per_million = self._price_per_million(model.get("output_token_price_per_m"))
+                    prompt_price = prompt_price_per_million / 1_000_000
+                    completion_price = completion_price_per_million / 1_000_000
+                    name_source = display_name or model_id.split("/")[-1]
+                    readable_name = name_source if display_name else name_source.replace("-", " ").title()
                     
                     processed_models.append({
                         "id": model_id,
-                        "name": model_id.split("/")[-1].replace("-", " ").title(),  # Extract readable name
+                        "name": readable_name,
                         "context_length": context_length,
                         "category": category,
                         "owned_by": model.get("owned_by", ""),
                         "created": model.get("created", 0),
+                        "prompt_price": prompt_price,
+                        "completion_price": completion_price,
+                        "prompt_price_per_million": prompt_price_per_million,
+                        "completion_price_per_million": completion_price_per_million,
+                        "input_price_per_m": model.get("input_token_price_per_m"),
+                        "output_price_per_m": model.get("output_token_price_per_m"),
+                        "max_output_tokens": model.get("max_output_tokens"),
                     })
 
                 elapsed = time.perf_counter() - start
@@ -183,7 +252,7 @@ class NovitaClient:
         self,
         model_id: str,
         prompt: str,
-        max_tokens: int = 4096,
+        max_tokens: int | None = None,
         *,
         temperature: float = 0.6,
         top_p: float = 0.95,
@@ -205,10 +274,15 @@ class NovitaClient:
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
+        resolved_max_tokens = (
+            max_tokens
+            if isinstance(max_tokens, int) and max_tokens > 0
+            else self.ai_move_max_output_tokens
+        )
         payload = {
             "model": model_id,
             "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": max_tokens,
+            "max_tokens": resolved_max_tokens,
             "temperature": temperature,
             "top_p": top_p,
         }
@@ -218,7 +292,7 @@ class NovitaClient:
                 "[%s] Calling Novita model %s (max_tokens=%d, prompt_chars=%d, temp=%.2f)",
                 trace_id,
                 model_id,
-                max_tokens,
+                resolved_max_tokens,
                 len(prompt),
                 temperature,
             )

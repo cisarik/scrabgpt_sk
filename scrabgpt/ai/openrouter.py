@@ -49,7 +49,11 @@ class OpenRouterClient:
         timeout_seconds: int | None = None,
     ) -> None:
         self.api_key = api_key or os.getenv("OPENROUTER_API_KEY", "")
-        env_timeout = os.getenv("OPENROUTER_TIMEOUT_SECONDS")
+        env_timeout = (
+            os.getenv("AI_MOVE_TIMEOUT_SECONDS")
+            or os.getenv("OPENROUTER_TIMEOUT_SECONDS")
+            or os.getenv("NOVITA_TIMEOUT_SECONDS")
+        )
         try:
             env_timeout_value = int(env_timeout) if env_timeout is not None else None
         except ValueError:
@@ -66,6 +70,27 @@ class OpenRouterClient:
             limits=httpx.Limits(max_keepalive_connections=20, max_connections=50),
         )
         self._call_counter = count(1)
+        self.ai_move_max_output_tokens = self._resolve_ai_move_max_tokens()
+
+    @staticmethod
+    def _parse_positive_int(value: Any) -> int | None:
+        """Return a positive integer parsed from value or None."""
+
+        if value is None:
+            return None
+        try:
+            tokens = int(str(value))
+        except (TypeError, ValueError):
+            return None
+        return tokens if tokens > 0 else None
+
+    def _resolve_ai_move_max_tokens(self) -> int:
+        """Resolve the per-move token cap from environment with sane defaults."""
+
+        env_tokens = self._parse_positive_int(os.getenv("AI_MOVE_MAX_OUTPUT_TOKENS"))
+        if env_tokens is not None:
+            return max(500, min(env_tokens, 20000))
+        return 3600
     
     def _next_call_id(self, kind: str) -> str:
         """Return a unique identifier for logging scopes."""
@@ -166,7 +191,7 @@ class OpenRouterClient:
         self,
         model_id: str,
         prompt: str,
-        max_tokens: int = 3600,
+        max_tokens: int | None = None,
     ) -> dict[str, Any]:
         """Call a specific model via OpenRouter."""
         call_id = self._next_call_id("call")
@@ -176,10 +201,15 @@ class OpenRouterClient:
             "HTTP-Referer": "https://github.com/cisarik/scrabgpt_sk",
             "X-Title": "ScrabGPT SK",
         }
+        resolved_max_tokens = (
+            max_tokens
+            if isinstance(max_tokens, int) and max_tokens > 0
+            else self.ai_move_max_output_tokens
+        )
         payload = {
             "model": model_id,
             "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": max_tokens,
+            "max_tokens": resolved_max_tokens,
             "temperature": 0.7,
         }
 
@@ -188,7 +218,7 @@ class OpenRouterClient:
                 "[%s] Calling model %s (max_tokens=%d, prompt_chars=%d)",
                 trace_id,
                 model_id,
-                max_tokens,
+                resolved_max_tokens,
                 len(prompt),
             )
             log.debug("[%s] Request headers=%s", trace_id, _sanitize_headers(headers))
