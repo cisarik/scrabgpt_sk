@@ -373,7 +373,7 @@ class AIModelResultsTable(QWidget):
         if status == "pending":
             status_text = "Čaká…"
         elif status == "ready":
-            status_text = "Ready"
+            status_text = "Pripravený"
         elif status == "ok" and judge_valid:
             status_text = "Valid ✓"
         elif status == "ok" and judge_valid is False:

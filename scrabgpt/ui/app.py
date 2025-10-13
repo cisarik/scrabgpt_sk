@@ -1588,6 +1588,8 @@ class MainWindow(QMainWindow):
         self._last_move_reason_is_html: bool = False
         self._last_move_word_details: list[_WordScoreDetail] = []
         self._active_word_index: int | None = None
+        self._current_ai_model: str = "AI"
+        self._current_ai_model_id: Optional[str] = None
 
         # Repro mód nastavenia (iba runtime)
         # Pozn.: Nastavuje sa v dialógu Nastavenia a používa pri "Nová hra".
@@ -1923,6 +1925,7 @@ class MainWindow(QMainWindow):
         # AI Model Results Table (below rack)
         self.model_results_table = AIModelResultsTable()
         v.addWidget(self.model_results_table)
+        self._refresh_model_results_table()
         self.status = QStatusBar()
         self.setStatusBar(self.status)
         # start: prazdny status bar
@@ -2006,6 +2009,7 @@ class MainWindow(QMainWindow):
                 log.info("Loaded opponent mode from config: %s", self.opponent_mode.value)
             except ValueError:
                 log.warning("Invalid opponent mode in config: %s", saved_mode)
+        self._refresh_model_results_table()
 
     @staticmethod
     def _load_ai_move_max_tokens() -> tuple[int, bool]:
@@ -2027,6 +2031,93 @@ class MainWindow(QMainWindow):
             self.max_tokens_label.setToolTip(
                 f"Aktuálny limit: {self.ai_move_max_tokens} tokenov"
             )
+
+    def _resolve_openai_model_label(self) -> str:
+        """Resolve the OpenAI model name that will be used in single-model mode."""
+        env_model = os.getenv("OPENAI_MODEL")
+        if env_model:
+            return env_model
+        if self.ai_client is not None:
+            try:
+                model_name = getattr(self.ai_client, "model", None)
+                if isinstance(model_name, str) and model_name:
+                    return model_name
+            except Exception:
+                pass
+        return "gpt-5-mini"
+
+    def _resolve_agent_display_name(self) -> str:
+        """Resolve the human-readable name of the selected agent."""
+        if self.selected_agent_name:
+            return self.selected_agent_name
+        for agent in self.available_agents:
+            name = agent.get("name")
+            if name:
+                return name
+        return "OpenAI Agent"
+
+    def _build_model_preview_entries(self) -> list[dict[str, Any]]:
+        """Build placeholder rows for the model results table."""
+        entries: list[dict[str, Any]] = []
+
+        def _entry(model_key: str, display_name: str, order_index: int) -> dict[str, Any]:
+            return {
+                "model": model_key,
+                "model_name": display_name,
+                "status": "ready",
+                "score": None,
+                "judge_valid": None,
+                "words": [],
+                "error": None,
+                "order": order_index,
+            }
+
+        mode = getattr(self, "opponent_mode", OpponentMode.BEST_MODEL)
+
+        if mode == OpponentMode.OPENROUTER and self.selected_ai_models:
+            for idx, model in enumerate(self.selected_ai_models):
+                model_id = str(
+                    model.get("id")
+                    or model.get("model")
+                    or model.get("name")
+                    or f"openrouter-{idx}"
+                )
+                label = str(model.get("name") or model.get("model") or model_id)
+                entries.append(_entry(model_id, label, idx))
+        elif mode == OpponentMode.NOVITA and self.selected_novita_models:
+            for idx, model in enumerate(self.selected_novita_models):
+                model_id = str(
+                    model.get("id")
+                    or model.get("model")
+                    or model.get("name")
+                    or f"novita-{idx}"
+                )
+                label = str(model.get("name") or model.get("model") or model_id)
+                entries.append(_entry(model_id, label, idx))
+        elif mode == OpponentMode.BEST_MODEL:
+            model_name = self._resolve_openai_model_label()
+            entries.append(
+                _entry(f"openai:{model_name}", f"OpenAI API – {model_name}", 0)
+            )
+        elif mode == OpponentMode.AGENT:
+            agent_name = self._resolve_agent_display_name()
+            entries.append(
+                _entry(f"agent:{agent_name}", f"OpenAI Agent – {agent_name}", 0)
+            )
+
+        return entries
+
+    def _refresh_model_results_table(self) -> None:
+        """Show currently selected models as ready in the results table."""
+        table = getattr(self, "model_results_table", None)
+        if table is None:
+            return
+
+        entries = self._build_model_preview_entries()
+        if entries:
+            table.set_results(entries)
+        else:
+            table.clear_results()
 
     @staticmethod
     def _format_timeout_choice(seconds: int) -> str:
@@ -2323,6 +2414,9 @@ class MainWindow(QMainWindow):
         self._set_game_ui_visible(False)
         self._disable_human_inputs()
         self._set_starter_controls(decided=False)
+        self._current_ai_model = "AI"
+        self._current_ai_model_id = None
+        self._refresh_model_results_table()
 
     def _update_scores_label(self) -> None:
         self.lbl_scores.setText(
@@ -3416,10 +3510,30 @@ class MainWindow(QMainWindow):
             provider_type=provider_type,
         )
 
+        preview_rows = self._build_model_preview_entries()
+
         if use_multi and selected_models:
+            self._current_ai_model = "AI"
+            self._current_ai_model_id = None
             self.model_results_table.initialize_models(selected_models)
         else:
-            self.model_results_table.clear_results()
+            if preview_rows:
+                primary = preview_rows[0]
+                self._current_ai_model = primary.get("model_name", "AI")
+                self._current_ai_model_id = primary.get("model")
+                placeholder_models = [
+                    {"id": row.get("model"), "name": row.get("model_name")}
+                    for row in preview_rows
+                    if row.get("model")
+                ]
+                if placeholder_models:
+                    self.model_results_table.initialize_models(placeholder_models)
+                else:
+                    self.model_results_table.clear_results()
+            else:
+                self._current_ai_model = "AI"
+                self._current_ai_model_id = None
+                self.model_results_table.clear_results()
 
         self._ai_worker.moveToThread(self._ai_thread)
         self._ai_thread.started.connect(self._ai_worker.run)
@@ -3482,9 +3596,11 @@ class MainWindow(QMainWindow):
         valid_results = [r for r in results if r.get("judge_valid")]
         if valid_results:
             valid_results.sort(key=lambda r: int(r.get("score", -1)), reverse=True)
-            self._current_ai_model = valid_results[0].get("model_name", "AI")
-            winner_word = ", ".join(valid_results[0].get("words", []))
-            winner_score = valid_results[0].get("score", 0)
+            winner = valid_results[0]
+            self._current_ai_model = winner.get("model_name", "AI")
+            self._current_ai_model_id = winner.get("model")
+            winner_word = ", ".join(winner.get("words", []))
+            winner_score = winner.get("score", 0)
             self.status.showMessage(
                 f"✓ Víťaz: {self._current_ai_model} - {winner_word} ({winner_score} bodov)"
             )
@@ -3492,10 +3608,13 @@ class MainWindow(QMainWindow):
             # No valid results, find highest scoring attempt
             all_sorted = sorted(results, key=lambda r: int(r.get("score", -1)), reverse=True)
             if all_sorted:
-                self._current_ai_model = all_sorted[0].get("model_name", "AI")
+                fallback = all_sorted[0]
+                self._current_ai_model = fallback.get("model_name", "AI")
+                self._current_ai_model_id = fallback.get("model")
                 self.status.showMessage(f"⚠️ Žiadne platné návrhy, používam {self._current_ai_model}")
             else:
                 self._current_ai_model = "AI"
+                self._current_ai_model_id = None
                 self.status.showMessage("⚠️ Žiadne platné návrhy od modelov")
     
     def _update_table_for_judging(self, words: list[str]) -> None:
@@ -3843,6 +3962,21 @@ class MainWindow(QMainWindow):
         if len(ps2) == 7:
             total += 50
         apply_premium_consumption(self.board, ps2)
+
+        model_row_id = getattr(self, "_current_ai_model_id", None)
+        if model_row_id:
+            judged_words = [word for word, _coords in words_coords]
+            update_payload = {
+                "model": model_row_id,
+                "model_name": self._current_ai_model,
+                "status": "ok",
+                "words": judged_words,
+                "score": total,
+                "judge_valid": True,
+                "judge_reason": reason_text,
+            }
+            self.model_results_table.update_result(update_payload)
+
         self.ai_score += total
         # spotrebuj rack AI a doplň z tašky
         before = "".join(self.ai_rack)
@@ -4017,6 +4151,8 @@ class MainWindow(QMainWindow):
                 )
             elif new_mode == self.opponent_mode and new_agent == self.selected_agent_name:
                 self.status.showMessage("Nastavenia uložené.", 2000)
+
+            self._refresh_model_results_table()
         
         # Connect signal and show dialog (non-blocking, non-modal)
         dlg.accepted.connect(on_settings_accepted)
@@ -4304,6 +4440,7 @@ class MainWindow(QMainWindow):
                 self.status.showMessage(f"AI Režim: {mode_name}")
             
             log.info("Opponent settings changed: mode=%s, agent=%s", new_mode.value, new_agent)
+            self._refresh_model_results_table()
         
         # Show dialog (non-blocking, non-modal)
         dialog.accepted.connect(on_opponent_settings_accepted)
@@ -4335,31 +4472,15 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
             
-            # Display selected models in the table immediately
+            self._refresh_model_results_table()
+
             if self.use_multi_model:
-                # Create result entries showing the selected models as "Ready"
-                model_entries = []
-                for model in self.selected_ai_models:
-                    model_entries.append({
-                        "model": model.get("id", ""),
-                        "model_name": model.get("name", model.get("id", "Unknown")),
-                        "move": None,
-                        "score": 0,
-                        "status": "ready",
-                        "judge_valid": None,
-                        "words": [],
-                    })
-                self.model_results_table.set_results(model_entries)
-                
-                # Update status bar
                 model_count = len(self.selected_ai_models)
                 self.status.showMessage(
                     f"✓ Aktivované {model_count} modelov (max tokeny: {shared_tokens})",
                     5000,
                 )
             else:
-                # Clear table when multi-model is disabled
-                self.model_results_table.clear_results()
                 self.status.showMessage(
                     "Multi-model režim deaktivovaný. Používa sa GPT-5-mini.", 5000
                 )
