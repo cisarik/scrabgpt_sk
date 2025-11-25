@@ -15,7 +15,7 @@ from PySide6.QtGui import QIntValidator, QFont, QMouseEvent
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QPushButton,
     QLabel, QTabWidget, QWidget, QMessageBox, QFormLayout,
-    QLineEdit, QCheckBox, QComboBox, QTextEdit, QInputDialog,
+    QLineEdit, QCheckBox, QComboBox, QTextEdit, QInputDialog, QSpinBox,
 )
 
 from ..core.opponent_mode import OpponentMode
@@ -118,11 +118,12 @@ class SettingsDialog(QDialog):
         self._installed_variants: list[VariantDefinition] = []
         self._languages: list[LanguageInfo] = []
         
-        # Prompt editor state
-        self.prompts_dir = Path("prompts")
-        self.prompts_dir.mkdir(exist_ok=True)
-        self.current_prompt_file = os.getenv("AI_PROMPT_FILE", "prompts/default.txt")
-        self.default_prompt_file = "prompts/default.txt"
+        # Prompt editor state - používateľská zložka
+        self.prompts_dir = Path.home() / ".scrabgpt" / "prompts"
+        self.prompts_dir.mkdir(parents=True, exist_ok=True)
+        self._ensure_default_prompt()
+        self.current_prompt_file = os.getenv("AI_PROMPT_FILE", str(self.prompts_dir / "default.txt"))
+        self.default_prompt_file = str(self.prompts_dir / "default.txt")
         self.prompt_modified = False
         
         # Language fetch animation state
@@ -274,6 +275,7 @@ class SettingsDialog(QDialog):
         self.mode_selector.configure_openrouter_requested.connect(self._configure_openrouter)
         self.mode_selector.configure_novita_requested.connect(self._configure_novita)
         self.mode_selector.configure_agent_requested.connect(self._configure_agent)
+        self.mode_selector.configure_offline_requested.connect(self._configure_offline)
         
         # Disable if game in progress
         if self.game_in_progress:
@@ -299,7 +301,6 @@ class SettingsDialog(QDialog):
                     "Prosím vyberte agenta pre Agent mód.",
                 )
                 return
-        
         # Accept dialog
         self.accept()
     
@@ -401,6 +402,88 @@ class SettingsDialog(QDialog):
                     "Agent Nastavený",
                     f"Vybraný agent: {agent_name}",
                 )
+
+    def _configure_offline(self) -> None:
+        """Open dialog to configure offline LLM (LMStudio/LLMStudio + MCP)."""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Offline LLM (LMStudio)")
+        form = QFormLayout(dialog)
+        form.setContentsMargins(12, 12, 12, 12)
+        form.setSpacing(10)
+        
+        base_url = QLineEdit(dialog)
+        base_url.setPlaceholderText("http://127.0.0.1:1234/v1")
+        base_url.setText(
+            os.getenv("OPENAI_BASE_URL")
+            or os.getenv("LLMSTUDIO_BASE_URL")
+            or "http://127.0.0.1:1234/v1"
+        )
+        form.addRow("Server URL:", base_url)
+        
+        model = QLineEdit(dialog)
+        model.setPlaceholderText("gpt-4o-mini")
+        model.setText(os.getenv("OPENAI_MODEL") or os.getenv("LLMSTUDIO_MODEL") or "")
+        form.addRow("Model:", model)
+        
+        tokens = QSpinBox(dialog)
+        tokens.setRange(500, 20000)
+        tokens.setValue(int(os.getenv("AI_MOVE_MAX_OUTPUT_TOKENS", "3600") or 3600))
+        form.addRow("Max tokens:", tokens)
+        
+        timeout = QSpinBox(dialog)
+        timeout.setRange(5, 120)
+        timeout.setSuffix(" s")
+        timeout.setValue(int(os.getenv("AI_MOVE_TIMEOUT_SECONDS", "30") or 30))
+        form.addRow("Timeout:", timeout)
+        
+        mcp_url = QLineEdit(dialog)
+        mcp_url.setPlaceholderText("http://127.0.0.1:1234")
+        mcp_url.setText(os.getenv("SCRABBLE_MCP_SERVER_URL", "http://127.0.0.1:1234"))
+        form.addRow("MCP server URL:", mcp_url)
+        
+        buttons_layout = QHBoxLayout()
+        save_btn = QPushButton("Uložiť", dialog)
+        cancel_btn = QPushButton("Zrušiť", dialog)
+        buttons_layout.addWidget(save_btn)
+        buttons_layout.addWidget(cancel_btn)
+        form.addRow(buttons_layout)
+        
+        def _save() -> None:
+            url_val = base_url.text().strip()
+            model_val = model.text().strip()
+            if not url_val or not model_val:
+                QMessageBox.warning(dialog, "Offline LLM", "Vyplňte URL aj model.")
+                return
+            tokens_val = str(tokens.value())
+            timeout_val = str(timeout.value())
+            mcp_val = mcp_url.text().strip() or "http://127.0.0.1:1234"
+            
+            os.environ["OPENAI_BASE_URL"] = url_val
+            os.environ["OPENAI_MODEL"] = model_val
+            os.environ["AI_MOVE_MAX_OUTPUT_TOKENS"] = tokens_val
+            os.environ["AI_MOVE_TIMEOUT_SECONDS"] = timeout_val
+            os.environ["SCRABBLE_MCP_SERVER_URL"] = mcp_val
+            
+            try:
+                from dotenv import set_key as _set_key
+                _set_key(ENV_PATH, "OPENAI_BASE_URL", url_val)
+                _set_key(ENV_PATH, "OPENAI_MODEL", model_val)
+                _set_key(ENV_PATH, "AI_MOVE_MAX_OUTPUT_TOKENS", tokens_val)
+                _set_key(ENV_PATH, "AI_MOVE_TIMEOUT_SECONDS", timeout_val)
+                _set_key(ENV_PATH, "SCRABBLE_MCP_SERVER_URL", mcp_val)
+            except Exception:
+                pass
+            
+            # Sync AI tokens field so main dialog shares limit
+            if hasattr(self, "ai_tokens_edit"):
+                self.ai_tokens_edit.setText(tokens_val)
+            
+            dialog.accept()
+        
+        save_btn.clicked.connect(_save)
+        cancel_btn.clicked.connect(dialog.reject)
+        
+        dialog.exec()
     
     def _create_general_tab(self) -> QWidget:
         """Create general game settings tab.
@@ -1013,6 +1096,40 @@ class SettingsDialog(QDialog):
         )
         header_layout.addWidget(self.prompt_combo)
         
+        # Nové tlačidlá pre manažment promptov
+        new_btn = QPushButton("➕ Nový prompt", widget)
+        new_btn.clicked.connect(self._create_new_prompt)
+        new_btn.setStyleSheet(
+            "QPushButton { "
+            "padding: 6px 12px; font-size: 12px; border-radius: 4px; "
+            "background-color: #182c1d; color: #b6e0bd; border: 1px solid #2f5c39; "
+            "} "
+            "QPushButton:hover { background-color: #213f29; border-color: #4caf50; }"
+        )
+        header_layout.addWidget(new_btn)
+        
+        rename_btn = QPushButton("✏️ Premenovať", widget)
+        rename_btn.clicked.connect(self._rename_prompt)
+        rename_btn.setStyleSheet(
+            "QPushButton { "
+            "padding: 6px 12px; font-size: 12px; border-radius: 4px; "
+            "background-color: #182c1d; color: #b6e0bd; border: 1px solid #2f5c39; "
+            "} "
+            "QPushButton:hover { background-color: #213f29; border-color: #4caf50; }"
+        )
+        header_layout.addWidget(rename_btn)
+        
+        delete_btn = QPushButton("🗑️ Vymazať", widget)
+        delete_btn.clicked.connect(self._delete_prompt)
+        delete_btn.setStyleSheet(
+            "QPushButton { "
+            "padding: 6px 12px; font-size: 12px; border-radius: 4px; "
+            "background-color: #2c1d1d; color: #e0b6b6; border: 1px solid #5c2f2f; "
+            "} "
+            "QPushButton:hover { background-color: #3f2929; border-color: #af4c4c; }"
+        )
+        header_layout.addWidget(delete_btn)
+        
         header_layout.addStretch()
         
         # Load available prompts
@@ -1091,6 +1208,83 @@ class SettingsDialog(QDialog):
         
         return widget
     
+    def _ensure_default_prompt(self) -> None:
+        """Skopírovať default.txt do používateľskej zložky ak neexistuje."""
+        default_user_path = self.prompts_dir / "default.txt"
+        if not default_user_path.exists():
+            # Skopírovať z pôvodnej prompts/ zložky
+            original_default = Path("prompts/default.txt")
+            if original_default.exists():
+                import shutil
+                shutil.copy2(original_default, default_user_path)
+                log.info("Skopírovaný default.txt do %s", default_user_path)
+            else:
+                # Použiť rovnaký template ako v PromptEditorDialog
+                default_content = """You are an expert Scrabble player for the {language} language variant.
+
+RULES:
+- Play to win and obey official Scrabble rules for {language}
+- Do NOT overwrite existing board letters; place only on empty cells
+- Placements must form a single contiguous line with no gaps
+- Connect to existing letters after previous move
+- Use only letters from ai_rack
+- For '?' (blank), use chosen uppercase letter (respecting diacritics)
+
+SCORING:
+- Points for each tile: {tile_summary}
+- 7-tile bingo bonus: +50 points
+- Maximize total points using premium squares
+- Empty premium squares show their multiplier symbol (see legend below)
+- Prioritize TL/DL for high-value letters
+- Aim to span DW/TW with the main word
+- Stacking letter multipliers that feed into word multipliers yields maximal score
+
+WORD VALIDITY:
+- Do not glue your letters to adjacent existing letters unless the resulting main word is valid in {language}
+- Use intersections/hooks properly
+- Share letters with the board only at overlapping cells
+- Do not extend an existing word into a non-word
+- All cross-words must be valid {language} words
+- Diacritics are CRITICAL: 'Ú' ≠ 'U', 'Á' ≠ 'A', etc.
+
+SPECIAL CASES:
+- ⭐ CRITICAL: If board is empty, the FIRST MOVE MUST include a tile at coordinates (row=7, col=7)
+  This is the center star (H8 in chess notation). AT LEAST ONE of your placements must have row=7 AND col=7.
+  Example valid first moves:
+    * ACROSS from (7,5): places tiles at (7,5), (7,6), (7,7) ✓ crosses center
+    * DOWN from (5,7): places tiles at (5,7), (6,7), (7,7) ✓ crosses center
+    * ACROSS from (7,8): INVALID ✗ doesn't cross (7,7)
+    * DOWN from (8,7): INVALID ✗ doesn't cross (7,7)
+- If no legal move exists: pass (set 'pass': true), but prefer gaining points over passing
+- The 'word' field must equal the final main word formed (existing letters + your placements)
+
+OUTPUT FORMAT:
+- Coordinates are 0-based (row and col: 0-14)
+- Return ONLY pure JSON, no explanations, no markdown
+- Required structure: start:{{row:int,col:int}}, direction:'ACROSS'|'DOWN', placements:[{{row,col,letter}}]
+
+STRATEGY:
+Given this compact state, propose exactly ONE move that:
+1. Forms valid {language} words
+2. Maximizes points
+3. Uses premium squares effectively
+4. Creates high-scoring cross-words
+
+SANITY CHECKS:
+- Place tiles in exactly one line (ACROSS or DOWN); no gaps
+- Do not extend existing words unless the resulting contiguous main word is valid in {language}
+- Prefer hooks/intersections instead of blind prefix/suffix sticking
+- 'word' field must equal the final main word on the board
+
+==== CURRENT STATE ====
+{compact_state}
+
+Premium legend: {premium_legend}
+
+==== YOUR MOVE (JSON only) ===="""
+                default_user_path.write_text(default_content, encoding="utf-8")
+                log.info("Vytvorený nový default.txt v %s", default_user_path)
+    
     def _load_available_prompts(self) -> None:
         """Load all available prompt files from prompts/ directory."""
         self.prompt_combo.clear()
@@ -1102,6 +1296,9 @@ class SettingsDialog(QDialog):
         
         for prompt_file in prompt_files:
             display_name = prompt_file.stem
+            # Špeciálne zobrazenie pre default.txt
+            if display_name == "default":
+                display_name = "Predvolený"
             self.prompt_combo.addItem(display_name, str(prompt_file))
         
         # Select current file
@@ -1112,6 +1309,10 @@ class SettingsDialog(QDialog):
     
     def _load_prompt(self, filepath: str) -> None:
         """Load prompt from file."""
+        # Skip if prompt_text_edit doesn't exist yet (called before widget creation)
+        if not hasattr(self, 'prompt_text_edit'):
+            return
+        
         try:
             path = Path(filepath)
             if path.exists():
@@ -1254,6 +1455,183 @@ class SettingsDialog(QDialog):
                     f"Prompt bol úspešne uložený ako {name}.txt"
                 )
     
+    def _create_new_prompt(self) -> None:
+        """Vytvoriť nový prázdny prompt súbor."""
+        name, ok = QInputDialog.getText(
+            self,
+            "Nový prompt",
+            "Zadajte názov promptu:"
+        )
+        
+        if ok and name:
+            # Sanitize filename
+            name = "".join(c for c in name if c.isalnum() or c in (' ', '-', '_')).strip()
+            if not name:
+                QMessageBox.warning(
+                    self,
+                    "Neplatný názov",
+                    "Názov musí obsahovať aspoň jeden alfanumerický znak."
+                )
+                return
+            
+            filepath = str(self.prompts_dir / f"{name}.txt")
+            
+            if Path(filepath).exists():
+                reply = QMessageBox.question(
+                    self,
+                    "Súbor existuje",
+                    f"Súbor {name}.txt už existuje. Chcete ho prepísať?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                )
+                
+                if reply != QMessageBox.StandardButton.Yes:
+                    return
+            
+            # Minimálny template text
+            template_content = """You are an expert Scrabble player for the {language} language variant.
+
+[Add your custom instructions here]
+
+==== CURRENT STATE ====
+{compact_state}
+
+Premium legend: {premium_legend}
+
+==== YOUR MOVE (JSON only) ===="""
+            
+            try:
+                Path(filepath).write_text(template_content, encoding="utf-8")
+                
+                # Reload available prompts and select the new one
+                self._load_available_prompts()
+                self._load_prompt(filepath)
+                
+                QMessageBox.information(
+                    self,
+                    "Vytvorený",
+                    f"Nový prompt '{name}' bol úspešne vytvorený."
+                )
+                log.info("Vytvorený nový prompt: %s", filepath)
+                
+            except Exception as e:
+                log.exception("Failed to create new prompt: %s", e)
+                QMessageBox.critical(
+                    self,
+                    "Chyba vytvorenia",
+                    f"Nepodarilo sa vytvoriť nový prompt: {e}"
+                )
+    
+    def _rename_prompt(self) -> None:
+        """Premenovať aktuálny prompt súbor."""
+        current_path = Path(self.current_prompt_file)
+        
+        # Ochrana default.txt
+        if current_path.stem == "default":
+            QMessageBox.warning(
+                self,
+                "Chránený súbor",
+                "Predvolený prompt je chránený a nemožno ho premenovať týmto spôsobom."
+            )
+            return
+        
+        current_name = current_path.stem
+        name, ok = QInputDialog.getText(
+            self,
+            "Premenovať prompt",
+            "Zadajte nový názov promptu:",
+            text=current_name
+        )
+        
+        if ok and name and name != current_name:
+            # Sanitize filename
+            name = "".join(c for c in name if c.isalnum() or c in (' ', '-', '_')).strip()
+            if not name:
+                QMessageBox.warning(
+                    self,
+                    "Neplatný názov",
+                    "Názov musí obsahovať aspoň jeden alfanumerický znak."
+                )
+                return
+            
+            new_filepath = self.prompts_dir / f"{name}.txt"
+            
+            if new_filepath.exists():
+                reply = QMessageBox.question(
+                    self,
+                    "Súbor existuje",
+                    f"Súbor {name}.txt už existuje. Chcete ho prepísať?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                )
+                
+                if reply != QMessageBox.StandardButton.Yes:
+                    return
+            
+            try:
+                current_path.rename(new_filepath)
+                
+                # Reload available prompts and select the renamed file
+                self._load_available_prompts()
+                self._load_prompt(str(new_filepath))
+                
+                QMessageBox.information(
+                    self,
+                    "Premenovaný",
+                    f"Prompt bol úspešne premenovaný na '{name}'."
+                )
+                log.info("Premenovaný prompt: %s -> %s", current_path, new_filepath)
+                
+            except Exception as e:
+                log.exception("Failed to rename prompt: %s", e)
+                QMessageBox.critical(
+                    self,
+                    "Chyba premenovania",
+                    f"Nepodarilo sa premenovať prompt: {e}"
+                )
+    
+    def _delete_prompt(self) -> None:
+        """Vymazať aktuálny prompt súbor."""
+        current_path = Path(self.current_prompt_file)
+        
+        # Ochrana default.txt
+        if current_path.stem == "default":
+            QMessageBox.warning(
+                self,
+                "Chránený súbor",
+                "Predvolený prompt je chránený a nemožno ho vymazať."
+            )
+            return
+        
+        current_name = current_path.stem
+        reply = QMessageBox.question(
+            self,
+            "Potvrdiť vymazanie",
+            f"Naozaj chcete vymazať prompt '{current_name}'?\n\nTáto akcia sa nedá vrátiť späť.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        
+        if reply == QMessageBox.StandardButton.Yes:
+            try:
+                current_path.unlink()
+                
+                # Reload available prompts and select default
+                self._load_available_prompts()
+                self._load_prompt(self.default_prompt_file)
+                
+                QMessageBox.information(
+                    self,
+                    "Vymazaný",
+                    f"Prompt '{current_name}' bol úspešne vymazaný."
+                )
+                log.info("Vymazaný prompt: %s", current_path)
+                
+            except Exception as e:
+                log.exception("Failed to delete prompt: %s", e)
+                QMessageBox.critical(
+                    self,
+                    "Chyba vymazania",
+                    f"Nepodarilo sa vymazať prompt: {e}"
+                )
+    
     def _load_agent_auto_show(self) -> bool:
         """Load agent auto-show setting from environment.
         
@@ -1337,6 +1715,16 @@ class SettingsDialog(QDialog):
         
         # Update environment variable for prompt
         os.environ["AI_PROMPT_FILE"] = self.current_prompt_file
+        
+        # Reload teams and refresh UI in main window after saving settings
+        if hasattr(self, 'parent') and self.parent():
+            main_window = self.parent()
+            if hasattr(main_window, '_load_saved_teams'):
+                main_window._load_saved_teams()
+            if hasattr(main_window, '_refresh_model_results_table'):
+                main_window._refresh_model_results_table()
+            if hasattr(main_window, '_update_mode_status_label'):
+                main_window._update_mode_status_label()
         
         # Call parent accept
         super().accept()

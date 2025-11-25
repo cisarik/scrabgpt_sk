@@ -13,24 +13,24 @@ class OpponentMode(Enum):
     - BEST_MODEL: Uses OpenAI's best available model (auto-fetched)
     - OPENROUTER: Multi-model competition via OpenRouter
     - NOVITA: Multi-model competition via Novita (reasoning models)
-    - OFFLINE: Local AI model (not implemented yet)
-    """
+    - GEMINI: OpenRouter Gemini 3 Pro (streaming + reasoning)
+"""
     
     AGENT = "agent"
     BEST_MODEL = "best_model"
     OPENROUTER = "openrouter"
     NOVITA = "novita"
-    OFFLINE = "offline"
+    GEMINI = "gemini"
     
     @property
     def display_name_sk(self) -> str:
         """Slovak display name for UI."""
         names = {
-            OpponentMode.AGENT: "OpenAI Agent",
-            OpponentMode.BEST_MODEL: "OpenAI API call",
+            OpponentMode.AGENT: "Agent (MCP)",
+            OpponentMode.BEST_MODEL: "OpenAI",
             OpponentMode.OPENROUTER: "OpenRouter",
             OpponentMode.NOVITA: "Novita AI",
-            OpponentMode.OFFLINE: "Offline AI",
+            OpponentMode.GEMINI: "Gemini (OpenRouter)",
         }
         return names[self]
     
@@ -38,20 +38,20 @@ class OpponentMode(Enum):
     def description_sk(self) -> str:
         """Slovak description for UI."""
         descriptions = {
-            OpponentMode.AGENT: "Hrať proti agentovi ktorý sa sám rozhoduje čo a kedy použije (aké nástroje=funkcie si podľa potreby zavolá) na to aby navrhol svoj ťah",
+            OpponentMode.AGENT: (
+                "Hrať proti agentovi s MCP nástrojmi (Scrabble tools) a vybraným LLM "
+                "napojeným cez .env/LMStudio."
+            ),
             OpponentMode.BEST_MODEL: "Hrať oproti najlepšiemu <GPT5> modelu",
             OpponentMode.OPENROUTER: "Paralelné volanie modelov ktoré vybraté na hru.",
             OpponentMode.NOVITA: "Paralelné volanie reasoning modelov (DeepSeek, Qwen, GLM, LLaMA).",
-            OpponentMode.OFFLINE: "Hrať offline proti Vášmu PC",
+            OpponentMode.GEMINI: "Gemini 3 Pro cez Google Vertex AI (reasoning + stream).",
         }
         return descriptions[self]
     
     @property
     def is_available(self) -> bool:
         """Whether this mode is currently available."""
-        # OFFLINE not implemented yet
-        if self == OpponentMode.OFFLINE:
-            return False
         return True
     
     @classmethod

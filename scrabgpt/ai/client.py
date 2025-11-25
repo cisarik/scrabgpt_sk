@@ -7,7 +7,8 @@ from pathlib import Path
 from typing import Any, Callable, TypedDict, cast
 
 from dotenv import load_dotenv
-from openai import OpenAI
+from openai import OpenAI, BadRequestError
+from openai.types.chat import ChatCompletionMessageParam
 
 from .fastdict import load_dictionary
 from .juls_online import is_word_in_juls
@@ -44,8 +45,23 @@ class OpenAIClient:
     def __init__(self, model: str = "gpt-5-mini") -> None:
         load_dotenv()
         api_key = os.getenv("OPENAI_API_KEY", "")
-        self.client = OpenAI(api_key=api_key if api_key else None)
+        env_model = os.getenv("OPENAI_MODEL")
+        if env_model:
+            model = env_model
+
+        base_url = os.getenv("OPENAI_BASE_URL") or os.getenv("LLMSTUDIO_BASE_URL")
+        client_kwargs: dict[str, Any] = {}
+        if base_url:
+            client_kwargs["base_url"] = base_url.rstrip("/")
+            log.info("OpenAI client base_url override: %s", client_kwargs["base_url"])
+
+        self.client = OpenAI(api_key=api_key if api_key else None, **client_kwargs)
         self.model = model
+        # LMStudio/localhost: vypneme Responses endpoint úplne (pády/500)
+        if base_url:
+            self._use_responses_endpoint = False
+        else:
+            self._use_responses_endpoint = True
         log.info("OpenAI client init (model=%s, key=%s)", model, _mask_key(api_key))
         # Bezpecnost: nikdy neloguj obsah .env ani plny kluc.
 
@@ -79,41 +95,37 @@ class OpenAIClient:
         """
         try:
             log.info("REQUEST → %s", prompt)
-            content: str
-            try:
-                # Preferovaný spôsob (novšie SDK)
-                resp = self.client.responses.create(  # type: ignore[call-overload]
-                    model=self.model,
-                    input=prompt,
-                    response_format={
-                        "type": "json_schema",
-                        "json_schema": {
-                            "name": "schema",
-                            "schema": json_schema,
-                            "strict": True,
-                        },
-                    },
-                    stream=False,
-                    max_output_tokens=max_output_tokens,
-                )
-                content = resp.output_text
-            except TypeError as e:
-                # Fallback: staršie SDK neakceptuje `response_format` pre Responses API.
-                # Namiesto ďalších pokusov s `response_format` v Chat Completions,
-                # preskoč rovno na režim bez schémy (inštrukcia v texte) — znižuje 400 chyby.
-                log.warning(
-                    (
-                        "Responses API nepodporuje response_format – prechádzam "
-                        "priamo na Chat Completions bez schema (dôvod=%s)"
-                    ),
-                    e,
-                )
+            content: str = ""
+            if self._use_responses_endpoint:
                 try:
-                    # Pokus 1: parameter max_completion_tokens
-                    log.warning(
-                        "chat.completions.create attempt "
-                        "mode=no_schema token_param=max_completion_tokens"
+                    # Preferovaný spôsob (novšie SDK)
+                    resp = self.client.responses.create(  # type: ignore[call-overload]
+                        model=self.model,
+                        input=prompt,
+                        response_format={
+                            "type": "json_schema",
+                            "json_schema": {
+                                "name": "schema",
+                                "schema": json_schema,
+                                "strict": True,
+                            },
+                        },
+                        stream=False,
+                        max_output_tokens=max_output_tokens,
                     )
+                    content = resp.output_text
+                except TypeError as e:
+                    log.warning(
+                        (
+                            "Responses API nepodporuje response_format – prechádzam "
+                            "priamo na Chat Completions bez schema (dôvod=%s)"
+                        ),
+                        e,
+                    )
+                except Exception as e:
+                    log.warning("Responses API zlyhalo — fallback chat.completions (reason=%s)", e)
+            if not content:
+                try:
                     chat = self.client.chat.completions.create(
                         model=self.model,
                         messages=[
@@ -131,7 +143,6 @@ class OpenAIClient:
                         max_completion_tokens=max_output_tokens,
                     )
                 except Exception as e1:
-                    # Pokus 2: parameter max_tokens
                     log.warning(
                         (
                             "chat.completions.create failed "
@@ -182,25 +193,48 @@ class OpenAIClient:
         """
         try:
             log.info("REQUEST → %s", prompt)
-            try:
-                resp = self.client.responses.create(
-                    model=self.model,
-                    input=prompt,
-                    stream=False,
-                    max_output_tokens=max_output_tokens,
-                )
-                content = resp.output_text
-            except TypeError as e:
-                log.warning(
-                    "Responses API bez podpory parametrov — fallback chat.completions (reason=%s)",
-                    e,
-                )
+            content = ""
+            # LMStudio/localhost: orez prompt ak je príliš dlhý (guard na overflow)
+            local_prompt = prompt
+            if not self._use_responses_endpoint and len(prompt) > 4000:
+                local_prompt = prompt[-1800:]
+                log.warning("Trimming prompt for local LLM (len=%d -> %d)", len(prompt), len(local_prompt))
+            if self._use_responses_endpoint:
+                try:
+                    resp = self.client.responses.create(
+                        model=self.model,
+                        input=local_prompt,
+                        stream=False,
+                        max_output_tokens=max_output_tokens,
+                    )
+                    content = resp.output_text
+                except Exception as e:
+                    log.warning(
+                        "Responses API zlyhalo — fallback chat.completions (reason=%s)",
+                        e,
+                    )
+            if not content:
                 try:
                     chat = self.client.chat.completions.create(
                         model=self.model,
-                        messages=[{"role": "user", "content": prompt}],
+                        messages=[{"role": "user", "content": local_prompt}],
                         max_completion_tokens=max_output_tokens,
                     )
+                except BadRequestError as be:
+                    if "context length" in str(be).lower():
+                        log.warning("Context overflow detected, retrying with truncated prompt")
+                        short_prompt = prompt[-1500:]
+                        try:
+                            chat = self.client.chat.completions.create(
+                                model=self.model,
+                                messages=[{"role": "user", "content": short_prompt}],
+                                max_tokens=min(max_output_tokens or 512, 512),
+                            )
+                        except Exception as e2:
+                            log.error("Retry after overflow failed: %s", e2)
+                            raise
+                    else:
+                        raise
                 except Exception:
                     chat = self.client.chat.completions.create(
                         model=self.model,
@@ -212,6 +246,190 @@ class OpenAIClient:
             return content
         except Exception as e:  # noqa: BLE001
             log.exception("OpenAI call failed: %s", e)
+            raise
+
+    def _call_text_with_context(
+        self,
+        messages: list[ChatCompletionMessageParam],
+        *,
+        max_output_tokens: int | None = None,
+        stream_callback: "Callable[[str], None] | None" = None,
+        reasoning_callback: "Callable[[str], None] | None" = None,
+    ) -> tuple[str, dict[str, Any], dict[str, int]]:
+        """Call with message history for reasoning models.
+        
+        Returns: (content, full_message) where full_message includes 'thinking' for reasoning models
+        
+        Komentár (SK): Táto metóda je optimalizovaná pre reasoning modely (deepseek-r1),
+        ktoré používajú 'thinking' channel. Podporuje konverzáciu s históriou správ.
+        """
+        try:
+            log.info("REQUEST (context) → %d messages", len(messages))
+            if log.isEnabledFor(logging.DEBUG):
+                for idx, msg in enumerate(messages):
+                    role = msg.get("role", "?")
+                    content = str(msg.get("content", ""))[:200]
+                    log.debug("  [%d] %s: %s...", idx, role, content)
+            
+            usage_info: dict[str, int] = {}
+            full_message: dict[str, Any] = {"role": "assistant", "content": ""}
+            
+            if stream_callback:
+                # Streaming path
+                try:
+                    stream = self.client.chat.completions.create(
+                        model=self.model,
+                        messages=messages,
+                        max_completion_tokens=max_output_tokens,
+                        stream=True,
+                    )
+                except BadRequestError as be:
+                    if "context length" in str(be).lower():
+                        log.warning("Stream context overflow, retrying with trimmed history (system + last user)")
+                        trimmed = messages[:1] + messages[-1:]
+                        stream = self.client.chat.completions.create(
+                            model=self.model,
+                            messages=trimmed,
+                            max_tokens=min(max_output_tokens or 512, 512),
+                            stream=True,
+                        )
+                    else:
+                        raise
+                except Exception:
+                    stream = self.client.chat.completions.create(
+                        model=self.model,
+                        messages=messages,
+                        max_tokens=max_output_tokens,
+                        stream=True,
+                    )
+                
+                collected: list[str] = []
+                reasoning_mode = False
+                for chunk in stream:
+                    delta = ""
+                    reasoning_delta = ""
+                    if chunk.choices and chunk.choices[0].delta:
+                        delta = chunk.choices[0].delta.content or ""
+                        # LMStudio/OpenAI reasoning
+                        reasoning_delta = getattr(chunk.choices[0].delta, "reasoning_content", None) or ""
+                        if hasattr(chunk.choices[0].delta, "thinking"):
+                            reasoning_delta = reasoning_delta or getattr(chunk.choices[0].delta, "thinking", "") or ""
+                    if reasoning_delta and reasoning_callback:
+                        # ak reasoning delta prichádza mimo tagov, odošli priamo
+                        reasoning_callback(reasoning_delta)
+                    
+                    if delta:
+                        # Parsuj <think> bloky v delta, aby reasoning šiel do separátnej bubliny
+                        text_remaining = delta
+                        while text_remaining:
+                            if reasoning_mode:
+                                end_idx = text_remaining.find("</think>")
+                                if end_idx != -1:
+                                    chunk_reason = text_remaining[:end_idx]
+                                    if chunk_reason and reasoning_callback:
+                                        reasoning_callback(chunk_reason)
+                                    reasoning_mode = False
+                                    text_remaining = text_remaining[end_idx + len("</think>") :]
+                                else:
+                                    if reasoning_callback:
+                                        reasoning_callback(text_remaining)
+                                    text_remaining = ""
+                            else:
+                                start_idx = text_remaining.find("<think>")
+                                if start_idx != -1:
+                                    before = text_remaining[:start_idx]
+                                    if before:
+                                        collected.append(before)
+                                        stream_callback(before)
+                                    reasoning_mode = True
+                                    text_remaining = text_remaining[start_idx + len("<think>") :]
+                                else:
+                                    collected.append(text_remaining)
+                                    stream_callback(text_remaining)
+                                    text_remaining = ""
+                content = "".join(collected)
+                full_message["content"] = content
+                log.info("RESPONSE (stream) ← content=%d chars", len(content))
+            else:
+                try:
+                    # Try with max_completion_tokens first (preferred for newer models)
+                    chat = self.client.chat.completions.create(
+                        model=self.model,
+                        messages=messages,
+                        max_completion_tokens=max_output_tokens,
+                    )
+                except BadRequestError as be:
+                    if "context length" in str(be).lower():
+                        log.warning("Context overflow (non-stream), retrying with trimmed history")
+                        trimmed = messages[:1] + messages[-1:]
+                        chat = self.client.chat.completions.create(
+                            model=self.model,
+                            messages=trimmed,
+                            max_tokens=min(max_output_tokens or 512, 512),
+                        )
+                    else:
+                        raise
+                except Exception as e:
+                    log.warning("max_completion_tokens failed, trying max_tokens: %s", e)
+                    chat = self.client.chat.completions.create(
+                        model=self.model,
+                        messages=messages,
+                        max_tokens=max_output_tokens,
+                    )
+                
+                message = chat.choices[0].message
+                content_raw = message.content or ""
+                reasoning_block = ""
+                # Extract <think>...</think> if present
+                if "<think>" in content_raw and "</think>" in content_raw:
+                    start_idx = content_raw.find("<think>") + len("<think>")
+                    end_idx = content_raw.find("</think>")
+                    reasoning_block = content_raw[start_idx:end_idx].strip()
+                    content = content_raw[end_idx + len("</think>") :].lstrip()
+                else:
+                    content = content_raw
+                full_message["content"] = content
+                
+                # Check for reasoning/thinking content (deepseek-r1 specific)
+                if hasattr(message, 'thinking') and message.thinking:
+                    full_message["thinking"] = message.thinking
+                    log.info("RESPONSE (context) ← content=%d chars, thinking=%d chars", 
+                             len(content), len(message.thinking))
+                elif hasattr(message, 'reasoning') and message.reasoning:
+                    full_message["reasoning"] = message.reasoning
+                    log.info("RESPONSE (context) ← content=%d chars, reasoning=%d chars", 
+                             len(content), len(message.reasoning))
+                elif reasoning_block:
+                    full_message["reasoning"] = reasoning_block
+                    if reasoning_callback:
+                        reasoning_callback(reasoning_block)
+                    log.info("RESPONSE (context) ← content=%d chars, reasoning(block)=%d chars",
+                             len(content), len(reasoning_block))
+                else:
+                    log.info("RESPONSE (context) ← content=%d chars", len(content))
+                
+                if log.isEnabledFor(logging.DEBUG):
+                    log.debug("Response content: %s", content[:300])
+                    if "thinking" in full_message:
+                        log.debug("Thinking: %s", full_message["thinking"][:200])
+                    if "reasoning" in full_message:
+                        log.debug("Reasoning: %s", full_message["reasoning"][:200])
+                
+                try:
+                    usage = getattr(chat, "usage", None)
+                    if usage:
+                        prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or usage.get("prompt_tokens", 0))  # type: ignore[attr-defined]
+                        context_len = 0
+                        if hasattr(chat, "model") and getattr(chat, "model", None):
+                            from .lmstudio_utils import get_context_length
+                            context_len = get_context_length(getattr(chat, "model"))
+                        usage_info = {"prompt_tokens": prompt_tokens, "context_length": context_len}
+                except Exception as exc:  # noqa: BLE001
+                    log.debug("Usage extraction failed: %s", exc)
+            
+            return content, full_message, usage_info
+        except Exception as e:  # noqa: BLE001
+            log.exception("Chat completion with context failed: %s", e)
             raise
 
     # ---------------- Rozhodca (batched) ----------------
@@ -291,7 +509,21 @@ class OpenAIClient:
                 "JULS online: %d/%d found, asking OpenAI about final %d words",
                 len(juls_results), len(juls_needed), len(openai_needed)
             )
-            openai_response = self._judge_with_openai(openai_needed, language)
+            try:
+                openai_response = self._judge_with_openai(openai_needed, language)
+            except Exception as e:  # noqa: BLE001
+                log.exception("OpenAI judge fallback failed: %s", e)
+                # Mark unresolved words as invalid but keep previous findings
+                error_results = [
+                    {"word": w, "valid": False, "reason": f"OpenAI judge failed: {e}"}
+                    for w in openai_needed
+                ]
+                combined_results = combined_results + error_results
+                all_valid = all(r["valid"] for r in combined_results)
+                return cast(JudgeBatchResponse, {
+                    "results": combined_results,
+                    "all_valid": all_valid,
+                })
             combined_results = combined_results + openai_response["results"]
             all_valid = all(r["valid"] for r in combined_results)
             return cast(JudgeBatchResponse, {
@@ -303,6 +535,8 @@ class OpenAIClient:
         return self._judge_with_openai(words, language)
 
     def _judge_with_openai(self, words: list[str], language: str) -> JudgeBatchResponse:
+        if not words:
+            return cast(JudgeBatchResponse, {"results": [], "all_valid": True})
         schema = {
             "type": "object",
             "properties": {

@@ -25,6 +25,7 @@ class OpponentModeSelector(QWidget):
     configure_openrouter_requested = Signal()  # Request to configure OpenRouter models
     configure_novita_requested = Signal()  # Request to configure Novita models
     configure_agent_requested = Signal()  # Request to configure AI agent
+    configure_offline_requested = Signal()  # Deprecated - kept for compatibility
     
     def __init__(
         self,
@@ -70,9 +71,9 @@ class OpponentModeSelector(QWidget):
         self.button_group = QButtonGroup(self)
         self.button_group.buttonClicked.connect(self._on_mode_changed)
         
-        # Radio buttons for each mode - REORDERED: OFFLINE first, AGENT last
+        # Radio buttons for each mode - include Gemini (OpenRouter single-model)
         mode_order = [
-            OpponentMode.OFFLINE,
+            OpponentMode.GEMINI,
             OpponentMode.BEST_MODEL,
             OpponentMode.OPENROUTER,
             OpponentMode.NOVITA,
@@ -132,20 +133,17 @@ class OpponentModeSelector(QWidget):
             "stop:0 #4caf50, stop:0.4 #4caf50, stop:0.5 #132418, stop:1 #132418); "
             "}"
         )
+        radio.setToolTip(mode.description_sk)
         
         # Set default selection
         if mode == self.current_mode:
             radio.setChecked(True)
         
-        # Disable OFFLINE mode
-        if mode == OpponentMode.OFFLINE:
-            radio.setEnabled(False)
-        
         self.button_group.addButton(radio)
         layout.addWidget(radio)
         
         # Description with optional button for OpenRouter, Novita, or Agent
-        if mode in (OpponentMode.OPENROUTER, OpponentMode.NOVITA, OpponentMode.AGENT):
+        if mode in (OpponentMode.OPENROUTER, OpponentMode.NOVITA, OpponentMode.AGENT, OpponentMode.GEMINI):
             desc_layout = QHBoxLayout()
             desc_layout.setSpacing(8)
             desc_layout.setContentsMargins(26, 0, 0, 0)
@@ -191,8 +189,10 @@ class OpponentModeSelector(QWidget):
                 config_btn.clicked.connect(lambda: self.configure_openrouter_requested.emit())
             elif mode == OpponentMode.NOVITA:
                 config_btn.clicked.connect(lambda: self.configure_novita_requested.emit())
-            else:  # AGENT mode
+            elif mode == OpponentMode.AGENT:
                 config_btn.clicked.connect(lambda: self.configure_agent_requested.emit())
+            else:  # GEMINI/OpenRouter single
+                config_btn.clicked.connect(lambda: self.configure_openrouter_requested.emit())
             
             desc_layout.addWidget(config_btn)
             
@@ -429,9 +429,5 @@ class OpponentModeSelector(QWidget):
             enabled: Whether to enable the selector
         """
         for button in self.button_group.buttons():
-            # Keep OFFLINE disabled always
             mode = button.property("mode")
-            if mode == OpponentMode.OFFLINE:
-                button.setEnabled(False)
-            else:
-                button.setEnabled(enabled)
+            button.setEnabled(enabled and mode.is_available)

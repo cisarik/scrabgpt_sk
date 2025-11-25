@@ -8,18 +8,90 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Callable, Any
+import os
 from datetime import datetime
+from typing import Any, Callable
 
-from PySide6.QtCore import Qt, QThread, Signal
-from PySide6.QtGui import QFont, QTextCursor, QCloseEvent
+from PySide6.QtCore import QEasingCurve, QPropertyAnimation, QThread, QTimer, Qt, Signal
+from PySide6.QtGui import QCloseEvent, QFont, QTextCursor
 from PySide6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QPushButton,
-    QLabel, QTabWidget, QWidget, QTextEdit, QProgressBar,
-    QListWidget, QDialogButtonBox,
+    QDialog,
+    QDialogButtonBox,
+    QFormLayout,
+    QGraphicsOpacityEffect,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QMessageBox,
+    QPushButton,
+    QProgressBar,
+    QSpinBox,
+    QTabWidget,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
 )
 
 log = logging.getLogger("scrabgpt.ui.agents")
+
+
+def load_env_llm_defaults() -> dict[str, object] | None:
+    """Načítaj implicitné LLM nastavenie z .env (OpenAI/LLMStudio)."""
+    base = os.getenv("OPENAI_BASE_URL") or os.getenv("LLMSTUDIO_BASE_URL")
+    model = os.getenv("OPENAI_MODEL") or os.getenv("LLMSTUDIO_MODEL")
+    max_tokens_env = os.getenv("AI_MOVE_MAX_OUTPUT_TOKENS")
+    timeout_env = os.getenv("AI_MOVE_TIMEOUT_SECONDS")
+    
+    if not base and not model:
+        return None
+    
+    def _to_int(value: str | None) -> int | None:
+        if not value:
+            return None
+        try:
+            return int(value)
+        except ValueError:
+            return None
+    
+    return {
+        "base_url": base or "http://127.0.0.1:1234/v1",
+        "model": model or "gpt-5-mini",
+        "max_tokens": max(500, min(20000, _to_int(max_tokens_env) or 4000)),
+        "timeout": max(5, min(120, _to_int(timeout_env) or 30)),
+    }
+
+
+def load_env_mcp_server() -> str:
+    """Načítaj URL MCP servera zo .env alebo vráť default localhost."""
+    return os.getenv("SCRABBLE_MCP_SERVER_URL", "http://127.0.0.1:1234")
+
+
+def normalize_llm_config(
+    base_url: str,
+    model: str,
+    max_tokens: int | None = None,
+    timeout: int | None = None,
+) -> dict[str, object]:
+    """Normalize LLM config input (strip, basic validation, clamping)."""
+    base = (base_url or "").strip()
+    mdl = (model or "").strip()
+    if not base:
+        raise ValueError("URL nesmie byť prázdne")
+    if not mdl:
+        raise ValueError("Model nesmie byť prázdny")
+    
+    def _clamp(value: int | None, min_v: int, max_v: int) -> int | None:
+        if value is None:
+            return None
+        return max(min_v, min(max_v, value))
+    
+    return {
+        "base_url": base,
+        "model": mdl,
+        "max_tokens": _clamp(max_tokens, 500, 20000),
+        "timeout": _clamp(timeout, 5, 120),
+    }
 
 
 class AsyncAgentWorker(QThread):
@@ -97,9 +169,21 @@ class AsyncAgentWorker(QThread):
 class AgentActivityWidget(QWidget):
     """Widget showing activity for a single agent."""
     
-    def __init__(self, agent_name: str, parent: QWidget | None = None) -> None:
+    llm_config_changed = Signal(dict)
+    
+    def __init__(
+        self,
+        agent_name: str,
+        parent: QWidget | None = None,
+        default_llm_config: dict[str, object] | None = None,
+        default_mcp_url: str | None = None,
+    ) -> None:
         super().__init__(parent)
         self.agent_name = agent_name
+        self.llm_config: dict[str, object] | None = default_llm_config
+        self.default_mcp_url = default_mcp_url or load_env_mcp_server()
+        self._reasoning_anim: QPropertyAnimation | None = None
+        self._reasoning_effect: QGraphicsOpacityEffect | None = None
         self._setup_ui()
         
     def _setup_ui(self) -> None:
@@ -113,6 +197,16 @@ class AgentActivityWidget(QWidget):
         self.html_snippet_button.setEnabled(False)
         self.html_snippet_button.clicked.connect(self._show_html_snippet_dialog)
         button_layout.addWidget(self.html_snippet_button)
+        
+        self.add_llm_button = QPushButton("➕ Pridať LLM", self)
+        self.add_llm_button.clicked.connect(self._open_llm_dialog)
+        self.add_llm_button.setToolTip("Pridať/aktualizovať hlavný LLM (URL, model, limity)")
+        self.add_llm_button.setStyleSheet(
+            "QPushButton { padding: 6px 10px; border-radius: 6px; "
+            "background: #1d2c22; color: #b6e0bd; border: 1px solid #2f5c39; } "
+            "QPushButton:hover { background: #243a2a; }"
+        )
+        button_layout.addWidget(self.add_llm_button)
         button_layout.addStretch()
         layout.addLayout(button_layout)
 
@@ -124,6 +218,12 @@ class AgentActivityWidget(QWidget):
             "color: #b6e0bd; font-weight: bold; font-size: 13px;"
         )
         status_layout.addWidget(self.status_label)
+        
+        self.context_label = QLabel("Context: --")
+        self.context_label.setStyleSheet(
+            "color: #96a28f; font-size: 11px; font-family: 'Fira Sans';"
+        )
+        status_layout.addWidget(self.context_label)
         
         status_layout.addStretch()
         
@@ -139,8 +239,7 @@ class AgentActivityWidget(QWidget):
             "text-align: center; height: 20px; "
             "} "
             "QProgressBar::chunk { "
-            "background: qlineargradient(x1:0, y1:0, x2:1, y2:0, "
-            "stop:0 #2e7d32, stop:1 #4caf50); "
+            "background: #4b7d5d; "
             "border-radius: 3px; "
             "}"
         )
@@ -152,6 +251,20 @@ class AgentActivityWidget(QWidget):
         activity_label = QLabel("🧠 Aktivita:")
         activity_label.setStyleSheet("color: #b6e0bd; font-weight: bold; font-size: 13px;")
         layout.addWidget(activity_label)
+        
+        # Reasoning flash (fade in/out)
+        self.reasoning_flash = QLabel("")
+        self.reasoning_flash.setWordWrap(True)
+        self.reasoning_flash.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        self.reasoning_flash.setStyleSheet(
+            "background: #050805; color: #8cd9a0; border: 1px solid #1f2f23; "
+            "border-radius: 6px; padding: 8px; font-family: 'Fira Code', 'Consolas'; "
+            "font-size: 11px; opacity: 0;"
+        )
+        self._reasoning_effect = QGraphicsOpacityEffect(self.reasoning_flash)
+        self._reasoning_effect.setOpacity(0.0)
+        self.reasoning_flash.setGraphicsEffect(self._reasoning_effect)
+        layout.addWidget(self.reasoning_flash)
         
         self.activity_log = QTextEdit()
         self.activity_log.setReadOnly(True)
@@ -201,6 +314,15 @@ class AgentActivityWidget(QWidget):
        
         self._html_snippets: list[dict[str, str]] = []
         self._current_progress: int = 0
+        
+        # Ak je predvyplnený LLM, zobraz ho v stave
+        if self.llm_config:
+            self.set_llm_config(self.llm_config)
+        
+        # Auto MCP info
+        if self.default_mcp_url:
+            self.append_status(f"Auto-pripojené MCP: {self.default_mcp_url}")
+            self.context_label.setText("Context: MCP ready")
 
     def set_status(self, status: str, is_working: bool = False) -> None:
         """Update status label and progress bar."""
@@ -214,6 +336,11 @@ class AgentActivityWidget(QWidget):
         self._current_progress = clamped
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(clamped)
+        self.context_label.setText(f"Context: {clamped}%")
+
+    def update_context_progress(self, percent: int | None) -> None:
+        """Alias na update_progress pre jasnejší význam."""
+        self.update_progress(percent)
 
     def append_activity(self, message: str, prefix: str = "ℹ️", color: str | None = None) -> None:
         """Append message to activity log with timestamp.
@@ -248,6 +375,7 @@ class AgentActivityWidget(QWidget):
     def append_thinking(self, thought: str) -> None:
         """Append agent thinking to activity log."""
         self.append_activity(thought, prefix="💭")
+        self._show_reasoning_flash(thought)
     
     def append_status(self, status: str) -> None:
         """Append status update to activity log."""
@@ -261,6 +389,32 @@ class AgentActivityWidget(QWidget):
             if line.strip():
                 self.append_activity(line, prefix="  ", color="#4caf50")
 
+    def _show_reasoning_flash(self, text: str) -> None:
+        """Zobraz krátky fade-in/out blok s reasoning obsahom."""
+        if not self._reasoning_effect:
+            return
+        self.reasoning_flash.setText(text)
+        self._reasoning_effect.setOpacity(0.0)
+        
+        anim = QPropertyAnimation(self._reasoning_effect, b"opacity", self)
+        anim.setDuration(220)
+        anim.setStartValue(0.0)
+        anim.setEndValue(1.0)
+        anim.setEasingCurve(QEasingCurve.Type.InOutQuad)
+        anim.start()
+        self._reasoning_anim = anim
+        
+        def _fade_out() -> None:
+            out_anim = QPropertyAnimation(self._reasoning_effect, b"opacity", self)
+            out_anim.setDuration(350)
+            out_anim.setStartValue(1.0)
+            out_anim.setEndValue(0.0)
+            out_anim.setEasingCurve(QEasingCurve.Type.InOutQuad)
+            out_anim.start()
+            self._reasoning_anim = out_anim
+        
+        QTimer.singleShot(1200, _fade_out)
+
     def add_html_snippet(self, label: str, raw_html: str, summary: str) -> None:
         snippet = {
             "label": label,
@@ -270,6 +424,13 @@ class AgentActivityWidget(QWidget):
         self._html_snippets.append(snippet)
         self.html_snippet_button.setEnabled(True)
         self.html_snippet_button.setText(f"Zobraziť HTML ({label})")
+    
+    def set_llm_config(self, cfg: dict[str, object]) -> None:
+        """Ulož LLM config a emituj signál."""
+        self.llm_config = cfg
+        self.llm_config_changed.emit(cfg)
+        short_model = str(cfg.get("model", ""))[:32]
+        self.status_label.setText(f"LLM: {short_model}")
 
     def set_response(self, response: str) -> None:
         """Set response text (replacing previous)."""
@@ -290,6 +451,65 @@ class AgentActivityWidget(QWidget):
         self._current_progress = 0
         self.progress_bar.setValue(0)
         self.progress_bar.setVisible(False)
+        if self._reasoning_effect:
+            self._reasoning_effect.setOpacity(0.0)
+
+    def _open_llm_dialog(self) -> None:
+        """Dialog pre nastavenie hlavného LLM (URL, model, limity)."""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Hlavný LLM")
+        form = QFormLayout(dialog)
+        form.setContentsMargins(12, 12, 12, 12)
+        form.setSpacing(10)
+        
+        url_edit = QLineEdit(dialog)
+        url_edit.setPlaceholderText("http://127.0.0.1:1234")
+        url_edit.setText(
+            str((self.llm_config or {}).get("base_url", "http://127.0.0.1:1234"))
+        )
+        form.addRow("Server URL:", url_edit)
+        
+        model_edit = QLineEdit(dialog)
+        model_edit.setPlaceholderText("gpt-4o-mini")
+        model_edit.setText(str((self.llm_config or {}).get("model", "")))
+        form.addRow("Model:", model_edit)
+        
+        max_tokens_spin = QSpinBox(dialog)
+        max_tokens_spin.setRange(500, 20000)
+        max_tokens_spin.setValue(int((self.llm_config or {}).get("max_tokens", 4000) or 4000))
+        form.addRow("Max tokens:", max_tokens_spin)
+        
+        timeout_spin = QSpinBox(dialog)
+        timeout_spin.setRange(5, 120)
+        timeout_spin.setSuffix(" s")
+        timeout_spin.setValue(int((self.llm_config or {}).get("timeout", 30) or 30))
+        form.addRow("Timeout:", timeout_spin)
+        
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
+            parent=dialog,
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        form.addRow(buttons)
+        
+        if dialog.exec() == QDialog.Accepted:
+            try:
+                cfg = normalize_llm_config(
+                    url_edit.text(),
+                    model_edit.text(),
+                    max_tokens_spin.value(),
+                    timeout_spin.value(),
+                )
+            except ValueError as exc:
+                QMessageBox.warning(self, "LLM nastavenie", str(exc))
+                return
+            
+            self.set_llm_config(cfg)
+            self.append_status(
+                f"Nastavený LLM: {cfg['model']} @ {cfg['base_url']} "
+                f"(max_tokens={cfg['max_tokens']}, timeout={cfg['timeout']}s)"
+            )
 
     def _show_html_snippet_dialog(self) -> None:
         if not self._html_snippets:
@@ -348,6 +568,7 @@ class AgentsDialog(QDialog):
         super().__init__(parent)
         
         self.agent_tabs: dict[str, AgentActivityWidget] = {}
+        self.default_llm_config = load_env_llm_defaults()
         
         self.setWindowTitle("⚙️ Agenti")
         self.setModal(False)  # Non-modal so it can stay open
@@ -384,17 +605,6 @@ class AgentsDialog(QDialog):
         )
         layout.addWidget(title)
         
-        # Info label
-        info_label = QLabel(
-            "Tu môžete sledovať, čo agenti robia. Každý agent má vlastnú záložku."
-        )
-        info_label.setStyleSheet(
-            "color: white; font-size: 14px; font-style: italic; "
-            "padding: 4px 0px;"
-        )
-        info_label.setWordWrap(True)
-        layout.addWidget(info_label)
-        
         # Tab widget
         self.tabs = QTabWidget()
         layout.addWidget(self.tabs)
@@ -430,12 +640,28 @@ class AgentsDialog(QDialog):
         if agent_name in self.agent_tabs:
             return self.agent_tabs[agent_name]
         
-        widget = AgentActivityWidget(agent_name, parent=self)
+        widget = AgentActivityWidget(
+            agent_name,
+            parent=self,
+            default_llm_config=self.default_llm_config,
+            default_mcp_url=self.default_mcp_url,
+        )
         self.agent_tabs[agent_name] = widget
         
         tab_label = display_name or agent_name
         self.tabs.addTab(widget, tab_label)
         
+        return widget
+
+    def show_agent_tab(self, agent_name: str, display_name: str | None = None) -> AgentActivityWidget:
+        """Open dialog and focus given agent tab (create if missing)."""
+        widget = self.get_or_create_agent_tab(agent_name, display_name)
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        idx = self.tabs.indexOf(widget)
+        if idx >= 0:
+            self.tabs.setCurrentIndex(idx)
         return widget
     
     def remove_agent_tab(self, agent_name: str) -> None:

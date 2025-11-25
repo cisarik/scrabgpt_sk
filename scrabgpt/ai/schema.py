@@ -194,7 +194,10 @@ def parse_ai_move(text: str) -> tuple[MoveModel, str]:
     log = logging.getLogger("scrabgpt.ai.schema")
 
     # Strip markdown code blocks if present at start/end
-    cleaned = text.strip()
+    import re
+
+    # Odstráň reasoning bloky <think>...</think>
+    cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
     if cleaned.startswith("```json"):
         cleaned = cleaned[7:]  # Remove ```json
     elif cleaned.startswith("```"):
@@ -239,7 +242,7 @@ def parse_ai_move(text: str) -> tuple[MoveModel, str]:
                 # Pokračuj k vyhodeniu pôvodnej chyby
         
         # Žiadny fallback nezabrral, vyhoď pôvodnú chybu
-        log.error("Všetky parsing pokusy zlyhali")
+        log.warning("Všetky parsing pokusy zlyhali (raw text dĺžka: %d)", len(text))
         raise
 
 

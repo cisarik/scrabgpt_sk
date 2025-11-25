@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 import asyncio
 import os
@@ -5,6 +6,8 @@ import sys
 import uuid
 import json
 import logging
+import time
+import webbrowser
 import html
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -29,6 +32,7 @@ from PySide6.QtCore import (
 from PySide6.QtGui import (
     QAction,
     QPainter,
+    QCloseEvent,
     QColor,
     QPen,
     QFont,
@@ -68,16 +72,23 @@ from ..core.rules import first_move_must_cover_center, connected_to_existing, no
 from ..core.scoring import score_words, apply_premium_consumption
 from ..core.types import Placement, Premium
 from ..ai.client import OpenAIClient
-from ..ai.player import propose_move as ai_propose_move
-from ..ai.player import should_auto_trigger_ai_opening, is_board_empty
+from ..ai.gemini_client import GeminiClient
+from ..ai.player import (
+    propose_move as ai_propose_move,
+    should_auto_trigger_ai_opening,
+    is_board_empty,
+    reset_reasoning_context,
+    get_context_transcript,
+)
 from ..ai.openrouter import OpenRouterClient
+from ..ai.vertex import VertexClient
 from ..ai.multi_model import propose_move_multi_model
 from ..ai.novita import NovitaClient
 from ..ai.novita_multi_model import propose_move_novita_multi_model
-from .prompt_editor import PromptEditorDialog
 from .agents_dialog import AgentsDialog, AsyncAgentWorker
 from .agent_status_widget import AgentStatusWidget
 from .mcp_test_dialog import MCPTestDialog
+from .chat_dialog import ChatDialog
 from ..core.state import build_ai_state_dict
 from ..core.rack import consume_rack, restore_rack
 from ..core.state import build_save_state_dict, parse_save_state_dict, restore_board_from_save, restore_bag_from_save
@@ -89,7 +100,7 @@ from ..core.variant_store import (
     set_active_variant_slug,
 )
 from ..core.opponent_mode import OpponentMode
-from ..core.team_config import get_team_manager
+from ..core.team_config import get_team_manager, TeamConfig
 from ..ai.variants import (
     LanguageInfo,
     fetch_supported_languages,
@@ -1560,6 +1571,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("ScrabGPT")
         self.resize(1000, 800)
+        self._shutting_down = False
 
         # Register internet tools
         register_internet_tools()
@@ -1601,9 +1613,16 @@ class MainWindow(QMainWindow):
         
         # Agent workers (run in background even when dialog closed)
         self.agent_workers: dict[str, Any] = {}
+        
+        # Chat dialog (non-modal, hlavný chat s AI protihráčom)
+        self.chat_dialog = ChatDialog(self)
+        self.chat_dialog.message_sent.connect(self._on_user_chat_message)
 
         # OpenAI klient (lazy init po prvom pouziti ak treba)
         self.ai_client: Optional[OpenAIClient] = None
+        
+        # OpenRouter klient (pre chat protokol)
+        self.openrouter_client: Optional[OpenRouterClient] = None
         
         # Team manager for persisting model configurations
         self.team_manager = get_team_manager()
@@ -1854,17 +1873,29 @@ class MainWindow(QMainWindow):
         self.btn_exchange.hide()
         self.rack_container = rack_bar
 
-        # Inline settings row (timeout etc.)
+        # Inline settings row (mode status and timeout)
         self.timeout_frame = QFrame()
         self.timeout_frame.setObjectName("timeoutFrame")
         timeout_layout = QHBoxLayout(self.timeout_frame)
         timeout_layout.setContentsMargins(18, 10, 18, 10)
         timeout_layout.setSpacing(24)
 
-        timeout_label = QLabel("⏱ Timeout pre modely:")
+        # Mode status label (left side)
+        self.lbl_mode_status = QLabel("Loading...")
+        self.lbl_mode_status.setStyleSheet(
+            "QLabel { color: #4caf50; font-size: 15px; font-weight: bold; }"
+        )
+        timeout_layout.addWidget(self.lbl_mode_status)
+
+        # Spacer to push timeout to the right
+        timeout_layout.addStretch(1)
+
+        # Timeout controls (right side)
+        timeout_label = QLabel("⏱ Timeout:")
         timeout_label.setStyleSheet(
             "QLabel { color: #e0e6f0; font-size: 15px; font-weight: 600; }"
         )
+        timeout_label.setToolTip("Zastaví pomalé modely po limite počas konkurenčného ťahu")
         timeout_layout.addWidget(timeout_label)
 
         self.timeout_combo = QComboBox()
@@ -1898,19 +1929,6 @@ class MainWindow(QMainWindow):
         self.timeout_combo.currentIndexChanged.connect(self._on_timeout_changed)
         timeout_layout.addWidget(self.timeout_combo)
 
-        timeout_hint = QLabel("Zastaví pomalé modely po limite počas konkurenčného ťahu.")
-        timeout_hint.setStyleSheet(
-            "QLabel { color: #9aa5b5; font-size: 12px; }"
-        )
-        timeout_layout.addWidget(timeout_hint)
-
-        self.max_tokens_label = QLabel("")
-        self.max_tokens_label.setStyleSheet(
-            "QLabel { color: #9aa5b5; font-size: 12px; }"
-        )
-        timeout_layout.addWidget(self.max_tokens_label)
-        timeout_layout.addStretch(1)
-
         self.timeout_frame.setStyleSheet(
             "QFrame#timeoutFrame {"
             "background-color: #12141b;"
@@ -1920,14 +1938,20 @@ class MainWindow(QMainWindow):
         )
 
         v.addWidget(self.timeout_frame)
-        self._update_max_tokens_label()
+        self._update_mode_status_label()
 
         # AI Model Results Table (below rack)
         self.model_results_table = AIModelResultsTable()
+        self.model_results_table.agent_row_clicked.connect(self._on_agent_row_clicked)
         v.addWidget(self.model_results_table)
         self._refresh_model_results_table()
         self.status = QStatusBar()
         self.setStatusBar(self.status)
+        # Pridať click handler na statusbar - otvorí chat dialog
+        self.status.mousePressEvent = self._on_statusbar_click
+        self.status.messageChanged.connect(self._on_status_message_changed)
+        self._chat_status_last_message: str = ""
+        self._chat_status_last_ts: float = 0.0
         # start: prazdny status bar
         self.status.showMessage("")
 
@@ -1942,6 +1966,11 @@ class MainWindow(QMainWindow):
         self._spinner_stack: list[_SpinnerEntry] = []
         self._wait_cursor_depth = 0
         self._ai_thinking: bool = False
+        # Countdown timer for AI turn
+        self._ai_countdown_timer = QTimer(self)
+        self._ai_countdown_timer.setInterval(1000)
+        self._ai_countdown_timer.timeout.connect(self._on_ai_countdown_tick)
+        self._ai_deadline: float = 0.0
         # Guard pre otvárací ťah AI (zabraňuje dvojitému volaniu pri štarte)
         self._ai_opening_active: bool = False
         self._consecutive_passes: int = 0
@@ -1982,10 +2011,22 @@ class MainWindow(QMainWindow):
         """Load saved team configurations from disk."""
         # Load ACTIVE OpenRouter team (not default team!)
         openrouter_team = self.team_manager.load_active_team_config("openrouter")
+        if openrouter_team is None:
+            # Create default OpenRouter team with Gemini 3 Pro if none exists
+            default_timeout = self._load_ai_move_timeout()
+            openrouter_team = TeamConfig(
+                name="Gemini3Pro",
+                provider="openrouter",
+                model_ids=["google/gemini-3-pro-preview"],
+                timeout_seconds=default_timeout,
+            )
+            self.team_manager.save_team(openrouter_team)
+            self.team_manager.save_active_team("openrouter", openrouter_team.name)
+            log.info("Created default OpenRouter team with Gemini 3 Pro (timeout=%ss)", default_timeout)
         if openrouter_team:
             # Convert IDs to minimal model objects needed for runtime
             self.selected_ai_models = [{"id": mid, "name": mid} for mid in openrouter_team.model_ids]
-            self.use_multi_model = len(openrouter_team.model_ids) > 0
+            self.use_multi_model = len(openrouter_team.model_ids) > 1  # 1 model => stream single path
             self.ai_move_timeout_seconds = openrouter_team.timeout_seconds
             log.info("Loaded ACTIVE OpenRouter team '%s': %d models", openrouter_team.name, len(openrouter_team.model_ids))
         
@@ -2009,7 +2050,13 @@ class MainWindow(QMainWindow):
                 log.info("Loaded opponent mode from config: %s", self.opponent_mode.value)
             except ValueError:
                 log.warning("Invalid opponent mode in config: %s", saved_mode)
+                self.opponent_mode = OpponentMode.GEMINI
+        # If stratégia je byť na OpenRouter a máme modely, prepnúť na OpenRouter
+        if self.selected_ai_models and self.opponent_mode == OpponentMode.GEMINI:
+            self.opponent_mode = OpponentMode.GEMINI
+            log.info("Switched opponent mode to Gemini (OpenRouter)")
         self._refresh_model_results_table()
+        self._update_mode_status_label()
 
     @staticmethod
     def _load_ai_move_max_tokens() -> tuple[int, bool]:
@@ -2025,12 +2072,6 @@ class MainWindow(QMainWindow):
             return default, False
         return value, True
 
-    def _update_max_tokens_label(self) -> None:
-        if hasattr(self, "max_tokens_label") and self.max_tokens_label is not None:
-            self.max_tokens_label.setText("Maximálne tokenov na ťah:")
-            self.max_tokens_label.setToolTip(
-                f"Aktuálny limit: {self.ai_move_max_tokens} tokenov"
-            )
 
     def _resolve_openai_model_label(self) -> str:
         """Resolve the OpenAI model name that will be used in single-model mode."""
@@ -2050,11 +2091,41 @@ class MainWindow(QMainWindow):
         """Resolve the human-readable name of the selected agent."""
         if self.selected_agent_name:
             return self.selected_agent_name
+        env_model = os.getenv("OPENAI_MODEL") or os.getenv("LLMSTUDIO_MODEL")
+        if env_model:
+            return f"LMStudio – {env_model}"
+        env_base = os.getenv("OPENAI_BASE_URL") or os.getenv("LLMSTUDIO_BASE_URL")
+        if env_base:
+            return "LMStudio agent"
         for agent in self.available_agents:
             name = agent.get("name")
             if name:
                 return name
         return "OpenAI Agent"
+
+    def _update_mode_status_label(self) -> None:
+        """Update mode status label to show current opponent mode and active model/team."""
+        mode = self.opponent_mode
+        
+        if mode == OpponentMode.BEST_MODEL:
+            model_name = self._resolve_openai_model_label()
+            text = f"OpenAI - {model_name}"
+        elif mode == OpponentMode.OPENROUTER:
+            team = self.team_manager.load_active_team_config("openrouter")
+            team_name = team.name if team else "Žiadny team"
+            text = f"OpenRouter - {team_name}"
+        elif mode == OpponentMode.NOVITA:
+            team = self.team_manager.load_active_team_config("novita")
+            team_name = team.name if team else "Žiadny team"
+            text = f"Novita AI - {team_name}"
+        elif mode == OpponentMode.AGENT:
+            agent_name = self._resolve_agent_display_name()
+            text = f"Agent (MCP) - {agent_name}"
+        else:
+            text = "Offline AI"
+        
+        if hasattr(self, 'lbl_mode_status') and self.lbl_mode_status is not None:
+            self.lbl_mode_status.setText(text)
 
     def _build_model_preview_entries(self) -> list[dict[str, Any]]:
         """Build placeholder rows for the model results table."""
@@ -2102,7 +2173,7 @@ class MainWindow(QMainWindow):
         elif mode == OpponentMode.AGENT:
             agent_name = self._resolve_agent_display_name()
             entries.append(
-                _entry(f"agent:{agent_name}", f"OpenAI Agent – {agent_name}", 0)
+                _entry(f"agent:{agent_name}", f"Agent (MCP) – {agent_name}", 0)
             )
 
         return entries
@@ -2172,6 +2243,7 @@ class MainWindow(QMainWindow):
         self.variant_slug = slug
         self.variant_definition = definition
         self.variant_language = definition.language
+        reset_reasoning_context()
 
     @staticmethod
     def _analyze_judge_response(resp: dict[str, object]) -> tuple[bool, list[dict[str, Any]]]:
@@ -2218,6 +2290,7 @@ class MainWindow(QMainWindow):
         # Základný placeholder pre žreb štartéra (MVP skeleton)
         from ..core.tiles import TileBag
         self._exit_exchange_mode()
+        reset_reasoning_context()
         
         # Reload teams before starting new game (in case settings changed)
         self._load_saved_teams()
@@ -2358,6 +2431,55 @@ class MainWindow(QMainWindow):
         if hasattr(self, "status") and isinstance(self.status, QStatusBar):
             self.status.showMessage(f"Timeout nastavený na {display}", 4000)
 
+    def _stop_thread(self, attr: str, *, wait_ms: int = 5000) -> None:
+        """Gracefully stop and dispose a QThread stored on the instance."""
+        thread = getattr(self, attr, None)
+        if not isinstance(thread, QThread):
+            setattr(self, attr, None)
+            return
+
+        log.debug("Stopping thread %s (running=%s)", attr, thread.isRunning())
+
+        if thread.isRunning():
+            try:
+                thread.requestInterruption()
+            except Exception:
+                pass
+            thread.quit()
+            if not thread.wait(wait_ms):
+                log.warning(
+                    "Thread %s did not stop within %sms; waiting for completion",
+                    attr,
+                    wait_ms,
+                )
+                thread.wait()
+        else:
+            log.debug("Thread %s already stopped", attr)
+
+        log.debug("Thread %s stopped (running=%s)", attr, thread.isRunning())
+        try:
+            thread.deleteLater()
+        except Exception:
+            pass
+        setattr(self, attr, None)
+
+    def _stop_all_threads(self) -> None:
+        """Stop all background threads used by the main window."""
+        thread_workers = {
+            "_judge_thread": "_judge_worker",
+            "_ai_thread": "_ai_worker",
+            "_ai_judge_thread": "_ai_judge_worker",
+        }
+        for thread_attr, worker_attr in thread_workers.items():
+            self._stop_thread(thread_attr)
+            worker = getattr(self, worker_attr, None)
+            if isinstance(worker, QObject):
+                try:
+                    worker.deleteLater()
+                except Exception:
+                    pass
+            setattr(self, worker_attr, None)
+
     def _reset_to_idle_state(self) -> None:
         """Vráti aplikáciu do východzieho stavu pred spustením hry."""
         # zastav animácie/spinner a ukonči rozbehnuté vlákna
@@ -2372,16 +2494,7 @@ class MainWindow(QMainWindow):
         self._ai_retry_used = False
         self._ai_last_main_word = ""
         self._ai_last_anchor = ""
-        for attr in ("_judge_thread", "_ai_thread", "_ai_judge_thread"):
-            thread = getattr(self, attr, None)
-            if isinstance(thread, QThread):
-                try:
-                    thread.requestInterruption()
-                except Exception:
-                    pass
-                thread.quit()
-                thread.wait(500)
-            setattr(self, attr, None)
+        self._stop_all_threads()
         # reset modelov
         self.board = Board(PREMIUMS_PATH)
         self.board_view.board = self.board
@@ -3140,11 +3253,17 @@ class MainWindow(QMainWindow):
         # uklon thread po dokonceni
         self._judge_worker.finished.connect(self._judge_thread.quit)
         self._judge_worker.failed.connect(self._judge_thread.quit)
+        self._judge_worker.finished.connect(self._judge_worker.deleteLater)
+        self._judge_worker.failed.connect(self._judge_worker.deleteLater)
+        self._judge_thread.finished.connect(self._judge_thread.deleteLater)
         # uchovaj pre neskor pouzitie pri skore
         self._pending_words_coords = words_coords
         self._judge_thread.start()
 
     def _on_judge_ok(self, resp: dict[str, object]) -> None:
+        if getattr(self, "_shutting_down", False):
+            log.debug("Ignoring judge OK during shutdown")
+            return
         self._stop_status_spinner("judge")
         log.info("Rozhodca výsledok: %s", resp)
         all_valid, entries = self._analyze_judge_response(resp)
@@ -3226,6 +3345,9 @@ class MainWindow(QMainWindow):
         self._start_ai_turn()
 
     def _on_judge_fail(self, e: Exception) -> None:
+        if getattr(self, "_shutting_down", False):
+            log.debug("Ignoring judge failure during shutdown: %s", e)
+            return
         self._stop_status_spinner("judge")
         log.exception("Rozhodca zlyhal: %s", e)
         # vráť dosku do stavu pred potvrdením a pridaj písmená späť na rack
@@ -3322,6 +3444,9 @@ class MainWindow(QMainWindow):
         self._start_ai_turn()
 
     def _start_ai_turn(self) -> None:
+        if getattr(self, "_shutting_down", False):
+            log.debug("Skip AI turn start during shutdown")
+            return
         self._ai_thinking = True
         self._disable_human_inputs()
         self._start_status_spinner("ai", "Hrá AI", wait_cursor=False)
@@ -3330,6 +3455,7 @@ class MainWindow(QMainWindow):
         # priraď trace_id pre AI ťah
         TRACE_ID_VAR.set(str(uuid.uuid4())[:8])
         log.info("[AI] start turn")
+        # Initialize client based on opponent mode
         if self.ai_client is None:
             self.ai_client = OpenAIClient()
         # priprav stav
@@ -3342,15 +3468,26 @@ class MainWindow(QMainWindow):
             f"ai_rack:{st['ai_rack']}\n"
             f"scores: H={st['human_score']} AI={st['ai_score']}\nturn:{st['turn']}\n"
         )
+        
+        # Profiling info pre chat dialog
+        if self.chat_dialog:
+            self.chat_dialog.add_profiling_info("Hráč má ťah: AI", {
+                "Rack": "".join(self.ai_rack),
+                "Skóre": f"AI {self.ai_score} : {self.human_score} Hráč",
+                "Model": self.opponent_mode.name
+            })
 
         class ProposeWorker(QObject):
             finished: Signal = Signal(dict)
             failed: Signal = Signal(Exception)
             multi_model_results: Signal = Signal(list)
             partial_result: Signal = Signal(dict)
+            stream_update: Signal = Signal(str)
+            stream_reasoning: Signal = Signal(str)
+            debug_log: Signal = Signal(str)
             def __init__(
                 self,
-                client: OpenAIClient,
+                client: OpenAIClient | GeminiClient,
                 state_str: str,
                 trace_id: str,
                 variant: VariantDefinition,
@@ -3375,20 +3512,13 @@ class MainWindow(QMainWindow):
                 try:
                     TRACE_ID_VAR.set(self.trace_id)
                     if self.use_multi_model and self.selected_models:
-                        import os
-                        
                         if self.provider_type == "novita":
-                            # Novita multi-model
                             api_key = os.getenv("NOVITA_API_KEY", "")
-                            novita_client = NovitaClient(
-                                api_key,
-                                timeout_seconds=self.timeout_seconds,
-                            )
-                            
+                            novita_client = NovitaClient(api_key, timeout_seconds=self.timeout_seconds)
+
                             async def run_novita_multi() -> tuple[dict[str, Any], list[dict[str, Any]]]:
                                 def on_partial(res: dict[str, Any]) -> None:
                                     self.partial_result.emit(res)
-
                                 try:
                                     move, results = await propose_move_novita_multi_model(
                                         novita_client,
@@ -3402,71 +3532,146 @@ class MainWindow(QMainWindow):
                                     )
                                 finally:
                                     await novita_client.close()
-
-                                log.info(
-                                    "Novita multi-model: %d models, best score from %s",
-                                    len(results),
-                                    next(
-                                        (
-                                            r.get("model_name")
-                                            for r in results
-                                            if r.get("status") == "ok"
-                                        ),
-                                        "?",
-                                    ),
-                                )
                                 return move, results
-                            
+
                             resp, results = asyncio.run(run_novita_multi())
                             self.multi_model_results.emit(results)
-                        else:
-                            # OpenRouter multi-model
-                            api_key = os.getenv("OPENROUTER_API_KEY", "")
-                            openrouter_client = OpenRouterClient(
-                                api_key,
-                                timeout_seconds=self.timeout_seconds,
-                            )
+                            self.finished.emit(resp)
+                            return
+
+                        if self.provider_type == "vertex":
+                            vertex_client = VertexClient(timeout_seconds=self.timeout_seconds)
                             
-                            async def run_multi() -> tuple[dict[str, Any], list[dict[str, Any]]]:
+                            async def run_vertex_multi() -> tuple[dict[str, Any], list[dict[str, Any]]]:
                                 def on_partial(res: dict[str, Any]) -> None:
                                     self.partial_result.emit(res)
-
                                 try:
-                                    move, results = await propose_move_multi_model(
-                                        openrouter_client,
-                                        self.selected_models,
-                                        self.state_str,
-                                        self.variant,
-                                        self.board,
-                                        self.client,
-                                        progress_callback=on_partial,
-                                        timeout_seconds=self.timeout_seconds,
-                                    )
+                                    # Reuse propose_move_multi_model but with VertexClient
+                                    # VertexClient must implement call_model compatible with OpenRouterClient
+                                    # Load MCP tools for Gemini
+                                    from ..ai.mcp_adapter import get_gemini_tools
+                                    tools = get_gemini_tools()
+                                    
+                                    # Start timer thread
+                                    import threading
+                                    stop_timer = threading.Event()
+                                    
+                                    def timer_loop():
+                                        remaining = 120 # 2 minutes
+                                        while remaining > 0 and not stop_timer.is_set():
+                                            msg = f"⏳ Čas na ťah: {remaining}s"
+                                            # Send timer update as a partial result with special status
+                                            on_partial({
+                                                "id": "timer",
+                                                "status": "timer",
+                                                "message": msg,
+                                                "remaining": remaining
+                                            })
+                                            time.sleep(1)
+                                            remaining -= 1
+                                    
+                                    timer_thread = threading.Thread(target=timer_loop, daemon=True)
+                                    # Announce timer start
+                                    on_partial({
+                                        "status": "tool_use",
+                                        "message": "⏱️ Rozhodca spustil časomieru (120s)"
+                                    })
+                                    timer_thread.start()
+                                    
+                                    try:
+                                        move, results = await propose_move_multi_model(
+                                            vertex_client, # type: ignore
+                                            self.selected_models,
+                                            self.state_str,
+                                            self.variant,
+                                            self.board,
+                                            self.client,
+                                            progress_callback=on_partial,
+                                            timeout_seconds=self.timeout_seconds,
+                                            thinking_mode=False, # Disable thinking mode for now
+                                            tools=tools # Pass tools
+                                        )
+                                    finally:
+                                        stop_timer.set()
+                                        timer_thread.join(timeout=1.0)
                                 finally:
-                                    await openrouter_client.close()
-
-                                log.info(
-                                    "Multi-model: %d models, best score from %s",
-                                    len(results),
-                                    next(
-                                        (
-                                            r.get("model_name")
-                                            for r in results
-                                            if r.get("status") == "ok"
-                                        ),
-                                        "?",
-                                    ),
-                                )
+                                    await vertex_client.close()
                                 return move, results
-                            
-                            resp, results = asyncio.run(run_multi())
+
+                            resp, results = asyncio.run(run_vertex_multi())
                             self.multi_model_results.emit(results)
-                    else:
-                        resp = ai_propose_move(
-                            client=self.client,
-                            compact_state=self.state_str,
-                            variant=self.variant,
+                            self.finished.emit(resp)
+                            return
+
+                        api_key = os.getenv("OPENROUTER_API_KEY", "")
+                        openrouter_client = OpenRouterClient(
+                            api_key,
+                            timeout_seconds=self.timeout_seconds,
                         )
+
+                        async def run_multi() -> tuple[dict[str, Any], list[dict[str, Any]]]:
+                            def on_partial(res: dict[str, Any]) -> None:
+                                self.partial_result.emit(res)
+                            try:
+                                move, results = await propose_move_multi_model(
+                                    openrouter_client,
+                                    self.selected_models,
+                                    self.state_str,
+                                    self.variant,
+                                    self.board,
+                                    self.client,
+                                    progress_callback=on_partial,
+                                    timeout_seconds=self.timeout_seconds,
+                                )
+                            finally:
+                                await openrouter_client.close()
+                            return move, results
+
+                        resp, results = asyncio.run(run_multi())
+                        self.multi_model_results.emit(results)
+                        try:
+                            all_failed = all(r.get("status") != "ok" for r in results)
+                            has_gemini = any(
+                                m.get("id") == "google/gemini-3-pro-preview"
+                                for m in (self.selected_models or [])
+                            )
+                            google_key = os.getenv("GOOGLE_API_KEY", "")
+                            if all_failed and has_gemini and google_key:
+                                if self.debug_log:
+                                    try:
+                                        self.debug_log.emit(
+                                            "[Fallback] OpenRouter Gemini zlyhal, skúšam Google Gemini API."
+                                        )
+                                    except Exception:
+                                        pass
+                                from ..ai.gemini_client import GeminiClient
+                                gem_client = GeminiClient(
+                                    api_key=google_key, timeout_seconds=self.timeout_seconds
+                                )
+                                final_text, usage = gem_client.generate_with_tools(
+                                    messages=[{"role": "user", "content": self.state_str}],
+                                    stream_callback=self.stream_update.emit,
+                                    reasoning_callback=self.stream_reasoning.emit,
+                                    debug_callback=self.debug_log.emit,
+                                )
+                                from ..ai.schema import parse_ai_move, to_move_payload
+                                move_model, _pm = parse_ai_move(final_text)
+                                move = to_move_payload(move_model)
+                                move["_usage"] = usage
+                                self.finished.emit(move)
+                                return
+                        except Exception as g_exc:  # noqa: BLE001
+                            log.debug("Gemini API fallback failed: %s", g_exc)
+                        self.finished.emit(resp)
+                        return
+
+                    resp = ai_propose_move(
+                        client=self.client,
+                        compact_state=self.state_str,
+                        variant=self.variant,
+                        stream_callback=self.stream_update.emit,
+                        reasoning_callback=self.stream_reasoning.emit,
+                    )
                     self.finished.emit(resp)
                 except Exception as e:  # noqa: BLE001
                     self.failed.emit(e)
@@ -3474,7 +3679,7 @@ class MainWindow(QMainWindow):
         self._ai_thread = QThread(self)
         
         # Determine provider type and models/timeout based on opponent mode
-        provider_type = "openrouter"  # default
+        provider_type = "openrouter"  # default (Gemini/OpenRouter)
         selected_models = []
         timeout_seconds = self.ai_move_timeout_seconds
         use_multi = False
@@ -3483,7 +3688,13 @@ class MainWindow(QMainWindow):
         log.info("Available: OpenRouter models=%d, Novita models=%d", 
                  len(self.selected_ai_models), len(self.selected_novita_models))
         
-        if self.opponent_mode == OpponentMode.OPENROUTER and self.selected_ai_models:
+        if self.opponent_mode == OpponentMode.GEMINI:
+            provider_type = "vertex"
+            selected_models = [{"id": "gemini-3-pro-preview", "name": "Gemini 3 Pro"}]
+            timeout_seconds = self.ai_move_timeout_seconds
+            use_multi = True
+            log.info("Using Gemini via Vertex AI")
+        elif self.opponent_mode == OpponentMode.OPENROUTER and self.selected_ai_models:
             provider_type = "openrouter"
             selected_models = self.selected_ai_models
             timeout_seconds = self.ai_move_timeout_seconds
@@ -3497,6 +3708,19 @@ class MainWindow(QMainWindow):
             log.info("Using Novita with %d models", len(selected_models))
         else:
             log.info("Using single-model mode (opponent_mode=%s)", self.opponent_mode)
+            # Priprav chat na streaming výstupu
+            try:
+                self.chat_dialog.start_streaming_ai_message()
+                self.chat_dialog.start_reasoning_stream()
+            except Exception:
+                log.debug("Chat streaming start skipped")
+        # Start countdown for this AI turn
+        self._ai_deadline = time.monotonic() + timeout_seconds
+        self._ai_countdown_timer.start()
+        try:
+            self.chat_dialog.update_countdown(int(timeout_seconds))
+        except Exception:
+            pass
         
         self._ai_worker = ProposeWorker(
             self.ai_client,
@@ -3509,6 +3733,13 @@ class MainWindow(QMainWindow):
             timeout_seconds,
             provider_type=provider_type,
         )
+        self._ai_worker.multi_model_results.connect(self._on_multi_model_results)
+        self._ai_worker.partial_result.connect(self._on_multi_model_partial)
+        self._ai_worker.stream_update.connect(self._on_ai_stream_update)
+        self._ai_worker.stream_reasoning.connect(self._on_ai_stream_reasoning)
+        self._ai_worker.debug_log.connect(self._on_ai_debug_log)
+        self._ai_worker.finished.connect(self._on_ai_proposal)
+        self._ai_worker.failed.connect(self._on_ai_fail)
 
         preview_rows = self._build_model_preview_entries()
 
@@ -3540,10 +3771,15 @@ class MainWindow(QMainWindow):
         # Connect signals - results come first, then proposal
         self._ai_worker.multi_model_results.connect(self._on_multi_model_results)
         self._ai_worker.partial_result.connect(self._on_multi_model_partial)
+        self._ai_worker.stream_update.connect(self._on_ai_stream_update)
+        self._ai_worker.stream_reasoning.connect(self._on_ai_stream_reasoning)
         self._ai_worker.finished.connect(self._on_ai_proposal)
         self._ai_worker.failed.connect(self._on_ai_fail)
         self._ai_worker.finished.connect(self._ai_thread.quit)
         self._ai_worker.failed.connect(self._ai_thread.quit)
+        self._ai_worker.finished.connect(self._ai_worker.deleteLater)
+        self._ai_worker.failed.connect(self._ai_worker.deleteLater)
+        self._ai_thread.finished.connect(self._ai_thread.deleteLater)
         self._ai_thread.start()
         
         # Update status to show models are being called
@@ -3564,9 +3800,25 @@ class MainWindow(QMainWindow):
         status = result.get("status", "pending")
         score = result.get("score")
 
-        log.info(
-            "Partial result from %s status=%s score=%s", model_name, status, score
-        )
+        if status == "timer":
+            remaining = result.get("remaining", 0)
+            if self.chat_dialog:
+                self.chat_dialog.update_countdown(remaining)
+            return
+
+        if status == "tool_use":
+            message = result.get("message", "🛠️ Používam nástroj...")
+            if self.chat_dialog:
+                self.chat_dialog.add_agent_activity(message)
+            # Update table status too
+            self.model_results_table.update_result(result)
+            return
+
+        if status == "retry":
+            error_msg = result.get("error", "")
+            if self.chat_dialog:
+                self.chat_dialog.add_agent_activity(f"🔄 Retry: {error_msg[:100]}...")
+            # Continue to update table
 
         self.model_results_table.update_result(result)
 
@@ -3579,7 +3831,13 @@ class MainWindow(QMainWindow):
             )
         elif status == "parse_error":
             self.status.showMessage(f"{model_name}: neplatná odpoveď – čakám na ostatné modely")
-        elif status == "error":
+            # Update timer display using the existing ChatDialog method
+            remaining = result.get("remaining", 0)
+            if self.chat_dialog:
+                self.chat_dialog.update_countdown(remaining)
+            return
+
+        if status == "error":
             self.status.showMessage(f"{model_name}: API chyba – čakám na ostatné modely")
         elif status == "timeout":
             self.status.showMessage(f"{model_name}: Timeout – čakám na ostatné modely")
@@ -3695,7 +3953,34 @@ class MainWindow(QMainWindow):
         return None
 
     def _on_ai_proposal(self, proposal: dict[str, object]) -> None:
+        if getattr(self, "_shutting_down", False):
+            log.debug("Ignoring AI proposal during shutdown")
+            return
+        self._ai_countdown_timer.stop()
+        try:
+            self.chat_dialog.update_countdown(0)
+        except Exception:
+            pass
         log.info("AI navrhla: %s", proposal)
+        usage = proposal.get("_usage") if isinstance(proposal, dict) else None
+        if usage:
+            try:
+                prompt_tokens = int(usage.get("prompt_tokens", 0))
+                context_length = int(usage.get("context_length", 0))
+                if prompt_tokens > 0 and context_length > 0:
+                    self.chat_dialog.update_context_usage(prompt_tokens, context_length)
+            except Exception:
+                log.debug("Context usage update skipped (invalid data)")
+        try:
+            transcript = get_context_transcript()
+            if transcript:
+                self.chat_dialog.set_context_snapshot(transcript)
+        except Exception:
+            log.debug("Context transcript update skipped")
+        try:
+            self.chat_dialog.finish_streaming_ai_message()
+        except Exception:
+            log.debug("Finish streaming skipped")
         # validacia - bez retry, jednoducho pass pri chybe
         err = self._validate_ai_move(proposal)
         if err is not None and not bool(proposal.get("pass", False)):
@@ -3885,14 +4170,29 @@ class MainWindow(QMainWindow):
         self._ai_judge_worker.failed.connect(self._on_ai_judge_fail)
         self._ai_judge_worker.finished.connect(self._ai_judge_thread.quit)
         self._ai_judge_worker.failed.connect(self._ai_judge_thread.quit)
+        self._ai_judge_worker.finished.connect(self._ai_judge_worker.deleteLater)
+        self._ai_judge_worker.failed.connect(self._ai_judge_worker.deleteLater)
+        self._ai_judge_thread.finished.connect(self._ai_judge_thread.deleteLater)
         self._ai_judge_thread.start()
 
     def _on_ai_fail(self, e: Exception) -> None:
+        if getattr(self, "_shutting_down", False):
+            log.debug("Ignoring AI failure during shutdown: %s", e)
+            return
+        self._ai_countdown_timer.stop()
+        try:
+            self.chat_dialog.update_countdown(0)
+        except Exception:
+            pass
         self._stop_status_spinner("ai")
         self._ai_thinking = False
         self._enable_human_inputs()
         log.exception("AI navrh zlyhal: %s", e)
         self.status.showMessage("AI pasuje (chyba)")
+        try:
+            self.chat_dialog.add_error_message(f"AI chyba: {e}")
+        except Exception:
+            pass
         self._register_scoreless_turn("AI")
         if self._ai_opening_active:
             try:
@@ -3903,6 +4203,9 @@ class MainWindow(QMainWindow):
         self._check_endgame()
 
     def _on_ai_judge_ok(self, resp: dict[str, object]) -> None:
+        if getattr(self, "_shutting_down", False):
+            log.debug("Ignoring AI judge OK during shutdown")
+            return
         self._stop_status_spinner("judge")
         self._stop_status_spinner("ai")
         all_valid, entries = self._analyze_judge_response(resp)
@@ -4011,6 +4314,9 @@ class MainWindow(QMainWindow):
         self._check_endgame()
 
     def _on_ai_judge_fail(self, e: Exception) -> None:
+        if getattr(self, "_shutting_down", False):
+            log.debug("Ignoring AI judge failure during shutdown: %s", e)
+            return
         self._stop_status_spinner("judge")
         self._stop_status_spinner("ai")
         log.exception("AI judge zlyhal: %s", e)
@@ -4128,7 +4434,7 @@ class MainWindow(QMainWindow):
             self.ai_move_max_tokens = new_ai_tokens
             self._ai_tokens_from_env = from_env
             self._user_defined_ai_tokens = False
-            self._update_max_tokens_label()
+            self._update_mode_status_label()
             try:
                 if self.ai_client is not None:
                     self.ai_client.ai_move_max_output_tokens = new_ai_tokens
@@ -4255,6 +4561,7 @@ class MainWindow(QMainWindow):
         except Exception as e:  # noqa: BLE001
             QMessageBox.critical(self, "Otvoriť", f"Neplatný súbor: {e}")
             return
+        reset_reasoning_context()
         try:
             # obnov board, bag a hodnoty
             saved_variant = st.get("variant")
@@ -4329,18 +4636,6 @@ class MainWindow(QMainWindow):
         )
         dialog.exec()
 
-    def edit_ai_prompt(self) -> None:
-        """Open AI prompt editor dialog."""
-        dialog = PromptEditorDialog(parent=self)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            # Reload prompt file in player.py will happen automatically
-            # since it reads AI_PROMPT_FILE env var on each call
-            QMessageBox.information(
-                self,
-                "Prompt aktualizovaný",
-                f"Prompt bol úspešne aktualizovaný.\n"
-                f"Používaný súbor: {dialog.get_current_prompt_file()}"
-            )
     
     def open_agents_dialog(self) -> None:
         """Open agents activity dialog (non-modal)."""
@@ -4356,6 +4651,128 @@ class MainWindow(QMainWindow):
         if self.agents_dialog is None:
             self.agents_dialog = AgentsDialog(parent=self)
         return self.agents_dialog
+    
+    def open_chat_dialog(self) -> None:
+        """Otvorí chat dialog s AI protihráčom (non-modal).
+        
+        Komentár (SK): Chat dialog zostáva otvorený počas hry a umožňuje
+        používateľovi priamo komunikovať s AI mimo herného protokolu.
+        """
+        self.chat_dialog.show()
+        self.chat_dialog.raise_()
+        self.chat_dialog.activateWindow()
+        log.info("Chat dialog opened")
+    
+    def _on_user_chat_message(self, message: str) -> None:
+        """Spracuje user správu z chat dialogu.
+        
+        Komentár (SK): Pridá správu do context session a požiada AI o odpoveď.
+        Toto umožňuje voľnú konverzáciu mimo herného protokolu.
+        """
+        log.info("User chat message received: %s", message[:50])
+        
+        # TODO: Implement chat message handling
+        # Pre teraz iba dummy odpoveď
+        self.chat_dialog.add_ai_message(
+            f"Dostal som tvoju správu: '{message}'. Chat protokol bude funkčný po dokončení integrácie.",
+            use_typing_effect=False
+        )
+    
+    def _on_statusbar_click(self, event: QMouseEvent) -> None:
+        """Handler pre kliknutie na statusbar - otvorí chat dialog.
+        
+        Komentár (SK): Statusbar slúži ako rýchly prístup k chat dialogu.
+        Kliknutím kdekoľvek na statusbar sa otvorí chat s AI.
+        """
+        self.open_chat_dialog()
+        log.debug("Statusbar clicked, opening chat dialog")
+
+    def _on_agent_row_clicked(self, model_id: str, model_name: str) -> None:
+        """Klik na agent row v tabuľke modelov - otvorí chat s týmto agentom."""
+        self.selected_agent_name = model_name
+        self.opponent_mode = OpponentMode.AGENT
+        self._update_mode_status_label()
+        try:
+            self.chat_dialog.setWindowTitle(f"Agent Chat – {model_name}")
+        except Exception:
+            pass
+        # Otvor Agents dialog a prepni na daného agenta
+        try:
+            agents_dialog = self.get_agents_dialog()
+            widget = agents_dialog.show_agent_tab(model_name, model_name)
+            # Indikuj použitý MCP server z defaults
+            if getattr(widget, "default_mcp_url", None):
+                widget.append_status(f"Používam MCP server: {widget.default_mcp_url}")
+        except Exception:
+            log.exception("Nepodarilo sa zobraziť Agents dialog pre agenta %s", model_name)
+        self.open_chat_dialog()
+
+    def _on_status_message_changed(self, message: str) -> None:
+        """Mirror dôležité status správy do chatu (pre kontext LLM)."""
+        msg = (message or "").strip()
+        if not msg:
+            return
+        # Filtruj spinner/duplicitné alebo nízko-informačné správy
+        lower_msg = msg.lower()
+        ignore_prefixes = [
+            "hrá ai",  # bežný status počas ťahu
+            "hrá hráč",
+            "hráč vymieňa",
+            "potencionálne skóre",
+        ]
+        if any(lower_msg.startswith(pref) for pref in ignore_prefixes):
+            return
+        now = time.time()
+        if msg == self._chat_status_last_message and (now - self._chat_status_last_ts) < 1.5:
+            return
+        if msg.endswith("…") or msg.endswith("..."):
+            return
+        
+        self._chat_status_last_message = msg
+        self._chat_status_last_ts = now
+        try:
+            self.chat_dialog.add_ai_message(f"ℹ️ {msg}", use_typing_effect=False)
+        except Exception:
+            log.exception("Mirror status->chat zlyhal")
+
+    def _on_ai_countdown_tick(self) -> None:
+        """Update countdown label for AI timeout."""
+        if self._ai_deadline <= 0:
+            self._ai_countdown_timer.stop()
+            try:
+                self.chat_dialog.update_countdown(0)
+            except Exception:
+                pass
+            return
+        rem = int(self._ai_deadline - time.monotonic())
+        if rem <= 0:
+            rem = 0
+            self._ai_countdown_timer.stop()
+        try:
+            self.chat_dialog.update_countdown(rem)
+        except Exception:
+            log.debug("Countdown update skipped")
+
+    def _on_ai_stream_update(self, delta: str) -> None:
+        """Streamujúce tokeny z AI -> chat."""
+        try:
+            self.chat_dialog.update_streaming_ai_message(delta)
+        except Exception:
+            log.debug("Stream update skipped")
+
+    def _on_ai_stream_reasoning(self, delta: str) -> None:
+        """Stream reasoning tokens into reasoning bubble."""
+        try:
+            self.chat_dialog.update_reasoning_stream(delta)
+        except Exception:
+            log.debug("Stream reasoning skipped")
+
+    def _on_ai_debug_log(self, message: str) -> None:
+        """Zobraz debug/profiling správy z AI klienta v chate."""
+        try:
+            self.chat_dialog.add_debug_message(message)
+        except Exception:
+            log.debug("Debug log to chat skipped")
     
     def open_mcp_test_dialog(self) -> None:
         """Open MCP testing dialog (non-modal)."""
@@ -4413,7 +4830,7 @@ class MainWindow(QMainWindow):
                 if openrouter_timeout:
                     self.ai_move_max_tokens = openrouter_timeout
                     self._user_defined_ai_tokens = True
-                    self._update_max_tokens_label()
+                    self._update_mode_status_label()
                     try:
                         if self.ai_client is not None:
                             self.ai_client.ai_move_max_output_tokens = self.ai_move_max_tokens
@@ -4425,7 +4842,7 @@ class MainWindow(QMainWindow):
                 if novita_tokens:
                     self.ai_move_max_tokens = novita_tokens
                     self._user_defined_ai_tokens = True
-                    self._update_max_tokens_label()
+                    self._update_mode_status_label()
                     try:
                         if self.ai_client is not None:
                             self.ai_client.ai_move_max_output_tokens = novita_tokens
@@ -4441,6 +4858,7 @@ class MainWindow(QMainWindow):
             
             log.info("Opponent settings changed: mode=%s, agent=%s", new_mode.value, new_agent)
             self._refresh_model_results_table()
+            self._update_mode_status_label()
         
         # Show dialog (non-blocking, non-modal)
         dialog.accepted.connect(on_opponent_settings_accepted)
@@ -4465,7 +4883,7 @@ class MainWindow(QMainWindow):
             shared_tokens = dialog.get_shared_tokens_value()
             self.ai_move_max_tokens = shared_tokens
             self._user_defined_ai_tokens = True
-            self._update_max_tokens_label()
+            self._update_mode_status_label()
             try:
                 if self.ai_client is not None:
                     self.ai_client.ai_move_max_output_tokens = shared_tokens
@@ -4484,6 +4902,15 @@ class MainWindow(QMainWindow):
                 self.status.showMessage(
                     "Multi-model režim deaktivovaný. Používa sa GPT-5-mini.", 5000
                 )
+
+    def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
+        """Ensure background threads are stopped before closing the window."""
+        self._shutting_down = True
+        try:
+            self._stop_all_threads()
+        except Exception:
+            log.exception("Failed to stop background threads during close")
+        super().closeEvent(event)
 
 def main() -> None:
     app = QApplication(sys.argv)

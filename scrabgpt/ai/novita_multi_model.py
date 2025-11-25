@@ -62,7 +62,7 @@ async def propose_move_novita_multi_model(
         log.info("Calling Novita model: %s", model_id)
 
         async def invoke_model() -> dict[str, Any]:
-            return await client.call_model(model_id, prompt, max_tokens)
+            return await client.call_model(model_id, prompt, max_tokens=max_tokens)
 
         async def _notify(payload: dict[str, Any]) -> dict[str, Any]:
             if progress_callback is None:
@@ -363,7 +363,37 @@ async def propose_move_novita_multi_model(
     valid_results = [r for r in all_results if r.get("status") == "ok" and r.get("move")]
     
     if not valid_results:
-        raise ValueError("No models returned valid moves")
+        failure_summaries: list[str] = []
+        for payload in all_results:
+            if not isinstance(payload, dict):
+                continue
+            label = str(
+                payload.get("model_name")
+                or payload.get("model")
+                or "unknown"
+            )
+            error_text = payload.get("error")
+            status_text = payload.get("status")
+            if isinstance(error_text, str) and error_text:
+                failure_summaries.append(f"{label}: {error_text}")
+            elif isinstance(status_text, str) and status_text and status_text != "ok":
+                failure_summaries.append(f"{label}: {status_text}")
+
+        summary = "; ".join(failure_summaries[:3])
+        if len(failure_summaries) > 3:
+            summary += f"; +{len(failure_summaries) - 3} more errors"
+
+        reason = summary or "No valid move returned by any model"
+        log.warning("No models returned valid moves; forcing pass. Reason=%s", reason)
+        fallback_move: dict[str, Any] = {
+            "pass": True,
+            "placements": [],
+            "blanks": {},
+            "word": "",
+            "exchange": [],
+            "reason": reason,
+        }
+        return fallback_move, all_results
     
     # Extract words for all valid results first
     for result in valid_results:

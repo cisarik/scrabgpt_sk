@@ -190,10 +190,22 @@ class OpenRouterClient:
     async def call_model(
         self,
         model_id: str,
-        prompt: str,
+        prompt: str = "",
+        *,
+        messages: list[dict[str, Any]] | None = None,
         max_tokens: int | None = None,
     ) -> dict[str, Any]:
-        """Call a specific model via OpenRouter."""
+        """Call a specific model via OpenRouter.
+        
+        Args:
+            model_id: OpenRouter model ID (e.g., "openai/gpt-4o-mini")
+            prompt: Single prompt string (converted to user message if messages not provided)
+            messages: Optional list of messages for chat protocol (overrides prompt)
+            max_tokens: Maximum output tokens
+        
+        Returns:
+            dict with keys: model, content, status, prompt_tokens, completion_tokens, etc.
+        """
         call_id = self._next_call_id("call")
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -206,9 +218,16 @@ class OpenRouterClient:
             if isinstance(max_tokens, int) and max_tokens > 0
             else self.ai_move_max_output_tokens
         )
+        
+        # Use provided messages or convert prompt to messages
+        if messages:
+            api_messages = messages
+        else:
+            api_messages = [{"role": "user", "content": prompt}]
+        
         payload = {
             "model": model_id,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": api_messages,
             "max_tokens": resolved_max_tokens,
             "temperature": 0.7,
         }

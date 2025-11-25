@@ -5,8 +5,8 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QColor, QCursor
+from PySide6.QtCore import Qt, QTimer, QEvent, Signal
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QTableWidget, QTableWidgetItem,
     QHeaderView,
@@ -38,6 +38,8 @@ class AIModelResultsTable(QWidget):
     
     Sorted by score (highest first).
     """
+    
+    agent_row_clicked = Signal(str, str)  # model_id, model_name
     
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -103,7 +105,11 @@ class AIModelResultsTable(QWidget):
         
         # Make rows clickable
         self.table.cellClicked.connect(self._on_cell_clicked)
-        self.table.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.table.setMouseTracking(True)
+        self.table.viewport().setMouseTracking(True)
+        self.table.cellEntered.connect(self._on_cell_entered)
+        self.table.viewport().installEventFilter(self)
+        self.table.viewport().setCursor(Qt.CursorShape.ArrowCursor)
         
         # Set minimum/maximum height
         self.table.setMinimumHeight(0)  # Allow collapsing when empty
@@ -113,6 +119,19 @@ class AIModelResultsTable(QWidget):
         
         # Start with empty table (visible but collapsed)
         self.table.setRowCount(0)
+
+    def _on_cell_entered(self, _row: int, column: int) -> None:
+        """Adjust cursor when hovering over table cells."""
+        if column == 1:
+            self.table.viewport().setCursor(Qt.CursorShape.PointingHandCursor)
+        else:
+            self.table.viewport().setCursor(Qt.CursorShape.ArrowCursor)
+
+    def eventFilter(self, obj, event) -> bool:
+        """Reset cursor when leaving the table viewport."""
+        if obj is self.table.viewport() and event.type() == QEvent.Type.Leave:
+            self.table.viewport().setCursor(Qt.CursorShape.ArrowCursor)
+        return super().eventFilter(obj, event)
     
     def set_results(self, results: list[dict[str, Any]]) -> None:
         """Replace current results with a new list (final render)."""
@@ -430,6 +449,14 @@ class AIModelResultsTable(QWidget):
         if 0 <= row < len(self.results):
             result = self.results[row]
             status = (result.get("status") or "").lower()
+            model_id = str(result.get("model") or "")
+            model_name = str(result.get("model_name") or model_id)
+            
+            # Agent rows: otvor chat namiesto detailu (aj pri pending)
+            if model_id.startswith("agent:"):
+                self.agent_row_clicked.emit(model_id, model_name)
+                return
+            
             if status in {"pending", "ready"}:
                 return
             dialog = ResponseDetailDialog(result, parent=self)

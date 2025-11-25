@@ -42,6 +42,9 @@
   and background tooling.
 - `JUDGE_MAX_OUTPUT_TOKENS` limits the referee’s response size.
 - `SHOW_AGENT_ACTIVITY_AUTO` toggles automatic Agents dialog visibility after operations.
+- `OPENAI_BASE_URL` *(or `LLMSTUDIO_BASE_URL`)* points the built-in OpenAI client at a compatible HTTP endpoint (e.g., an llmstudio server hosting `deepseek` models). Combine with `OPENAI_MODEL` to pick the deployed model id.
+- `AI_CONTEXT_SESSION` enables the per-game rolling context window for reasoning models; set to `1/true/on` to keep a shared transcript instead of rebuilding the prompt every turn.
+- `AI_CONTEXT_HISTORY` (optional) caps how many prior AI turns are replayed inside that context (defaults to 8, max 20).
 - Config persistence writes to `~/.scrabgpt/config.json` and `~/.scrabgpt/teams/` outside the repo.
 
 ### Unified AI Move Budget
@@ -59,6 +62,48 @@ Guidelines for future work:
 - When persisting team presets, store `timeout_seconds` using the unified value so reloading
   respects the latest configuration.
 - The settings dialog already syncs both knobs back into `.env`.
+
+### Local LLMStudio Reasoning Mode
+
+You can point the single-model player at a self-hosted reasoning model (for example
+`deepseek/deepseek-r1-0528-qwen3-8b` served by llmstudio) without touching the UI:
+
+1. Start the llmstudio server with OpenAI-compatible HTTP surface (usually `http://localhost:1234/v1`).
+2. Export the following variables (or add them to `.env`):
+
+   ```bash
+   OPENAI_BASE_URL=http://localhost:1234/v1
+   OPENAI_MODEL=deepseek/deepseek-r1-0528-qwen3-8b
+   AI_CONTEXT_SESSION=1          # reuse a single prompt per game
+   AI_CONTEXT_HISTORY=8          # optional – number of past turns to replay
+   ```
+
+When `AI_CONTEXT_SESSION` is on, `scrabgpt.ai.player.propose_move()` uses a **persistent message-based
+context window** instead of rebuilding the full prompt every turn:
+
+- **First turn**: Sends system prompt + initial game state
+- **Subsequent turns**: Only appends new state to existing conversation (80-90% token reduction!)
+- **Reasoning models**: Automatically captures `thinking` or `reasoning` channel content
+- **Context preservation**: The full conversation history persists across turns
+- **Auto-reset**: Context clears on new game, variant switch, or explicit reset
+
+#### Implementation Details
+
+The context session maintains a list of `ChatCompletionMessageParam` objects:
+- System message (base prompt) sent once
+- User messages (game states) appended each turn  
+- Assistant messages (including thinking/reasoning) stored for next turn
+- History limit controlled by `AI_CONTEXT_HISTORY` (1-20, default 8)
+
+New methods in `GameContextSession`:
+- `prepare_messages()`: Returns message list for chat completion API
+- `remember_response()`: Stores assistant response including thinking content
+
+New method in `OpenAIClient`:
+- `_call_text_with_context()`: Calls chat completion with message history, extracts thinking/reasoning
+
+The context cache resets automatically whenever you start a new game, load a save, or
+switch variants, so each match gets its own transcript.
 
 ## Build, Test, and Development Commands
 `poetry install` provisions dependencies and the virtualenv. Run the desktop app via `poetry run python -m scrabgpt.ui.app` or the CLI shim `poetry run scrabgpt`. Execute automated checks with `poetry run pytest`, optionally `-k keyword` for a subset. Enforce style through `poetry run ruff check` (add `--fix` when safe) and typing with `poetry run mypy`. Run commands from the repo root so relative paths resolve.

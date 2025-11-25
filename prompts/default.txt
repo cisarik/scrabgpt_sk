@@ -33,7 +33,7 @@ SPECIAL CASES:
     * DOWN from (5,7): places tiles at (5,7), (6,7), (7,7) ✓ crosses center
     * ACROSS from (7,8): INVALID ✗ doesn't cross (7,7)
     * DOWN from (8,7): INVALID ✗ doesn't cross (7,7)
-- If no legal move exists: pass (set 'pass': true), but prefer gaining points over passing
+- NEVER GIVE UP: Always find a valid move. Do not pass.
 - The 'word' field must equal the final main word formed (existing letters + your placements)
 
 OUTPUT FORMAT:
