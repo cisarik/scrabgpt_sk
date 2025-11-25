@@ -37,7 +37,7 @@ class VertexClient:
     def __init__(
         self,
         project_id: str | None = None,
-        location: str = "us-central1",
+        location: str | None = None,
         *,
         timeout_seconds: int | None = None,
     ) -> None:
@@ -55,7 +55,8 @@ class VertexClient:
                 log.warning("Failed to parse project_id from %s: %s", creds_path, e)
 
         self.project_id = project_id or loaded_project_id or "vertexaccount"
-        self.location = location
+        # Prefer argument, then env var, then default
+        self.location = location or os.getenv("VERTEX_LOCATION") or "us-central1"
             
         self.client = genai.Client(
             vertexai=True,
@@ -148,22 +149,31 @@ class VertexClient:
         resolved_max_tokens = (
             max_tokens
             if isinstance(max_tokens, int) and max_tokens > 0
-            else 1024
+            else self.ai_move_max_output_tokens
         )
         
-        # Cap at 8192 for Gemini 2.0 Flash (and generally for safety)
-        if resolved_max_tokens > 8192:
-            log.warning("Capping max_tokens from %d to 8192 for Vertex AI", resolved_max_tokens)
-            resolved_max_tokens = 8192
+        # Cap at 20000 (consistent with OpenRouter) but allow user env var to drive it up to that point
+        if resolved_max_tokens > 20000:
+            log.warning("Capping max_tokens from %d to 20000 for safety", resolved_max_tokens)
+            resolved_max_tokens = 20000
         
         with self._trace_scope(call_id) as trace_id:
+            tool_count = 0
+            if tools:
+                # Vertex tools are wrappers; count actual function declarations
+                for t in tools:
+                    if hasattr(t, "function_declarations"):
+                        tool_count += len(t.function_declarations)
+                    else:
+                        tool_count += 1
+
             log.info(
-                "[%s] Calling Vertex model %s (max_tokens=%d, thinking=%s, tools=%s)",
+                "[%s] Calling Vertex model %s (max_tokens=%d, thinking=%s, tools=%d)",
                 trace_id,
                 model_id,
                 resolved_max_tokens,
                 thinking_mode,
-                len(tools) if tools else 0
+                tool_count
             )
             
             start = time.perf_counter()
@@ -204,8 +214,18 @@ class VertexClient:
                 }
                 
                 if prompt and messages:
-                    kwargs["system_instruction"] = types.Content(role="system", parts=[types.Part(text=prompt)])
-
+                    # Construct system prompt from prompt string
+                    # Note: If messages are provided, prompt is treated as system instruction by our convention
+                    # in multi_model.py/openrouter.py logic.
+                    
+                    # Pass system instruction in config
+                    config.system_instruction = [types.Part(text=prompt)]
+                    
+                    # IMPORTANT: Ensure system_instruction is NOT in kwargs, as it was removed
+                    # from GenerateContentConfig but generate_content signature might not accept it directly
+                    if "system_instruction" in kwargs:
+                        del kwargs["system_instruction"]
+                
                 # --- Tool Execution Loop ---
                 from .mcp_adapter import execute_tool
                 
@@ -233,10 +253,27 @@ class VertexClient:
                     # Notify progress
                     if progress_callback:
                         try:
+                            # Extract args for display
+                            tool_calls_data = []
+                            for tc in tool_calls:
+                                args_dict = {}
+                                if tc.args:
+                                    # Convert MapComposite to dict
+                                    try:
+                                        # Depending on SDK version, it might be dict or MapComposite
+                                        if hasattr(tc.args, "items"):
+                                            args_dict = dict(tc.args.items())
+                                        else:
+                                            args_dict = dict(tc.args)
+                                    except Exception:
+                                        args_dict = {"raw": str(tc.args)}
+                                tool_calls_data.append({"name": tc.name, "args": args_dict})
+
                             res = progress_callback({
                                 "status": "tool_use",
                                 "model": model_id,
                                 "tool_calls": [tc.name for tc in tool_calls],
+                                "tool_calls_data": tool_calls_data,
                                 "message": f"🛠️ Volám nástroje: {', '.join(tc.name for tc in tool_calls)}"
                             })
                             if inspect.isawaitable(res):
@@ -252,6 +289,21 @@ class VertexClient:
                     for tc in tool_calls:
                         log.info("[%s] Executing tool: %s", trace_id, tc.name)
                         result = execute_tool(tc.name, tc.args)
+                        
+                        # Report result via progress callback
+                        if progress_callback:
+                            try:
+                                res = progress_callback({
+                                    "status": "tool_result",
+                                    "model": model_id,
+                                    "tool_name": tc.name,
+                                    "result": result,
+                                    "message": f"✅ Výsledok {tc.name}"
+                                })
+                                if inspect.isawaitable(res):
+                                    await res
+                            except Exception:
+                                log.warning("Progress callback failed for tool result", exc_info=True)
                         
                         tool_outputs.append(
                             types.Part.from_function_response(

@@ -12,7 +12,13 @@ from typing import Any, Callable, Optional
 from ..core.variant_store import VariantDefinition
 from ..core.board import Board
 from ..core.types import Placement
-from ..core.rules import extract_all_words
+from ..core.rules import (
+    extract_all_words,
+    placements_in_line,
+    no_gaps_in_line,
+    first_move_must_cover_center,
+    connected_to_existing,
+)
 from ..core.scoring import score_words
 from .openrouter import OpenRouterClient
 from .schema import parse_ai_move, to_move_payload
@@ -86,14 +92,12 @@ async def propose_move_multi_model(
 
             # Call model
             try:
-                # If we have history, prompt is passed as system instruction (handled by client)
-                # If no history, prompt is the initial user message/system prompt
-                current_prompt = prompt if not conversation_history else ""
-                
+                # Always pass the prompt (system instruction).
+                # Clients must handle whether to use it as system msg or prepend to messages.
                 result = await asyncio.wait_for(
                     client.call_model(
                         model_id, 
-                        current_prompt, 
+                        prompt, 
                         max_tokens=model_info.get("max_tokens") or client.ai_move_max_output_tokens, 
                         **kwargs
                     ), 
@@ -149,6 +153,99 @@ async def propose_move_multi_model(
                         blank_as=p.get("blank_as")
                     ))
                 
+                # Extract rack from compact_state
+                import re
+                rack_match = re.search(r"(?:ai_)?rack:\s*(?:\[(.*?)\]|(.*))", compact_state)
+                if rack_match:
+                    rack_str = rack_match.group(1) or rack_match.group(2) or ""
+                    # Rack letters - comma separated or just string?
+                    # Usually "A, B, C" or "ABC"
+                    if "," in rack_str:
+                        rack_letters = [x.strip() for x in rack_str.split(",") if x.strip()]
+                    else:
+                        # Handle JSON style "['A', 'B']" if present (regex might catch quotes)
+                        cleaned = rack_str.replace("'", "").replace('"', "")
+                        if "," in cleaned:
+                            rack_letters = [x.strip() for x in cleaned.split(",") if x.strip()]
+                        else:
+                            rack_letters = list(cleaned.strip())
+                    
+                    # Validate letter usage
+                    rack_copy = list(rack_letters)
+                    
+                    # Check against board (for redundant placements)
+                    # We need to ignore placements that are already on board (redundant)
+                    # But multi_model doesn't have easy access to board cells directly here 
+                    # (it has 'board' object but we need to check specific cells)
+                    
+                    final_placements = []
+                    for p in placements:
+                        # Check if cell occupied
+                        existing = board.cells[p.row][p.col].letter
+                        if existing:
+                            if existing == p.letter:
+                                # Redundant, ignore
+                                continue
+                            else:
+                                raise ValueError(f"Attempt to overwrite existing '{existing}' at ({p.row},{p.col}) with '{p.letter}'")
+                        final_placements.append(p)
+                    
+                    # Now validate against rack
+                    for p in final_placements:
+                        # Handle blanks (if p.letter is not in rack but '?' is)
+                        # If AI proposes 'A' but has '?', we use '?'
+                        # But if AI explicitly sends '?', we use '?'
+                        
+                        # Logic:
+                        # 1. If letter in rack, use it.
+                        # 2. If not, check for '?'.
+                        # 3. If neither, error.
+                        
+                        # Note: UI app.py logic:
+                        # if p.letter == "?" or consume_as_blank: ...
+                        # Here we simplify:
+                        
+                        if p.letter in rack_copy:
+                            rack_copy.remove(p.letter)
+                        elif "?" in rack_copy:
+                            rack_copy.remove("?")
+                        else:
+                            raise ValueError(f"Used letter '{p.letter}' which is not in rack {rack_letters}")
+                    
+                    # If we survived, update placements to final_placements (stripped of redundant)
+                    # We must update the 'placements' variable as it is used below for board operations
+                    placements = final_placements
+                    
+                    # If stripped placements are empty, but AI sent a word, something is wrong (unless exchange/pass)
+                    if not placements and not move.get("pass") and not move.get("exchange"):
+                        # AI sent redundant placements for existing word but no new letters?
+                        # This is effectively a pass or invalid move.
+                        # But wait, maybe AI thought it's placing new letters but they were already there?
+                        # If so, it's invalid because you must place at least one tile.
+                        raise ValueError("No new tiles placed (all placements were redundant/occupied). You must place at least one new tile from your rack.")
+
+                # Geometry Validation (Gaps, Line, Center, Connection)
+                if placements: # skip for pass/exchange
+                    # 1. Line check
+                    direction = placements_in_line(placements)
+                    if direction is None:
+                        raise ValueError("Placements are not in a single line (ACROSS or DOWN).")
+                    
+                    # 2. Gaps check
+                    if not no_gaps_in_line(board, placements, direction):
+                        raise ValueError("Placements contain gaps (empty cells between letters). Move must be contiguous.")
+                    
+                    # 3. Center / Connection check
+                    # Check if board has any letters
+                    has_any = any(board.cells[r][c].letter for r in range(15) for c in range(15))
+                    
+                    if not has_any:
+                        if not first_move_must_cover_center(placements):
+                            raise ValueError("First move must cover the center star (7,7).")
+                    else:
+                        if not connected_to_existing(board, placements):
+                            raise ValueError("Move must connect to existing words on the board.")
+
                 # Check board validity (geometry)
                 board_snapshot = deepcopy(board)
                 board_snapshot.place_letters(placements)

@@ -666,10 +666,11 @@ def tool_validate_word_slovak(
     # ========== Length-based Online Skip ==========
     # Short words: if not in local dict, assume invalid (99%+ coverage)
     # Long words: might be compounds/neologisms, check JULS
-    if len(word_normalized) <= online_min_length:
+    threshold = online_min_length if online_min_length is not None else 7
+    if len(word_normalized) <= threshold:
         elapsed_ms = (time.time() - start_time) * 1000
         log.debug("⚡ Word '%s' too short (len=%d ≤ %d) for online validation, marking invalid", 
-                 word_normalized, len(word_normalized), online_min_length)
+                 word_normalized, len(word_normalized), threshold)
         
         _VALIDATION_STATS["slovak_short_skip"]["count"] += 1
         
@@ -677,7 +678,7 @@ def tool_validate_word_slovak(
             "valid": False,
             "language": "slovak",
             "tier": 1,
-            "reason": f"Not in local dictionary (short word ≤{online_min_length} chars, online skipped)",
+            "reason": f"Not in local dictionary (short word ≤{threshold} chars, online skipped)",
             "source": "tier1_negative_short",
             "time_ms": elapsed_ms,
             "cached": False,

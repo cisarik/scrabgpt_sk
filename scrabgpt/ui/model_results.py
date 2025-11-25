@@ -181,10 +181,17 @@ class AIModelResultsTable(QWidget):
     def update_result(self, result: dict[str, Any]) -> None:
         """Merge a single model result and re-render the table."""
 
-        model_id = result.get("model")
+        model_id = result.get("model") or result.get("id")
         if not model_id:
+            # Some specialized updates (like timer) might not have a model ID
+            # and we don't want to log warnings for them if they are not meant for this table.
+            if result.get("status") == "timer":
+                return
             log.warning("Ignoring partial result without model id: %s", result)
             return
+
+        if model_id == "timer":
+             return
 
         existing = self._results_by_model.get(model_id, {})
         merged = {**existing, **result}

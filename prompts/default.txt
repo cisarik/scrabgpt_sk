@@ -17,6 +17,21 @@ SCORING:
 - Aim to span DW/TW with the main word
 - Stacking letter multipliers that feed into word multipliers yields maximal score
 
+STRATEGICKÉ PRAVIDLÁ (STRATEGIC RULES):
+1. **Rack Management (Správa stojana):**
+   - Snaž sa udržať pomer samohlások a spoluhlások blízko 3:4.
+   - Ak máš 'Q', prioritne ho zahraj (ideálne na TL/DL). Nenechávaj si ho, ak nemáš 'U' alebo 'I' pre slovo QI.
+   - Nikdy nemíňaj Blank ('?') na ťah za menej ako 30 bodov, pokiaľ nejde o Bingo (+50). Blanky sú kľúčové pre neskoré skórovanie.
+
+2. **Útočná vs. Defenzívna hra:**
+   - Ak nemôžeš skórovať aspoň 15-20 bodov, zváž defenzívu: neotváraj súperovi Triple Word Score (TW) alebo Double Word Score (DW).
+   - Ak vedieš o veľa bodov, hraj zatvorene (krátke slová, blokovanie).
+   - Ak prehrávaš, riskuj a otváraj dosku pre šancu na Bingo.
+
+3. **Hľadanie Binga:**
+   - Vždy najprv skontroluj, či môžeš položiť všetkých 7 písmen.
+   - Hľadaj bežné prípony ({language} suffixes) ako -IE, -OV, -OU, -IA.
+
 WORD VALIDITY:
 - Do not glue your letters to adjacent existing letters unless the resulting main word is valid in {language}
 - Use intersections/hooks properly
@@ -33,30 +48,17 @@ SPECIAL CASES:
     * DOWN from (5,7): places tiles at (5,7), (6,7), (7,7) ✓ crosses center
     * ACROSS from (7,8): INVALID ✗ doesn't cross (7,7)
     * DOWN from (8,7): INVALID ✗ doesn't cross (7,7)
-- NEVER GIVE UP: Always find a valid move. Do not pass.
+- NEVER GIVE UP: Always find a valid move. DO NOT PASS. "pass": true is FORBIDDEN.
+  If you cannot form a word, you MUST use "exchange" to swap tiles. But playing a word is 100x better.
 - The 'word' field must equal the final main word formed (existing letters + your placements)
 
 OUTPUT FORMAT:
 - Coordinates are 0-based (row and col: 0-14)
-- Return ONLY pure JSON, no explanations, no markdown
-- Required structure: start:{{row:int,col:int}}, direction:'ACROSS'|'DOWN', placements:[{{row,col,letter}}]
-
-STRATEGY:
-Given this compact state, propose exactly ONE move that:
-1. Forms valid {language} words
-2. Maximizes points
-3. Uses premium squares effectively
-4. Creates high-scoring cross-words
-
-SANITY CHECKS:
-- Place tiles in exactly one line (ACROSS or DOWN); no gaps
-- Do not extend existing words unless the resulting contiguous main word is valid in {language}
-- Prefer hooks/intersections instead of blind prefix/suffix sticking
-- 'word' field must equal the final main word on the board
+- See the Chat Protocol for exact output structure and thinking process requirements.
 
 ==== CURRENT STATE ====
 {compact_state}
 
 Premium legend: {premium_legend}
 
-==== YOUR MOVE (JSON only) ====
+==== YOUR MOVE ====

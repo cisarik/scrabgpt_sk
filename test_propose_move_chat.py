@@ -11,6 +11,7 @@ Tento script testuje:
 
 import asyncio
 import logging
+import pytest
 from scrabgpt.ai.player import propose_move_chat, reset_reasoning_context
 from scrabgpt.ai.openrouter import OpenRouterClient
 from scrabgpt.core.board import Board
@@ -24,8 +25,8 @@ logging.getLogger().setLevel(logging.INFO)
 log = logging.getLogger(__name__)
 
 
-async def test_first_move():
-    """Test prvého ťahu - prázdna doska."""
+async def _step_first_move():
+    """Krok 1: Prvý ťah - prázdna doska."""
     print("\n" + "="*70)
     print("TEST 1: PRVÝ ŤAH (PRÁZDNA DOSKA)")
     print("="*70)
@@ -75,8 +76,8 @@ async def test_first_move():
     return move
 
 
-async def test_second_move(first_move):
-    """Test druhého ťahu - delta update."""
+async def _step_second_move(first_move):
+    """Krok 2: Druhý ťah - delta update."""
     print("\n" + "="*70)
     print("TEST 2: DRUHÝ ŤAH (DELTA UPDATE)")
     print("="*70)
@@ -125,31 +126,25 @@ async def test_second_move(first_move):
     print("="*70 + "\n")
 
 
-async def main():
-    """Hlavná testovacia funkcia."""
+@pytest.mark.asyncio
+@pytest.mark.openrouter
+async def test_chat_protocol_flow():
+    """Integračný test pre chat protokol (first move -> delta move)."""
     print("\n" + "🧪 TESTOVANIE propose_move_chat() - OPENROUTER API")
     print("="*70)
-    print("Tento test zavolá skutočné OpenRouter API.")
-    print("Spotrebuje tokeny (ale malo, ~1000 celkom).")
-    print("="*70)
     
-    try:
-        # Test 1: Prvý ťah
-        first_move = await test_first_move()
+    # Test 1: Prvý ťah
+    first_move = await _step_first_move()
+    
+    # Verify first move structure
+    assert isinstance(first_move, dict)
+    if first_move.get("pass"):
+        pytest.skip("AI passed on first move, skipping second move test")
         
-        # Test 2: Druhý ťah (delta)
-        if not first_move.get('pass'):
-            await asyncio.sleep(1)  # Pauza medzi volaniami
-            await test_second_move(first_move)
-        
-        print("\n✅ VŠETKY TESTY ÚSPEŠNÉ!")
-        print("🎉 Chat protokol funguje správne!")
-        
-    except Exception as e:
-        print(f"\n❌ TEST ZLYHAL: {e}")
-        import traceback
-        traceback.print_exc()
+    # Test 2: Druhý ťah (delta)
+    await asyncio.sleep(1)  # Pauza medzi volaniami
+    await _step_second_move(first_move)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(test_chat_protocol_flow())

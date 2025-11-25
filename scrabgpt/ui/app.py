@@ -89,6 +89,30 @@ from .agents_dialog import AgentsDialog, AsyncAgentWorker
 from .agent_status_widget import AgentStatusWidget
 from .mcp_test_dialog import MCPTestDialog
 from .chat_dialog import ChatDialog
+from ..ai.vertex import VertexClient
+from google.genai import types as vertex_types
+
+class GeminiProbeWorker(QObject):
+    """Background worker to check if Gemini 3.0 Pro is available."""
+    finished = Signal(bool)
+    
+    def run(self) -> None:
+        try:
+            # Use default credentials/location from environment or VertexClient defaults
+            client = VertexClient(timeout_seconds=10)
+            # Try minimal generation to probe availability
+            # We use the underlying google-genai client directly to be sync/fast
+            response = client.client.models.generate_content(
+                model="gemini-3-pro-preview",
+                contents="Hi",
+                config=vertex_types.GenerateContentConfig(max_output_tokens=1)
+            )
+            # If we get here without exception, it exists and we have access
+            self.finished.emit(True)
+        except Exception as e:
+            log.info("Gemini 3 Pro probe failed: %s", e)
+            self.finished.emit(False)
+
 from ..core.state import build_ai_state_dict
 from ..core.rack import consume_rack, restore_rack
 from ..core.state import build_save_state_dict, parse_save_state_dict, restore_board_from_save, restore_bag_from_save
@@ -1990,8 +2014,37 @@ class MainWindow(QMainWindow):
         self._exchange_mode_active: bool = False
         self._starter_side: StarterSide | None = None
         self._starter_decided: bool = False
+        
+        # Default preferovaný model pre Gemini mód
+        # Ak sa podarí detekovať 3.0 Pro, zmení sa na "gemini-3-pro-preview"
+        self._preferred_gemini_model = "gemini-2.5-pro"
+        
+        # Spustiť detekciu Gemini 3.0 na pozadí
+        self._start_gemini_probe()
 
         self._reset_to_idle_state()
+
+    def _start_gemini_probe(self) -> None:
+        """Run background probe for Gemini 3.0 Pro."""
+        self._gemini_probe_thread = QThread(self)
+        self._gemini_probe_worker = GeminiProbeWorker()
+        self._gemini_probe_worker.moveToThread(self._gemini_probe_thread)
+        self._gemini_probe_thread.started.connect(self._gemini_probe_worker.run)
+        self._gemini_probe_worker.finished.connect(self._on_gemini_probe_finished)
+        self._gemini_probe_worker.finished.connect(self._gemini_probe_thread.quit)
+        self._gemini_probe_worker.finished.connect(self._gemini_probe_worker.deleteLater)
+        self._gemini_probe_thread.finished.connect(self._gemini_probe_thread.deleteLater)
+        self._gemini_probe_thread.start()
+    
+    def _on_gemini_probe_finished(self, available: bool) -> None:
+        """Callback when Gemini probe finishes."""
+        if available:
+            log.info("Gemini 3.0 Pro detected! Switching preferred model.")
+            self._preferred_gemini_model = "gemini-3-pro-preview"
+            # Update UI if Gemini mode is active? Only if we need to refresh labels/tables.
+            # But _start_ai_turn uses self._preferred_gemini_model dynamically.
+        else:
+            log.info("Gemini 3.0 Pro not available, staying with 2.5 Pro.")
 
     def _load_ai_move_timeout(self) -> int:
         raw = (
@@ -3552,6 +3605,9 @@ class MainWindow(QMainWindow):
                                     from ..ai.mcp_adapter import get_gemini_tools
                                     tools = get_gemini_tools()
                                     
+                                    # Pass model_id to inner scope if needed, but we have self.selected_models
+                                    current_model_id = self.selected_models[0]["id"] if self.selected_models else "gemini-2.5-pro"
+                                    
                                     # Start timer thread
                                     import threading
                                     stop_timer = threading.Event()
@@ -3579,6 +3635,11 @@ class MainWindow(QMainWindow):
                                     timer_thread.start()
                                     
                                     try:
+                                        # Enable thinking only for models that support it (like 2.5 pro, 3.0 pro)
+                                        # We can assume all models we select here support it for now
+                                        # Or check model ID
+                                        use_thinking = "thinking" in current_model_id or "pro" in current_model_id or "flash" in current_model_id
+                                        
                                         move, results = await propose_move_multi_model(
                                             vertex_client, # type: ignore
                                             self.selected_models,
@@ -3588,7 +3649,7 @@ class MainWindow(QMainWindow):
                                             self.client,
                                             progress_callback=on_partial,
                                             timeout_seconds=self.timeout_seconds,
-                                            thinking_mode=False, # Disable thinking mode for now
+                                            thinking_mode=use_thinking,
                                             tools=tools # Pass tools
                                         )
                                     finally:
@@ -3690,10 +3751,13 @@ class MainWindow(QMainWindow):
         
         if self.opponent_mode == OpponentMode.GEMINI:
             provider_type = "vertex"
-            selected_models = [{"id": "gemini-3-pro-preview", "name": "Gemini 3 Pro"}]
+            # Dynamically use preferred model
+            model_id = getattr(self, "_preferred_gemini_model", "gemini-2.5-pro")
+            display_name = "Gemini 3 Pro" if "3-pro" in model_id else "Gemini 2.5 Pro"
+            selected_models = [{"id": model_id, "name": display_name}]
             timeout_seconds = self.ai_move_timeout_seconds
             use_multi = True
-            log.info("Using Gemini via Vertex AI")
+            log.info("Using Gemini via Vertex AI (%s)", model_id)
         elif self.opponent_mode == OpponentMode.OPENROUTER and self.selected_ai_models:
             provider_type = "openrouter"
             selected_models = self.selected_ai_models
@@ -3769,12 +3833,13 @@ class MainWindow(QMainWindow):
         self._ai_worker.moveToThread(self._ai_thread)
         self._ai_thread.started.connect(self._ai_worker.run)
         # Connect signals - results come first, then proposal
-        self._ai_worker.multi_model_results.connect(self._on_multi_model_results)
-        self._ai_worker.partial_result.connect(self._on_multi_model_partial)
-        self._ai_worker.stream_update.connect(self._on_ai_stream_update)
-        self._ai_worker.stream_reasoning.connect(self._on_ai_stream_reasoning)
-        self._ai_worker.finished.connect(self._on_ai_proposal)
-        self._ai_worker.failed.connect(self._on_ai_fail)
+        # self._ai_worker.multi_model_results.connect(self._on_multi_model_results)  <-- Duplicate removed
+        # self._ai_worker.partial_result.connect(self._on_multi_model_partial)      <-- Duplicate removed
+        # self._ai_worker.stream_update.connect(self._on_ai_stream_update)          <-- Duplicate removed
+        # self._ai_worker.stream_reasoning.connect(self._on_ai_stream_reasoning)    <-- Duplicate removed
+        # self._ai_worker.finished.connect(self._on_ai_proposal)                    <-- Duplicate removed
+        # self._ai_worker.failed.connect(self._on_ai_fail)                          <-- Duplicate removed
+        
         self._ai_worker.finished.connect(self._ai_thread.quit)
         self._ai_worker.failed.connect(self._ai_thread.quit)
         self._ai_worker.finished.connect(self._ai_worker.deleteLater)
@@ -3807,11 +3872,24 @@ class MainWindow(QMainWindow):
             return
 
         if status == "tool_use":
-            message = result.get("message", "🛠️ Používam nástroj...")
-            if self.chat_dialog:
-                self.chat_dialog.add_agent_activity(message)
+            tool_data = result.get("tool_calls_data")
+            if tool_data and self.chat_dialog:
+                for tc in tool_data:
+                    self.chat_dialog.add_tool_call(tc["name"], tc["args"])
+            else:
+                message = result.get("message", "🛠️ Používam nástroj...")
+                if self.chat_dialog:
+                    self.chat_dialog.add_agent_activity(message)
             # Update table status too
             self.model_results_table.update_result(result)
+            return
+
+        if status == "tool_result":
+            if self.chat_dialog:
+                tool_name = result.get("tool_name", "?")
+                res_data = result.get("result", {})
+                is_error = isinstance(res_data, dict) and "error" in res_data
+                self.chat_dialog.add_tool_result(tool_name, res_data, is_error=is_error)
             return
 
         if status == "retry":
@@ -4019,7 +4097,18 @@ class MainWindow(QMainWindow):
                 self._enable_human_inputs()
                 self._register_scoreless_turn("AI")
                 return
-            ps.append(Placement(int(p["row"]), int(p["col"]), str(p["letter"])))
+            
+            # Robustness fix: If AI tries to place a letter on an occupied square,
+            # and it matches the existing letter, we ignore it (redundant).
+            # If it mismatches, we keep it so validation can catch the error.
+            r, c, letter = int(p["row"]), int(p["col"]), str(p["letter"])
+            existing_letter = self.board.cells[r][c].letter
+            if existing_letter and existing_letter == letter:
+                log.info("Ignoring redundant AI placement at (%d, %d) letter=%s", r, c, letter)
+                continue
+                
+            ps.append(Placement(r, c, letter))
+            
         blanks = proposal.get("blanks")
         blank_map, _ = self._parse_blank_map(blanks)
         # nastav blank_as; ak AI oznacila v `blanks`, prekonvertuj na '?'

@@ -221,7 +221,15 @@ class OpenRouterClient:
         
         # Use provided messages or convert prompt to messages
         if messages:
-            api_messages = messages
+            api_messages = list(messages)  # Copy to avoid modifying original
+            # If prompt is provided (system instruction) and messages doesn't start with system/user context,
+            # we should probably add it. However, usually 'prompt' is the system instruction.
+            # Let's prepend it as a system message if it's not empty.
+            if prompt:
+                # Check if there's already a system message?
+                # Some models support multiple system messages, some don't.
+                # Safest is to prepend it as system role.
+                api_messages.insert(0, {"role": "system", "content": prompt})
         else:
             api_messages = [{"role": "user", "content": prompt}]
         

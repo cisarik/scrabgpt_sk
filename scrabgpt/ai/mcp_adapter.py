@@ -80,7 +80,22 @@ def execute_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
     """
     try:
         log.info("Executing tool: %s with args: %s", name, args)
-        tool_func = mcp_tools.get_tool_function(name)
+        
+        # Case-insensitive lookup
+        try:
+            tool_func = mcp_tools.get_tool_function(name)
+        except KeyError:
+            # Try to find case-insensitive match
+            all_tools = mcp_tools.ALL_TOOLS
+            lower_name = name.lower()
+            found_name = next((k for k in all_tools.keys() if k.lower() == lower_name), None)
+            
+            if found_name:
+                log.info("Case mismatch: requested '%s', found '%s'", name, found_name)
+                tool_func = mcp_tools.get_tool_function(found_name)
+            else:
+                raise
+
         result = tool_func(**args)
         return result
     except Exception as e:

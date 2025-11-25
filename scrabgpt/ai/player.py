@@ -270,10 +270,10 @@ def _serialize_unused_premiums(board: Board) -> str:
     }
     
     symbol_map = {
-        Premium.TRIPLE_WORD: ("*", "TW"),
-        Premium.DOUBLE_WORD: ("~", "DW"),
-        Premium.TRIPLE_LETTER: ("$", "TL"),
-        Premium.DOUBLE_LETTER: ("^", "DL"),
+        Premium.TW: ("*", "TW"),
+        Premium.DW: ("~", "DW"),
+        Premium.TL: ("$", "TL"),
+        Premium.DL: ("^", "DL"),
     }
     
     for r in range(15):
@@ -389,11 +389,11 @@ $ = TL (×3 písmeno)
 }}
 ```
 
-Ak nie je možný ťah: skús nájsť aspoň výmenu, ale NIKDY nepasuj bezdôvodne.
+Ak nie je možný ťah: skús nájsť aspoň výmenu, ale NIKDY nepasuj. "pass": true je zakázané.
 """
     else:
         # Embedded legacy fallback
-        return """You are an expert Scrabble player for the {language} language variant. Play to win and obey official Scrabble rules for that language. Do NOT overwrite existing board letters; place only on empty cells. Placements must form a single contiguous line with no gaps and must connect to existing letters after previous move. Use only letters from ai_rack; for '?' use chosen uppercase letter (respecting diacritics). Points you can get for each tile: {tile_summary}. Always evaluate moves that use all 7 rack tiles for the 50 point bingo bonus; play it when legal. Prefer the move that maximizes total points, spending high-value rack letters on premium squares. Do not glue your letters to adjacent existing letters unless the resulting main word is a valid {language} word. Use intersections/hooks properly; you may share letters with the board only at overlapping cells; do not extend an existing word into a non-word. The field 'word' must equal the final main word formed on the board (existing board letters plus your placements). All cross-words should plausibly be valid {language} words. Diacritics is very important so distinguishing between 'Ú' and 'U' for example and every letter with diacritic. NEVER GIVE UP. Always find a valid move. Do not pass. If the board is empty, the first move must cross the center star at H8 (row=7,col=7). Coordinates are 0-based. No explanations — JSON only. Always return a JSON object with keys: start:{{row:int,col:int}}, direction:'ACROSS'|'DOWN', placements:[{{row,col,letter}}]. Empty premium squares in the grid already show their multiplier symbol (see legend). Prioritize TL/DL for high-value letters and aim to span DW/TW with the main word when possible; stacking letter multipliers that feed into word multipliers yields maximal score. Also value high-scoring cross-words created by your placements.
+        return """You are an expert Scrabble player for the {language} language variant. Play to win and obey official Scrabble rules for that language. Do NOT overwrite existing board letters; place only on empty cells. Placements must form a single contiguous line with no gaps and must connect to existing letters after previous move. Use only letters from ai_rack; for '?' use chosen uppercase letter (respecting diacritics). Points you can get for each tile: {tile_summary}. Always evaluate moves that use all 7 rack tiles for the 50 point bingo bonus; play it when legal. Prefer the move that maximizes total points, spending high-value rack letters on premium squares. Do not glue your letters to adjacent existing letters unless the resulting main word is a valid {language} word. Use intersections/hooks properly; you may share letters with the board only at overlapping cells; do not extend an existing word into a non-word. The field 'word' must equal the final main word formed on the board (existing board letters plus your placements). All cross-words should plausibly be valid {language} words. Diacritics is very important so distinguishing between 'Ú' and 'U' for example and every letter with diacritic. NEVER GIVE UP. Always find a valid move. DO NOT PASS. "pass": true is FORBIDDEN. If board is empty, the first move must cross the center star at H8 (row=7,col=7). Coordinates are 0-based. No explanations — JSON only. Always return a JSON object with keys: start:{{row:int,col:int}}, direction:'ACROSS'|'DOWN', placements:[{{row,col,letter}}]. Empty premium squares in the grid already show their multiplier symbol (see legend). Prioritize TL/DL for high-value letters and aim to span DW/TW with the main word when possible; stacking letter multipliers that feed into word multipliers yields maximal score. Also value high-scoring cross-words created by your placements.
 
 Given this compact state, propose exactly one move with placements in a single line using only valid {language} words.
 
@@ -653,6 +653,7 @@ async def propose_move_chat(
         system_prompt = template.format(
             language=variant.language,
             tile_summary=tile_summary,
+            rack=", ".join(ai_rack),  # Fallback for templates that still use {rack}
         )
         session._base_prompt = system_prompt
         

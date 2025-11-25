@@ -261,6 +261,46 @@ class ChatDialog(QDialog):
         header = self._create_header()
         main_layout.addWidget(header)
         
+        # Context info bar (usage of context window)
+        self.context_container = QFrame()
+        self.context_container.setStyleSheet("background: #0c1a12; border-bottom: 1px solid #243227;")
+        self.context_container.setFixedHeight(28)
+        context_layout = QHBoxLayout(self.context_container)
+        context_layout.setContentsMargins(12, 0, 12, 0)
+        context_layout.setSpacing(10)
+
+        self.context_label = QLabel("Context Window:")
+        self.context_label.setStyleSheet("color: #5fbcbc; font-size: 10px; font-family: 'Fira Code'; font-weight: bold;")
+        context_layout.addWidget(self.context_label)
+
+        self.context_bar = QProgressBar()
+        self.context_bar.setRange(0, 100)
+        self.context_bar.setValue(0)
+        self.context_bar.setTextVisible(True)
+        self.context_bar.setAlignment(Qt.AlignCenter)
+        self.context_bar.setStyleSheet("""
+            QProgressBar {
+                background: #1a241c;
+                border: 1px solid #324536;
+                border-radius: 4px;
+                color: #e8e3d9;
+                height: 14px;
+                font-size: 9px;
+                font-family: 'Fira Code';
+            }
+            QProgressBar::chunk {
+                background: #5fbcbc;
+                border-radius: 3px;
+            }
+        """)
+        context_layout.addWidget(self.context_bar, stretch=1)
+        
+        self.token_info_label = QLabel("0 / 0 tokens")
+        self.token_info_label.setStyleSheet("color: #80cbc4; font-size: 10px; font-family: 'Fira Code';")
+        context_layout.addWidget(self.token_info_label)
+
+        main_layout.addWidget(self.context_container)
+        
         # Chat area (scrollable) - tmavé plátno
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -296,31 +336,6 @@ class ChatDialog(QDialog):
         
         scroll.setWidget(self.chat_container)
         main_layout.addWidget(scroll, stretch=1)
-        
-        # Context info bar (usage of context window)
-        self.context_bar = QProgressBar()
-        self.context_bar.setRange(0, 100)
-        self.context_bar.setValue(0)
-        self.context_bar.setTextVisible(True)
-        self.context_bar.setFormat("")
-        self.context_bar.setVisible(False)
-        self.context_bar.setStyleSheet("""
-            QProgressBar {
-                background: #0c1a12;
-                border: 1px solid #00ff41;
-                border-radius: 6px;
-                color: #0e1612;
-                height: 18px;
-                padding: 1px;
-                font-size: 10px;
-                font-family: 'Fira Code', 'Consolas';
-            }
-            QProgressBar::chunk {
-                background: #00ff41;
-                border-radius: 4px;
-            }
-        """)
-        main_layout.addWidget(self.context_bar)
         
         # Countdown (timeout) label
         self.countdown_label = QLabel("")
@@ -556,35 +571,24 @@ class ChatDialog(QDialog):
         else:
             tokens_used, ctx_len, percent = get_context_stats(aggregate_history, model_key)
         
-        # Odstráň starý label
-        if self.context_info_label:
-            self.chat_layout.removeWidget(self.context_info_label)
-            self.context_info_label.deleteLater()
-            self.context_info_label = None
-        
+        # Update progress bar
         if tokens_used <= 0 or ctx_len <= 0:
-            self.context_bar.setVisible(False)
+            self.context_bar.setValue(0)
+            self.token_info_label.setText("Unknown context")
             return
         
-        free_tokens = max(0, ctx_len - tokens_used)
         used_pct = int(percent)
-        free_pct = max(0, min(100, 100 - used_pct))
-        
-        # Label
-        label = QLabel(f"Context window: {used_pct}% used, free {free_tokens} / {ctx_len} tokens")
-        label.setStyleSheet(
-            "color: #00ff41; background: #0c1a12; border: 1px solid #00ff41; "
-            "border-radius: 6px; padding: 6px 10px; font-family: 'Fira Code', 'Consolas'; "
-            "font-size: 11px;"
-        )
-        self.context_info_label = label
-        self.chat_layout.addWidget(label, alignment=Qt.AlignLeft)
-        
-        # Progress bar - shows used percent, format shows free percent
-        self.context_bar.setVisible(True)
-        self.context_bar.setRange(0, 100)
         self.context_bar.setValue(used_pct)
-        self.context_bar.setFormat(f"Free {free_pct}%")
+        self.context_bar.setFormat(f"{used_pct}% used")
+        
+        # Update tokens label
+        self.token_info_label.setText(f"{tokens_used} / {ctx_len} tokens")
+        
+        # Warning color if nearly full
+        if used_pct > 90:
+            self.token_info_label.setStyleSheet("color: #ff5c5c; font-size: 10px; font-family: 'Fira Code'; font-weight: bold;")
+        else:
+            self.token_info_label.setStyleSheet("color: #80cbc4; font-size: 10px; font-family: 'Fira Code';")
 
     def update_context_usage(self, prompt_tokens: int, context_length: int) -> None:
         """Externé nastavenie usage (napr. z LMStudio usage)."""
@@ -645,19 +649,111 @@ class ChatDialog(QDialog):
             "background: #0d1620; border: 1px solid #3a4c63; border-radius: 6px;"
         )
         layout = QVBoxLayout(container)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(6)
+        
+        header = QLabel(f"📊 {title}")
+        header.setStyleSheet("color: #9ac7ff; font-weight: bold; font-size: 12px; font-family: 'Fira Sans', sans-serif;")
+        layout.addWidget(header)
+        
+        # Content container - use simple vertical list but with better styling
+        content_widget = QWidget()
+        content_layout = QVBoxLayout(content_widget)
+        content_layout.setContentsMargins(4, 0, 0, 0)
+        content_layout.setSpacing(4)
+        
+        for key, value in data.items():
+            row_widget = QWidget()
+            row_layout = QHBoxLayout(row_widget)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(8)
+            
+            key_label = QLabel(f"{key}:")
+            key_label.setStyleSheet("color: #5fbcbc; font-weight: bold; font-size: 11px; font-family: 'Fira Code', monospace;")
+            key_label.setFixedWidth(120) # Align keys
+            
+            val_label = QLabel(str(value))
+            val_label.setStyleSheet("color: #d7e4d8; font-size: 11px; font-family: 'Fira Code', monospace;")
+            val_label.setWordWrap(True)
+            
+            row_layout.addWidget(key_label)
+            row_layout.addWidget(val_label, stretch=1)
+            content_layout.addWidget(row_widget)
+            
+        layout.addWidget(content_widget)
+        self.chat_layout.addWidget(container, alignment=Qt.AlignLeft)
+        self._scroll_to_bottom()
+
+    def add_tool_call(self, tool_name: str, args: dict | str) -> None:
+        """Zobrazí volanie MCP nástroja."""
+        container = QFrame()
+        container.setStyleSheet(
+            "background: #1a1208; border-left: 3px solid #ffb74d; border-radius: 4px;"
+        )
+        container.setMinimumWidth(450)  # Prevent squashing
+        layout = QVBoxLayout(container)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(4)
         
-        header = QLabel(f"📊 {title}")
-        header.setStyleSheet("color: #9ac7ff; font-weight: bold; font-size: 12px;")
-        layout.addWidget(header)
+        header_layout = QHBoxLayout()
+        header_layout.setSpacing(8)
         
-        for key, value in data.items():
-            row = QLabel(f"<b>{key}:</b> {value}")
-            row.setStyleSheet("color: #d7e4d8; font-size: 11px;")
-            row.setWordWrap(True)
-            layout.addWidget(row)
+        icon = QLabel("🛠️")
+        name_label = QLabel(f"Calling: {tool_name}")
+        name_label.setStyleSheet("color: #ffb74d; font-weight: bold; font-family: 'Fira Code', monospace; font-size: 11px;")
+        
+        header_layout.addWidget(icon)
+        header_layout.addWidget(name_label, stretch=1)
+        layout.addLayout(header_layout)
+        
+        # Args display - verbose JSON
+        import json
+        arg_str = json.dumps(args, ensure_ascii=False, indent=2) if isinstance(args, dict) else str(args)
+        arg_label = QLabel(arg_str)
+        # Preserve newlines for JSON pretty print
+        arg_label.setTextFormat(Qt.PlainText)
+        arg_label.setStyleSheet("color: #d7e4d8; font-family: 'Fira Code', monospace; font-size: 10px; padding-left: 24px;")
+        layout.addWidget(arg_label)
+        
+        self.chat_layout.addWidget(container, alignment=Qt.AlignLeft)
+        self._scroll_to_bottom()
+
+    def add_tool_result(self, tool_name: str, result: Any, is_error: bool = False) -> None:
+        """Zobrazí výsledok volania nástroja."""
+        container = QFrame()
+        color = "#ff5c5c" if is_error else "#00ff41"
+        bg = "#2a0e0e" if is_error else "#0c1a12"
+        
+        container.setStyleSheet(
+            f"background: {bg}; border-left: 3px solid {color}; border-radius: 4px;"
+        )
+        container.setMinimumWidth(450)  # Prevent squashing
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(4)
+        
+        header_layout = QHBoxLayout()
+        icon = QLabel("❌" if is_error else "✅")
+        title = QLabel(f"{tool_name} -> {'Error' if is_error else 'Result'}")
+        title.setStyleSheet(f"color: {color}; font-weight: bold; font-family: 'Fira Code', monospace; font-size: 11px;")
+        
+        header_layout.addWidget(icon)
+        header_layout.addWidget(title, stretch=1)
+        layout.addLayout(header_layout)
+        
+        import json
+        res_str = json.dumps(result, ensure_ascii=False, indent=2) if isinstance(result, (dict, list)) else str(result)
+        
+        # Only truncate extremely long responses, let user see full JSON mostly
+        if len(res_str) > 2000:
+            res_str = res_str[:2000] + "... (truncated)"
             
+        res_label = QLabel(res_str)
+        res_label.setTextFormat(Qt.PlainText)
+        res_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        res_label.setStyleSheet("color: #d7e4d8; font-family: 'Fira Code', monospace; font-size: 10px; padding-left: 24px;")
+        layout.addWidget(res_label)
+        
         self.chat_layout.addWidget(container, alignment=Qt.AlignLeft)
         self._scroll_to_bottom()
 
@@ -806,13 +902,18 @@ class ChatDialog(QDialog):
         """Priprav blok pre reasoning (thinking) stream."""
         self.reasoning_text = ""
         bubble = ChatBubble("", is_user=False)
+        # Styling for thinking block - full width, code font
         bubble.setStyleSheet(
-            "QFrame { background: #0b1410; border: 1px dashed #5fbcbc; border-radius: 8px; padding: 6px 8px; }"
+            "QFrame { background: #0b1410; border: 1px dashed #5fbcbc; border-radius: 8px; padding: 8px 12px; }"
             "QLabel { color: #9ee6aa; font-size: 12px; font-family: 'Fira Code', 'Consolas'; }"
         )
+        bubble.setMinimumWidth(500) # Ensure wide enough for code
+        
         self.chat_layout.addWidget(bubble, alignment=Qt.AlignLeft)
         self.reasoning_bubble = bubble
         self.reasoning_label = bubble.set_plain_text("⏳ ")
+        self.reasoning_label.setTextFormat(Qt.PlainText) # Ensure whitespace preserved
+        
         # Spinner timer for ⏳ animation
         if self.reasoning_spinner_timer is None:
             self.reasoning_spinner_timer = QTimer(self)
@@ -841,9 +942,14 @@ class ChatDialog(QDialog):
             return
         if self.reasoning_label is None:
             self.start_reasoning_stream()
+        
         self.reasoning_text += delta
+        
+        # Update label - preserve formatting
         if self.reasoning_label:
-            self.reasoning_label.setText("💭 " + self.reasoning_text + "▋")
+            header = "💭 Thinking Process:\n\n"
+            self.reasoning_label.setText(header + self.reasoning_text + "▋")
+            
         self._scroll_to_bottom()
 
     def finish_streaming_ai_message(self) -> None:

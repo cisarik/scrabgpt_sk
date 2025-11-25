@@ -20,10 +20,6 @@ $ = TL (Triple Letter - písmeno ×3)
 
 Prémiá sa uplatňujú len pri prvom použití políčka. Už použité prémiá sa neuvádzajú.
  
-=== TVOJ RACK (PÍSMENÁ) ===
-Tieto písmená máš k dispozícii na vytvorenie slova:
-{rack}
- 
 === DOSTUPNÉ MCP TOOLS ===
 
 Máš prístup k validačným nástrojom. Použi ich na overenie svojho ťahu pred odpoveďou.
@@ -56,7 +52,33 @@ Vždy preferuj ťah s najvyšším ziskom bodov. NIKDY sa nevzdávaj, vždy náj
 
 === FORMÁT ODPOVEDE ===
 
-Odpovedaj **VŽDY** JSON objektom bez dodatočného textu. Nasledujúca ukážka je LEN pre formát, nikdy ju nepoužívaj ako reálny ťah – vždy generuj z aktuálneho stavu dosky a racku:
+Aby si dosiahol najlepší výsledok, najprv analyzuj situáciu (Chain-of-Thought) a až potom vygeneruj finálny JSON.
+
+Použi nasledujúcu štruktúru:
+
+<thinking_process>
+1. ANALÝZA RACKU:
+   - Mám: [A, B, C...]
+   - Problémy: (napr. priveľa spoluhlások, chýba U pre Q)
+   - Cieľ: (napr. zbaviť sa V, nájsť Bingo)
+
+2. BOARD SCAN:
+   - Otvorené miesta: (napr. H8, A1)
+   - Hotspots: (napr. TW na A1 dostupný cez písmeno 'K')
+
+3. KANDIDÁTI (Navrhni 3 možnosti):
+   - A: Slovo XY na H8 (cca 12 bodov) - Defenzívne
+   - B: Slovo YZ na A1 (cca 34 bodov) - Rizikové (otvára DW)
+   - C: ...
+
+4. VÝBER:
+   - Vyberám B, pretože maximalizuje skóre a zbavuje ma ťažkých písmen.
+
+5. FINAL CHECK:
+   - Súradnice sedia?
+   - Je to v jednej línii?
+   - Sú všetky krížové slová platné?
+</thinking_process>
 
 ```json
 {{
@@ -72,13 +94,16 @@ Odpovedaj **VŽDY** JSON objektom bez dodatočného textu. Nasledujúca ukážka
 ```
 
 **DÔLEŽITÉ:**
+- Sekcia `<thinking_process>` je POVINNÁ. Pomôže ti vyhnúť sa chybám.
+- JSON musí byť na konci správy v ` ```json ... ``` ` bloku.
 - Políčko `word` musí obsahovať výsledné hlavné slovo na doske (vrátane existujúcich písmen)
 - `start` je pozícia prvého písmena hlavného slova (existujúceho alebo nového)
 - `placements` obsahujú len NOVÉ písmená, ktoré kladieš z racku
 - `direction` je buď "ACROSS" (zľava doprava) alebo "DOWN" (zhora dolu)
 
-Ak nie je možný žiadny ťah (napr. nemáš vhodné písmená), skús nájsť aspoň výmenu písmen, ale NIKDY nepasuj bezdôvodne. Vždy sa snaž nájsť platné slovo.
-
+NIKDY NEPASUJ. Vždy existuje aspoň jeden platný ťah alebo výmena. Tvojou úlohou je nájsť ten najlepší.
+Ak naozaj nemôžeš položiť slovo, použi výmenu ("exchange"). Ale priorita je hrať slovo.
+NEPOUŽÍVAJ "pass": true.
 
 === PRÍKLAD ŤAHU ===
 
