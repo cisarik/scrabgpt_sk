@@ -642,45 +642,15 @@ class ChatDialog(QDialog):
         self._scroll_to_bottom()
 
     def add_profiling_info(self, title: str, data: dict[str, str]) -> None:
-        """Pridá štruktúrovaný profiling blok (napr. stav racku, tools)."""
-        container = QFrame()
-        container.setStyleSheet(
-            "background: #0d1620; border: 1px solid #3a4c63; border-radius: 6px;"
-        )
-        layout = QVBoxLayout(container)
-        layout.setContentsMargins(10, 10, 10, 10)
-        layout.setSpacing(6)
-        
-        header = QLabel(f"📊 {title}")
-        header.setStyleSheet("color: #9ac7ff; font-weight: bold; font-size: 12px; font-family: 'Fira Sans', sans-serif;")
-        layout.addWidget(header)
-        
-        # Content container - use simple vertical list but with better styling
-        content_widget = QWidget()
-        content_layout = QVBoxLayout(content_widget)
-        content_layout.setContentsMargins(4, 0, 0, 0)
-        content_layout.setSpacing(4)
-        
+        """Pridá štruktúrovaný profiling blok ako chat bublinu."""
+        lines = [f"📊 {title}"]
         for key, value in data.items():
-            row_widget = QWidget()
-            row_layout = QHBoxLayout(row_widget)
-            row_layout.setContentsMargins(0, 0, 0, 0)
-            row_layout.setSpacing(8)
-            
-            key_label = QLabel(f"{key}:")
-            key_label.setStyleSheet("color: #5fbcbc; font-weight: bold; font-size: 11px; font-family: 'Fira Code', monospace;")
-            key_label.setFixedWidth(120) # Align keys
-            
-            val_label = QLabel(str(value))
-            val_label.setStyleSheet("color: #d7e4d8; font-size: 11px; font-family: 'Fira Code', monospace;")
-            val_label.setWordWrap(True)
-            
-            row_layout.addWidget(key_label)
-            row_layout.addWidget(val_label, stretch=1)
-            content_layout.addWidget(row_widget)
-            
-        layout.addWidget(content_widget)
-        self.chat_layout.addWidget(container, alignment=Qt.AlignLeft)
+            lines.append(f"- {key}: {value}")
+        bubble = ChatBubble("\n".join(lines), is_user=False)
+        self.chat_layout.addWidget(bubble, alignment=Qt.AlignLeft)
+        self._highlight_bubble(bubble)
+        self.chat_history.append(" | ".join(lines))
+        self._render_context_info()
         self._scroll_to_bottom()
 
     def add_tool_call(self, tool_name: str, args: dict | str) -> None:
@@ -757,14 +727,16 @@ class ChatDialog(QDialog):
         self._scroll_to_bottom()
 
     def add_agent_activity(self, message: str) -> None:
-        """Pridá malú informačnú správu o aktivite agenta (napr. volanie nástroja)."""
-        label = QLabel(message)
-        label.setWordWrap(True)
-        label.setStyleSheet(
-            "color: #80cbc4; font-size: 11px; font-family: 'Fira Code', 'Consolas'; "
-            "padding: 2px 4px; font-style: italic;"
+        """Pridá informačnú správu o aktivite agenta ako chatový event."""
+        bubble = ChatBubble(f"- {message}", is_user=False)
+        bubble.setStyleSheet(
+            "QFrame { background: #112019; border: 1px solid #2f5c39; border-radius: 8px; padding: 6px 8px; }"
+            "QLabel { color: #cce7d0; font-size: 12px; font-family: 'Fira Sans', 'Segoe UI', sans-serif; }"
         )
-        self.chat_layout.addWidget(label, alignment=Qt.AlignLeft)
+        self.chat_layout.addWidget(bubble, alignment=Qt.AlignLeft)
+        self._highlight_bubble(bubble)
+        self.chat_history.append(message)
+        self._render_context_info()
         self._scroll_to_bottom()
 
     def update_countdown(self, seconds_remaining: int) -> None:

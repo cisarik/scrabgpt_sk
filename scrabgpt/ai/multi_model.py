@@ -43,6 +43,16 @@ _NON_SCORING_RETRY_FEEDBACK = (
 )
 
 
+def _timeout_fallback_model(model_id: str) -> str | None:
+    normalized = model_id.replace("google/", "").strip().lower()
+    chain = {
+        "gemini-3-pro": "gemini-2.5-pro",
+        "gemini-3-pro-preview": "gemini-2.5-pro",
+        "gemini-2.5-pro": "gemini-2.5-flash",
+    }
+    return chain.get(normalized)
+
+
 def _extract_rack_letters(compact_state: str) -> list[str]:
     """Best-effort rack extraction from compact state."""
     rack_match = re.search(r"(?:ai_)?rack:\s*(?:\[(.*?)\]|(.*))", compact_state)
@@ -93,6 +103,7 @@ async def propose_move_multi_model(
         model_id = model_info["id"]
         active_model_id = model_id
         active_model_name = str(model_info.get("name", model_id))
+        fallback_origin: str | None = None
         # Use provided timeout or default, but ensure we have a deadline
         deadline = asyncio.get_event_loop().time() + (timeout_seconds or 60)
         max_attempts = 3
@@ -149,7 +160,7 @@ async def propose_move_multi_model(
                 # Clients must handle whether to use it as system msg or prepend to messages.
                 result = await asyncio.wait_for(
                     client.call_model(
-                        model_id, 
+                        active_model_id,
                         prompt, 
                         max_tokens=model_info.get("max_tokens") or client.ai_move_max_output_tokens, 
                         **kwargs
@@ -157,7 +168,34 @@ async def propose_move_multi_model(
                     timeout=remaining_time
                 )
             except asyncio.TimeoutError:
-                log.warning("Model %s timed out", model_id)
+                timeout_fallback = _timeout_fallback_model(active_model_id)
+                if timeout_fallback and timeout_fallback != active_model_id and attempt_count < max_attempts:
+                    previous = active_model_id
+                    active_model_id = timeout_fallback
+                    active_model_name = timeout_fallback
+                    if fallback_origin is None:
+                        fallback_origin = previous
+                    log.warning(
+                        "Model %s timed out; retrying with timeout fallback %s",
+                        previous,
+                        timeout_fallback,
+                    )
+                    await _notify(
+                        {
+                            "status": "retry",
+                            "model": active_model_id,
+                            "model_name": active_model_name,
+                            "error": (
+                                f"Timeout on {previous}; retrying with {timeout_fallback}."
+                            ),
+                            "remaining": int(max(0, remaining_time)),
+                            "attempt": attempt_count,
+                            "max_attempts": max_attempts,
+                        }
+                    )
+                    continue
+
+                log.warning("Model %s timed out", active_model_id)
                 return await _notify({
                     "model": active_model_id,
                     "model_name": active_model_name,
@@ -212,6 +250,8 @@ async def propose_move_multi_model(
                 }
                 if isinstance(fallback_from, str) and fallback_from:
                     payload["fallback_from"] = fallback_from
+                elif fallback_origin:
+                    payload["fallback_from"] = fallback_origin
                 return await _notify(payload)
             
             # 1. Parse
@@ -402,6 +442,8 @@ async def propose_move_multi_model(
                 }
                 if isinstance(fallback_from, str) and fallback_from:
                     payload["fallback_from"] = fallback_from
+                elif fallback_origin:
+                    payload["fallback_from"] = fallback_origin
                 return await _notify(payload)
             
             # Failure - Prepare retry
@@ -471,6 +513,7 @@ async def propose_move_multi_model(
             "move": None,
             "score": -1,
             "words": [],
+            **({"fallback_from": fallback_origin} if fallback_origin else {}),
         })
 
     tasks = [call_one_model(model) for model in models]

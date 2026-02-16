@@ -2175,6 +2175,49 @@ class MainWindow(QMainWindow):
             return "Gemini 2.5 Pro"
         return model_id
 
+    @staticmethod
+    def _google_model_display_name(model_id: str) -> str:
+        normalized = model_id.replace("google/", "").strip()
+        if "3-pro" in normalized:
+            return "Gemini 3 Pro"
+        if "2.5-flash" in normalized:
+            return "Gemini 2.5 Flash"
+        if "2.5-pro" in normalized:
+            return "Gemini 2.5 Pro"
+        return normalized or "Gemini"
+
+    def _build_gemini_model_candidates(self) -> list[dict[str, str]]:
+        """Return ordered Google model list with automatic fallback candidates."""
+        primary = (getattr(self, "_preferred_gemini_model", "") or "").strip() or "gemini-2.5-pro"
+        chain: list[str] = [primary]
+
+        # Always keep a robust Google fallback chain. This protects against
+        # unavailable preview models and intermittent timeouts.
+        if "3-pro" in primary:
+            chain.extend(["gemini-2.5-pro", "gemini-2.5-flash"])
+        elif "2.5-pro" in primary:
+            chain.append("gemini-2.5-flash")
+        elif "2.5-flash" in primary:
+            chain.append("gemini-2.5-pro")
+        else:
+            # Unknown/experimental ID -> still keep stable fallbacks.
+            chain.extend(["gemini-2.5-pro", "gemini-2.5-flash"])
+
+        unique_chain: list[str] = []
+        for model_id in chain:
+            normalized = model_id.replace("google/", "").strip()
+            if not normalized or normalized in unique_chain:
+                continue
+            unique_chain.append(normalized)
+
+        candidates: list[dict[str, str]] = []
+        for idx, model_id in enumerate(unique_chain):
+            label = self._google_model_display_name(model_id)
+            if idx > 0:
+                label = f"{label} (fallback)"
+            candidates.append({"id": model_id, "name": label})
+        return candidates
+
     def _update_mode_status_label(self) -> None:
         """Update mode status label to show current opponent mode and active model/team."""
         mode = self.opponent_mode
@@ -2245,9 +2288,10 @@ class MainWindow(QMainWindow):
                 _entry(f"openai:{model_name}", f"OpenAI API – {model_name}", 0)
             )
         elif mode == OpponentMode.GEMINI:
-            model_id = getattr(self, "_preferred_gemini_model", "gemini-2.5-pro")
-            label = self._resolve_google_model_label()
-            entries.append(_entry(f"google:{model_id}", f"Google – {label}", 0))
+            for idx, model in enumerate(self._build_gemini_model_candidates()):
+                model_id = model.get("id", f"gemini-{idx}")
+                label = model.get("name", self._google_model_display_name(model_id))
+                entries.append(_entry(f"google:{model_id}", f"Google – {label}", idx))
         elif mode == OpponentMode.AGENT:
             agent_name = self._resolve_agent_display_name()
             entries.append(
@@ -3872,11 +3916,14 @@ class MainWindow(QMainWindow):
         
         # Profiling info pre chat dialog
         if self.chat_dialog:
-            self.chat_dialog.add_profiling_info("Hráč má ťah: AI", {
-                "Rack": "".join(self.ai_rack),
-                "Skóre": f"AI {self.ai_score} : {self.human_score} Hráč",
-                "Model": self.opponent_mode.name
-            })
+            try:
+                self.chat_dialog.add_profiling_info("AI začína ťah", {
+                    "Rack": "".join(self.ai_rack),
+                    "Skóre": f"AI {self.ai_score} : {self.human_score} Hráč",
+                    "Režim": self.opponent_mode.display_name_sk,
+                })
+            except Exception:
+                log.debug("Chat profiling start skipped")
 
         class ProposeWorker(QObject):
             finished: Signal = Signal(dict)
@@ -4085,18 +4132,13 @@ class MainWindow(QMainWindow):
         
         if self.opponent_mode == OpponentMode.GEMINI:
             provider_type = "vertex"
-            # Dynamically use preferred model
-            model_id = getattr(self, "_preferred_gemini_model", "gemini-2.5-pro")
-            if "3-pro" in model_id:
-                display_name = "Gemini 3 Pro"
-            elif "2.5-flash" in model_id:
-                display_name = "Gemini 2.5 Flash"
-            else:
-                display_name = "Gemini 2.5 Pro"
-            selected_models = [{"id": model_id, "name": display_name}]
+            selected_models = [dict(m) for m in self._build_gemini_model_candidates()]
             timeout_seconds = self.ai_move_timeout_seconds
             use_multi = True
-            log.info("Using Gemini via Vertex AI (%s)", model_id)
+            log.info(
+                "Using Gemini via Vertex AI candidates=%s",
+                [m.get("id") for m in selected_models],
+            )
         elif self.opponent_mode == OpponentMode.OPENROUTER and self.selected_ai_models:
             provider_type = "openrouter"
             selected_models = self.selected_ai_models
@@ -4117,6 +4159,11 @@ class MainWindow(QMainWindow):
                 self.chat_dialog.start_reasoning_stream()
             except Exception:
                 log.debug("Chat streaming start skipped")
+
+        if self.chat_dialog and use_multi and selected_models:
+            model_chain = " -> ".join(str(m.get("name") or m.get("id") or "?") for m in selected_models)
+            provider_label = "Google" if provider_type == "vertex" else ("Novita" if provider_type == "novita" else "OpenRouter")
+            self.chat_dialog.add_agent_activity(f"🧠 {provider_label} model chain: {model_chain}")
         # Start countdown for this AI turn
         self._ai_deadline = time.monotonic() + timeout_seconds
         self._ai_countdown_timer.start()
@@ -4239,7 +4286,10 @@ class MainWindow(QMainWindow):
         if status == "retry":
             error_msg = result.get("error", "")
             if self.chat_dialog:
-                self.chat_dialog.add_agent_activity(f"🔄 Retry: {error_msg[:100]}...")
+                retry_note = "Model skúša nový variant ťahu."
+                if isinstance(error_msg, str) and "exchange/pass too early" in error_msg:
+                    retry_note = "Model skúša znova: musí nájsť slovný ťah (nie exchange/pass)."
+                self.chat_dialog.add_agent_activity(f"🔄 {model_name}: {retry_note}")
             # Continue to update table
 
         self.model_results_table.update_result(result)
@@ -4248,10 +4298,18 @@ class MainWindow(QMainWindow):
             words = result.get("words") or []
             word_preview = ", ".join(words) if words else result.get("move", {}).get("word", "—")
             score_text = f"{score} b" if isinstance(score, (int, float)) else "—"
+            if self.chat_dialog:
+                self.chat_dialog.add_agent_activity(
+                    f"✅ {model_name}: kandidát '{word_preview}' ({score_text})"
+                )
             self.status.showMessage(
                 f"{model_name} odpovedal: {word_preview} ({score_text})"
             )
         elif status == "parse_error":
+            if self.chat_dialog:
+                self.chat_dialog.add_agent_activity(
+                    f"⚠️ {model_name}: neplatný formát odpovede, skúšam ďalšie modely."
+                )
             self.status.showMessage(f"{model_name}: neplatná odpoveď – čakám na ostatné modely")
             # Update timer display using the existing ChatDialog method
             remaining = result.get("remaining", 0)
@@ -4260,8 +4318,16 @@ class MainWindow(QMainWindow):
             return
 
         if status == "error":
+            if self.chat_dialog:
+                self.chat_dialog.add_agent_activity(
+                    f"❌ {model_name}: API chyba, pokračujem ďalšími modelmi."
+                )
             self.status.showMessage(f"{model_name}: API chyba – čakám na ostatné modely")
         elif status == "timeout":
+            if self.chat_dialog:
+                self.chat_dialog.add_agent_activity(
+                    f"⏳ {model_name}: timeout, pokračujem ďalšími modelmi."
+                )
             self.status.showMessage(f"{model_name}: Timeout – čakám na ostatné modely")
 
     def _on_multi_model_results(self, results: list[dict[str, Any]]) -> None:
@@ -4297,6 +4363,10 @@ class MainWindow(QMainWindow):
                     f"Google model {fallback_from} nie je dostupný, prepínam na {fallback_to}",
                     5000,
                 )
+                if self.chat_dialog:
+                    self.chat_dialog.add_agent_activity(
+                        f"🔁 Google fallback: {fallback_from} -> {fallback_to}"
+                    )
                 break
         
         # Store the winning model name for status messages
@@ -4309,6 +4379,10 @@ class MainWindow(QMainWindow):
             self._current_ai_model_id = winner.get("model")
             winner_word = ", ".join(winner.get("words", []))
             winner_score = winner.get("score", 0)
+            if self.chat_dialog:
+                self.chat_dialog.add_agent_activity(
+                    f"🏆 Víťaz návrhov: {self._current_ai_model} -> {winner_word} ({winner_score} b)"
+                )
             self.status.showMessage(
                 f"✓ Víťaz: {self._current_ai_model} - {winner_word} ({winner_score} bodov)"
             )
@@ -4319,10 +4393,16 @@ class MainWindow(QMainWindow):
                 fallback = all_sorted[0]
                 self._current_ai_model = fallback.get("model_name", "AI")
                 self._current_ai_model_id = fallback.get("model")
+                if self.chat_dialog:
+                    self.chat_dialog.add_agent_activity(
+                        f"⚠️ Žiadny model nedal judge-valid návrh, beriem najlepší dostupný: {self._current_ai_model}"
+                    )
                 self.status.showMessage(f"⚠️ Žiadne platné návrhy, používam {self._current_ai_model}")
             else:
                 self._current_ai_model = "AI"
                 self._current_ai_model_id = None
+                if self.chat_dialog:
+                    self.chat_dialog.add_agent_activity("❌ Žiadne návrhy od modelov.")
                 self.status.showMessage("⚠️ Žiadne platné návrhy od modelov")
     
     def _update_table_for_judging(self, words: list[str]) -> None:
@@ -4503,6 +4583,10 @@ class MainWindow(QMainWindow):
         words_coords = [(wf.word, wf.letters) for wf in words_found]
         words = [wf.word for wf in words_found]
         log.info("AI slová na overenie: %s", words)
+        if self.chat_dialog and words:
+            self.chat_dialog.add_agent_activity(
+                f"📤 AI navrhla slová na overenie: {', '.join(words)}"
+            )
 
         # --- Kontrola zlepeného hlavného slova vs. deklarované 'word' ---
         def _infer_main_and_anchor() -> tuple[str, str]:
@@ -4685,6 +4769,11 @@ class MainWindow(QMainWindow):
                     summary_word,
                     summary_reason,
                 )
+                if self.chat_dialog:
+                    reason_text = summary_reason or "neplatné slovo podľa rozhodcu"
+                    self.chat_dialog.add_agent_activity(
+                        f"⚖️ Rozhodca zamietol AI ťah ({summary_word}): {reason_text}"
+                    )
             # fallback: exchange instead of pass
             self.board.clear_letters(getattr(self, "_ai_ps2"))
             self._refresh_board_view()
@@ -4735,6 +4824,12 @@ class MainWindow(QMainWindow):
             self.model_results_table.update_result(update_payload)
 
         self.ai_score += total
+        if self.chat_dialog:
+            played_words = [word for word, _coords in words_coords]
+            words_label = ", ".join(played_words) if played_words else "?"
+            self.chat_dialog.add_agent_activity(
+                f"✅ AI odohrala: {words_label} za {total} bodov."
+            )
         # spotrebuj rack AI a doplň z tašky
         before = "".join(self.ai_rack)
         used = ",".join(p.letter for p in ps2)
@@ -5223,7 +5318,35 @@ class MainWindow(QMainWindow):
     def _on_ai_debug_log(self, message: str) -> None:
         """Zobraz debug/profiling správy z AI klienta v chate."""
         try:
-            self.chat_dialog.add_debug_message(message)
+            if not self.chat_dialog:
+                return
+
+            raw = (message or "").strip()
+            if not raw:
+                return
+
+            verbose = (os.getenv("SHOW_AGENT_DEBUG_RAW", "") or "").strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+            if verbose:
+                self.chat_dialog.add_debug_message(raw)
+                return
+
+            first_line = raw.splitlines()[0].strip()
+            noisy_markers = (
+                "HTTP Request:",
+                "request_payload",
+                "response_headers",
+                "raw_json",
+            )
+            if any(marker in first_line for marker in noisy_markers):
+                return
+            if len(first_line) > 220:
+                first_line = first_line[:220] + "..."
+            self.chat_dialog.add_agent_activity(f"ℹ️ {first_line}")
         except Exception:
             log.debug("Debug log to chat skipped")
     

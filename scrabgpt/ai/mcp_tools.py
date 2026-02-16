@@ -768,7 +768,7 @@ def tool_validate_word_slovak(
     # NOTE: Not implemented here to keep tool stateless
     # Caller should use OpenAIClient.judge_words() if needed
     elapsed_ms = (time.time() - start_time) * 1000
-    log.info("⚠ Word '%s' not found in Tier 1-2, needs AI judge (Tier 3)", word_normalized)
+    log.debug("Word '%s' not found in Tier 1-2, needs AI judge (Tier 3)", word_normalized)
     
     _VALIDATION_STATS["slovak_tier3_needed"]["count"] += 1
     
@@ -899,7 +899,7 @@ def tool_validate_word_english(
     
     # ========== Tier 3: Needs AI Judge ==========
     elapsed_ms = (time.time() - start_time) * 1000
-    log.info("⚠ Word '%s' not found in English dict, needs AI judge", word_normalized)
+    log.debug("Word '%s' not found in English dict, needs AI judge", word_normalized)
     
     _VALIDATION_STATS["english_tier3_needed"]["count"] += 1
     
