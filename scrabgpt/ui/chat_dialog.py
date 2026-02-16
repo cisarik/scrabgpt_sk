@@ -192,6 +192,109 @@ class ChatBubble(QFrame):
                 self.body_layout.addWidget(para_label)
 
 
+class SectionFeedCard(QFrame):
+    """Sekcia feedu s hlavičkou a zoznamom krokov."""
+
+    def __init__(
+        self,
+        *,
+        title: str,
+        icon: str,
+        subtitle: str,
+        accent: str,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._accent = accent
+        self._entry_labels_by_key: dict[str, QLabel] = {}
+        self._entry_count = 0
+        self._setup_ui(title=title, icon=icon, subtitle=subtitle)
+
+    def _setup_ui(self, *, title: str, icon: str, subtitle: str) -> None:
+        self.setStyleSheet(
+            """
+            QFrame {
+                background: #111b14;
+                border: 1px solid #2f5c39;
+                border-radius: 10px;
+                padding: 0;
+            }
+            QLabel#SectionTitle {
+                color: #e9f5ea;
+                font-size: 13px;
+                font-weight: 700;
+                font-family: 'Fira Sans', 'Segoe UI', sans-serif;
+            }
+            QLabel#SectionSubtitle {
+                color: #9cc8a0;
+                font-size: 10px;
+                font-family: 'Fira Sans', 'Segoe UI', sans-serif;
+            }
+            """
+        )
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 8, 10, 10)
+        layout.setSpacing(8)
+
+        header = QFrame()
+        header.setStyleSheet(
+            f"QFrame {{ background: #132119; border: 1px solid {self._accent}; border-radius: 8px; }}"
+        )
+        header_layout = QVBoxLayout(header)
+        header_layout.setContentsMargins(8, 6, 8, 6)
+        header_layout.setSpacing(2)
+
+        title_label = QLabel(f"{icon} {title}")
+        title_label.setObjectName("SectionTitle")
+        header_layout.addWidget(title_label)
+
+        subtitle_label = QLabel(subtitle)
+        subtitle_label.setObjectName("SectionSubtitle")
+        subtitle_label.setWordWrap(True)
+        header_layout.addWidget(subtitle_label)
+        layout.addWidget(header)
+
+        self.entries_widget = QWidget()
+        self.entries_layout = QVBoxLayout(self.entries_widget)
+        self.entries_layout.setContentsMargins(2, 2, 2, 2)
+        self.entries_layout.setSpacing(6)
+        layout.addWidget(self.entries_widget)
+
+    def append_entry(self, message: str, *, merge_key: str | None = None) -> tuple[QLabel, bool]:
+        """Pridá (alebo aktualizuje) riadok v sekcii."""
+        if merge_key and merge_key in self._entry_labels_by_key:
+            label = self._entry_labels_by_key[merge_key]
+            label.setText(message)
+            return label, True
+
+        self._entry_count += 1
+        row = QWidget()
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        row_layout.setSpacing(8)
+
+        step_label = QLabel(f"{self._entry_count}.")
+        step_label.setFixedWidth(24)
+        step_label.setAlignment(Qt.AlignTop | Qt.AlignRight)
+        step_label.setStyleSheet(
+            f"color: {self._accent}; font-size: 11px; font-weight: 700; font-family: 'Fira Code', 'Consolas';"
+        )
+        row_layout.addWidget(step_label)
+
+        text_label = QLabel(message)
+        text_label.setWordWrap(True)
+        text_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        text_label.setStyleSheet(
+            "color: #d6ead8; font-size: 12px; line-height: 1.35; font-family: 'Fira Sans', 'Segoe UI', sans-serif;"
+        )
+        row_layout.addWidget(text_label, stretch=1)
+
+        self.entries_layout.addWidget(row)
+        if merge_key:
+            self._entry_labels_by_key[merge_key] = text_label
+        return text_label, False
+
+
 class ChatDialog(QDialog):
     """Hlavný chat dialog s AI protihráčom - tmavá forest Scrabble téma.
     
@@ -205,6 +308,32 @@ class ChatDialog(QDialog):
     
     # Signals
     message_sent = Signal(str)  # Emituje sa keď user pošle správu
+    _SECTION_META: dict[str, tuple[str, str, str, str]] = {
+        "planning": (
+            "Plánovanie",
+            "🧭",
+            "Modely pripravujú kandidátov a skúšajú stratégie ťahu.",
+            "#7cc4ff",
+        ),
+        "word_check": (
+            "Kontrola slov",
+            "📚",
+            "Kontrola slovníka, legality a rozhodcu pre navrhnuté slová.",
+            "#7fe39b",
+        ),
+        "scoring": (
+            "Skórovanie",
+            "🧮",
+            "Výpočet bodov a porovnanie bodových variantov.",
+            "#ffd166",
+        ),
+        "final": (
+            "Finálny výber",
+            "🏁",
+            "Výber finálneho ťahu, fallbacky a aplikovanie výsledku.",
+            "#f78c6b",
+        ),
+    }
     
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -241,6 +370,15 @@ class ChatDialog(QDialog):
         self.reasoning_text: str = ""
         self.reasoning_spinner_timer: Optional[QTimer] = None
         self._reasoning_spinner_phase = 0
+        self._pending_tool_calls: list[tuple[str, dict | str, str | None]] = []
+        self._last_activity_merge_key: str | None = None
+        self._last_activity_bubble: ChatBubble | None = None
+        self._last_activity_history_index: int | None = None
+        self._word_validation_state: dict[str, dict[str, Any]] = {}
+        self._active_sections: dict[str, SectionFeedCard] = {}
+        self._section_history_indices: dict[tuple[str, str], int] = {}
+        self._turn_index = 0
+        self._turn_sections_ready = False
         
         self._setup_ui()
         self._apply_scrabble_theme()
@@ -505,6 +643,7 @@ class ChatDialog(QDialog):
     
     def add_user_message(self, message: str) -> None:
         """Pridaj user správu do chatu."""
+        self._reset_activity_merge_state()
         bubble = ChatBubble(message, is_user=True)
         self.chat_layout.addWidget(bubble, alignment=Qt.AlignRight)
         self._highlight_bubble(bubble)
@@ -516,6 +655,7 @@ class ChatDialog(QDialog):
     def add_ai_message(self, message: str, *, use_typing_effect: bool = False) -> None:
         """Pridaj AI správu do chatu (default bez typing efektu)."""
         self._hide_loading_animation()
+        self._reset_activity_merge_state()
         
         if use_typing_effect:
             # Vytvor prázdnu bublinu a postupne naplň
@@ -540,6 +680,7 @@ class ChatDialog(QDialog):
 
     def add_error_message(self, message: str) -> None:
         """Pridaj chybovú správu (červená bublina)."""
+        self._reset_activity_merge_state()
         bubble = ChatBubble(message, is_user=False)
         bubble.setStyleSheet(
             "QFrame { background: #2a0e0e; border: 1px solid #ff5c5c; border-radius: 8px; padding: 6px 8px; }"
@@ -557,6 +698,135 @@ class ChatDialog(QDialog):
             self.last_message_bubble.set_highlighted(False)
         bubble.set_highlighted(True)
         self.last_message_bubble = bubble
+
+    def _reset_activity_merge_state(self) -> None:
+        """Reset merge state pre agregačné chat eventy."""
+        self._last_activity_merge_key = None
+        self._last_activity_bubble = None
+        self._last_activity_history_index = None
+
+    @staticmethod
+    def _normalize_section(section: str | None) -> str | None:
+        if not section:
+            return None
+        normalized = section.strip().lower().replace(" ", "_")
+        aliases = {
+            "planovanie": "planning",
+            "planning": "planning",
+            "kontrola_slov": "word_check",
+            "word_check": "word_check",
+            "wordcheck": "word_check",
+            "slovnik": "word_check",
+            "slovnik_check": "word_check",
+            "skorovanie": "scoring",
+            "scoring": "scoring",
+            "final": "final",
+            "finalny_vyber": "final",
+            "final_choice": "final",
+        }
+        return aliases.get(normalized, normalized)
+
+    def _start_new_turn_sections(self) -> None:
+        """Inicializuje nové sekcie pre ďalší AI ťah."""
+        self._turn_index += 1
+        self._active_sections.clear()
+        self._section_history_indices.clear()
+        self._turn_sections_ready = True
+
+        banner = QLabel(
+            f"🎯 Ťah AI #{self._turn_index} • {datetime.now().strftime('%H:%M:%S')}"
+        )
+        banner.setStyleSheet(
+            "color: #dcefdc; background: #102017; border: 1px solid #2f5c39; "
+            "border-radius: 8px; padding: 6px 10px; font-size: 11px; font-weight: 700; "
+            "font-family: 'Fira Sans', 'Segoe UI', sans-serif;"
+        )
+        self.chat_layout.addWidget(banner, alignment=Qt.AlignHCenter)
+        self.chat_history.append(f"AI turn {self._turn_index} started")
+        self._render_context_info()
+        self._scroll_to_bottom()
+
+    def _ensure_section_card(self, section_key: str) -> SectionFeedCard:
+        normalized = self._normalize_section(section_key) or "planning"
+        if normalized not in self._SECTION_META:
+            normalized = "planning"
+
+        existing = self._active_sections.get(normalized)
+        if existing is not None:
+            return existing
+
+        title, icon, subtitle, accent = self._SECTION_META[normalized]
+        card = SectionFeedCard(
+            title=title,
+            icon=icon,
+            subtitle=subtitle,
+            accent=accent,
+            parent=self.chat_container,
+        )
+        self.chat_layout.addWidget(card)
+        self._active_sections[normalized] = card
+        return card
+
+    def _section_for_tool(self, normalized_tool: str) -> str:
+        if normalized_tool in {
+            "validate_word_slovak",
+            "validate_word_english",
+            "rules_extract_all_words",
+            "validate_move_legality",
+        }:
+            return "word_check"
+        if normalized_tool in {"calculate_move_score", "scoring_score_words"}:
+            return "scoring"
+        if normalized_tool in {"get_board_state", "get_rack_letters"}:
+            return "planning"
+        return "planning"
+
+    def _infer_activity_section(self, message: str, merge_key: str | None = None) -> str:
+        key_lower = (merge_key or "").lower()
+        if key_lower.startswith("tool:"):
+            tool_part = key_lower.split(":", 2)[1] if ":" in key_lower else ""
+            return self._section_for_tool(tool_part)
+
+        lowered = message.lower()
+        final_markers = (
+            "víťaz",
+            "odohrala",
+            "aplik",
+            "fallback",
+            "žiadne návrhy",
+            "mení písmená",
+            "timeout",
+            "api chyba",
+            "kandidát",
+            "final",
+        )
+        if any(marker in lowered for marker in final_markers):
+            return "final"
+
+        scoring_markers = ("skóre", "score", "bodov", "bod")
+        if any(marker in lowered for marker in scoring_markers):
+            return "scoring"
+
+        check_markers = (
+            "slovník",
+            "overenie",
+            "overujem",
+            "rozhodca",
+            "legalita",
+            "slová",
+            "neplatné slovo",
+        )
+        if any(marker in lowered for marker in check_markers):
+            return "word_check"
+
+        return "planning"
+
+    def reset_tool_tracking(self) -> None:
+        """Vyčistí stav nástrojov na nový AI ťah."""
+        self._pending_tool_calls.clear()
+        self._word_validation_state.clear()
+        self._reset_activity_merge_state()
+        self._start_new_turn_sections()
 
     def _render_context_info(self) -> None:
         """Zobraz info o context window pre celú konverzáciu."""
@@ -643,18 +913,352 @@ class ChatDialog(QDialog):
 
     def add_profiling_info(self, title: str, data: dict[str, str]) -> None:
         """Pridá štruktúrovaný profiling blok ako chat bublinu."""
-        lines = [f"📊 {title}"]
+        self.add_agent_activity(f"📊 {title}", section="planning")
         for key, value in data.items():
-            lines.append(f"- {key}: {value}")
-        bubble = ChatBubble("\n".join(lines), is_user=False)
-        self.chat_layout.addWidget(bubble, alignment=Qt.AlignLeft)
-        self._highlight_bubble(bubble)
-        self.chat_history.append(" | ".join(lines))
-        self._render_context_info()
-        self._scroll_to_bottom()
+            self.add_agent_activity(f"{key}: {value}", section="planning")
 
-    def add_tool_call(self, tool_name: str, args: dict | str) -> None:
+    @staticmethod
+    def _tool_raw_enabled() -> bool:
+        raw = (os.getenv("SHOW_AGENT_TOOL_RAW", "") or "").strip().lower()
+        return raw in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _short_text(value: object, max_len: int = 80) -> str:
+        text = str(value).replace("\n", " ").strip()
+        if len(text) <= max_len:
+            return text
+        return text[:max_len] + "..."
+
+    @staticmethod
+    def _normalize_tool_name(tool_name: str) -> str:
+        normalized = (tool_name or "").strip().lower()
+        for separator in ("/", ".", "::", ":", "__"):
+            if separator in normalized:
+                normalized = normalized.split(separator)[-1]
+        return normalized.replace("-", "_").strip()
+
+    @staticmethod
+    def _model_prefix(model_name: str | None) -> str:
+        if not model_name:
+            return ""
+        cleaned = model_name.strip()
+        if not cleaned:
+            return ""
+        short = cleaned if len(cleaned) <= 24 else cleaned[:24] + "..."
+        return f"[{short}] "
+
+    @staticmethod
+    def _placements_summary(placements: object) -> str:
+        if not isinstance(placements, list) or not placements:
+            return "bez písmen"
+
+        letters: list[str] = []
+        start: tuple[int, int] | None = None
+        for item in placements[:7]:
+            if not isinstance(item, dict):
+                continue
+            letter = item.get("letter")
+            if isinstance(letter, str) and letter:
+                letters.append(letter)
+            row = item.get("row")
+            col = item.get("col")
+            if start is None and isinstance(row, int) and isinstance(col, int):
+                start = (row, col)
+
+        word_preview = "".join(letters) if letters else f"{len(placements)} písmen"
+        if start is None:
+            return word_preview
+        return f"{word_preview} @ ({start[0]},{start[1]})"
+
+    def _summarize_tool_args(self, tool_name: str, args: dict | str) -> str:
+        if not isinstance(args, dict):
+            return self._short_text(args, 120)
+
+        parts: list[str] = []
+        for key, value in args.items():
+            if key in {"board_grid", "grid"}:
+                if isinstance(value, list):
+                    rows = len(value)
+                    cols = len(value[0]) if value and isinstance(value[0], str) else "?"
+                    parts.append(f"{key}={rows}x{cols}")
+                else:
+                    parts.append(f"{key}=doska")
+                continue
+
+            if key == "premium_grid":
+                parts.append("premium_grid=layout")
+                continue
+
+            if key == "placements" and isinstance(value, list):
+                letters: list[str] = []
+                for item in value[:7]:
+                    if isinstance(item, dict):
+                        letter = item.get("letter")
+                        if isinstance(letter, str) and letter:
+                            letters.append(letter)
+                letters_preview = "".join(letters)
+                if letters_preview:
+                    parts.append(f"placements={len(value)} ({letters_preview})")
+                else:
+                    parts.append(f"placements={len(value)}")
+                continue
+
+            if key in {"messages", "contents"} and isinstance(value, list):
+                parts.append(f"{key}={len(value)}")
+                continue
+
+            if isinstance(value, list):
+                parts.append(f"{key}={len(value)} položiek")
+                continue
+
+            if isinstance(value, dict):
+                parts.append(f"{key}=obj")
+                continue
+
+            parts.append(f"{key}={self._short_text(value, 48)}")
+
+        if not parts:
+            return f"{tool_name}: bez argumentov"
+        return ", ".join(parts[:5])
+
+    def _summarize_tool_result(self, result: Any, is_error: bool = False) -> str:
+        if isinstance(result, dict):
+            if is_error or "error" in result:
+                return self._short_text(result.get("error", "Neznáma chyba"), 140)
+
+            if "valid" in result:
+                state = "validné" if bool(result.get("valid")) else "neplatné"
+                reason = result.get("reason", "")
+                if reason:
+                    return f"{state} ({self._short_text(reason, 100)})"
+                return state
+
+            if "total_score" in result:
+                score = result.get("total_score", 0)
+                words = result.get("words")
+                word_count = len(words) if isinstance(words, list) else 0
+                return f"score={score}, words={word_count}"
+
+            if "words" in result and isinstance(result["words"], list):
+                words_val = result["words"]
+                if words_val and isinstance(words_val[0], dict):
+                    words_only: list[str] = []
+                    for item in words_val[:4]:
+                        if isinstance(item, dict):
+                            word = item.get("word")
+                            if isinstance(word, str):
+                                words_only.append(word)
+                    if words_only:
+                        suffix = "..." if len(words_val) > 4 else ""
+                        return f"slová: {', '.join(words_only)}{suffix}"
+                return f"slová: {len(words_val)}"
+
+            if "premiums" in result and isinstance(result["premiums"], list):
+                return f"premium squares: {len(result['premiums'])}"
+
+            if "rack" in result:
+                rack_val = result.get("rack", "")
+                count_val = result.get("count")
+                if isinstance(count_val, int):
+                    return f"rack={rack_val} ({count_val})"
+                return f"rack={rack_val}"
+
+            keys = list(result.keys())
+            return f"výstup: {', '.join(keys[:5])}"
+
+        if isinstance(result, list):
+            return f"{len(result)} položiek"
+
+        return self._short_text(result, 140)
+
+    @staticmethod
+    def _source_label(source: str) -> str:
+        src = source.strip().lower()
+        mapping = {
+            "fastdict": "lokálny slovník",
+            "fastdict_english": "lokálny slovník",
+            "juls_api": "online slovník",
+            "tier1_negative_short": "lokálny slovník",
+            "tier2_negative": "online slovník",
+            "pattern_validation": "kontrola formátu",
+        }
+        return mapping.get(src, source)
+
+    @staticmethod
+    def _format_ms(value: object) -> str:
+        if isinstance(value, (int, float)):
+            return f"{value:.1f} ms"
+        return ""
+
+    def _build_tool_event_message(
+        self,
+        tool_name: str,
+        args: dict | str,
+        result: Any,
+        is_error: bool = False,
+        model_name: str | None = None,
+    ) -> tuple[str, str | None, str]:
+        normalized_tool = self._normalize_tool_name(tool_name)
+        model_prefix = self._model_prefix(model_name)
+        merge_key: str | None = None
+        section = self._section_for_tool(normalized_tool)
+
+        if is_error:
+            err = self._summarize_tool_result(result, is_error=True)
+            return f"{model_prefix}❌ {normalized_tool}: {err}", merge_key, section
+
+        args_dict = args if isinstance(args, dict) else {}
+        result_dict = result if isinstance(result, dict) else {}
+
+        if normalized_tool in {"validate_word_slovak", "validate_word_english"}:
+            word = "?"
+            if isinstance(args_dict, dict):
+                arg_word = args_dict.get("word")
+                if isinstance(arg_word, str) and arg_word.strip():
+                    word = arg_word.strip()
+
+            valid = bool(result_dict.get("valid", False))
+            merge_key = f"tool:{normalized_tool}:{model_name or '-'}"
+
+            state = self._word_validation_state.setdefault(
+                merge_key,
+                {"total": 0, "valid": 0, "invalid": 0, "recent": []},
+            )
+            state["total"] += 1
+            if valid:
+                state["valid"] += 1
+            else:
+                state["invalid"] += 1
+            mark = "✅" if valid else "❌"
+            recent = state["recent"]
+            if isinstance(recent, list):
+                recent.append(f"{word}{mark}")
+                if len(recent) > 4:
+                    del recent[:-4]
+
+            source_raw = result_dict.get("source")
+            source = self._source_label(str(source_raw)) if source_raw else ""
+            elapsed = self._format_ms(result_dict.get("time_ms"))
+            tier = result_dict.get("tier")
+            details: list[str] = []
+            if isinstance(tier, int):
+                details.append(f"tier {tier}")
+            if source:
+                details.append(source)
+            if result_dict.get("cached"):
+                details.append("cache")
+            if elapsed:
+                details.append(elapsed)
+            recent_text = ", ".join(recent) if isinstance(recent, list) else ""
+            details_text = f" | posledné overenie: {', '.join(details)}" if details else ""
+            lang = "SK" if normalized_tool.endswith("slovak") else "EN"
+            return (
+                f"{model_prefix}📚 Slovník {lang}: {state['total']} kontrol "
+                f"(✅ {state['valid']} / ❌ {state['invalid']}) | posledné: {recent_text}{details_text}",
+                merge_key,
+                "word_check",
+            )
+
+        if normalized_tool == "validate_move_legality":
+            valid = bool(result_dict.get("valid", False))
+            checks = result_dict.get("checks")
+            ok_checks = 0
+            all_checks = 0
+            if isinstance(checks, dict):
+                all_checks = len(checks)
+                ok_checks = sum(1 for value in checks.values() if bool(value))
+            reason = self._short_text(result_dict.get("reason", ""), 90)
+            status = "OK" if valid else "neplatné"
+            checks_text = f", kontroly {ok_checks}/{all_checks}" if all_checks else ""
+            reason_text = f", {reason}" if reason else ""
+            placement_text = self._placements_summary(args_dict.get("placements"))
+            merge_key = f"tool:{normalized_tool}:{model_name or '-'}"
+            return (
+                f"{model_prefix}⚖️ Legalita ťahu ({placement_text}): {status}{checks_text}{reason_text}",
+                merge_key,
+                "word_check",
+            )
+
+        if normalized_tool in {"calculate_move_score", "scoring_score_words"}:
+            score = result_dict.get("total_score", 0)
+            placement_text = self._placements_summary(args_dict.get("placements"))
+            words_value = result_dict.get("words")
+            words_text = ""
+            if isinstance(words_value, list) and words_value:
+                words: list[str] = []
+                for item in words_value[:3]:
+                    if isinstance(item, dict):
+                        w = item.get("word")
+                        if isinstance(w, str) and w:
+                            words.append(w)
+                if words:
+                    suffix = "..." if len(words_value) > 3 else ""
+                    words_text = f", slová: {', '.join(words)}{suffix}"
+            merge_key = f"tool:{normalized_tool}:{model_name or '-'}"
+            return (
+                f"{model_prefix}🧮 Skóre ({placement_text}): {score} bodov{words_text}",
+                merge_key,
+                "scoring",
+            )
+
+        if normalized_tool == "rules_extract_all_words":
+            words_value = result_dict.get("words")
+            words: list[str] = []
+            if isinstance(words_value, list):
+                for item in words_value[:4]:
+                    if isinstance(item, dict):
+                        word = item.get("word")
+                        if isinstance(word, str) and word:
+                            words.append(word)
+            placement_text = self._placements_summary(args_dict.get("placements"))
+            merge_key = f"tool:{normalized_tool}:{model_name or '-'}"
+            if words:
+                suffix = "..." if isinstance(words_value, list) and len(words_value) > 4 else ""
+                return (
+                    f"{model_prefix}🔤 Slová z ťahu ({placement_text}): {', '.join(words)}{suffix}",
+                    merge_key,
+                    "word_check",
+                )
+            return f"{model_prefix}🔤 Slová z ťahu ({placement_text}): žiadne", merge_key, "word_check"
+
+        if normalized_tool == "get_rack_letters":
+            rack = result_dict.get("rack", "")
+            count = result_dict.get("count")
+            if isinstance(count, int):
+                return f"{model_prefix}🎒 Rack: {rack} ({count} písmen)", None, "planning"
+            return f"{model_prefix}🎒 Rack: {rack}", None, "planning"
+
+        if normalized_tool == "get_board_state":
+            grid = result_dict.get("grid")
+            if isinstance(grid, list):
+                empty = 0
+                for row in grid:
+                    if isinstance(row, str):
+                        empty += row.count(".")
+                cells = len(grid) * (len(grid[0]) if grid and isinstance(grid[0], str) else 15)
+                filled = max(0, cells - empty)
+                return (
+                    f"{model_prefix}🗺️ Stav dosky načítaný (obsadené polia: {filled})",
+                    None,
+                    "planning",
+                )
+            return f"{model_prefix}🗺️ Stav dosky načítaný", None, "planning"
+
+        args_summary = self._summarize_tool_args(tool_name, args)
+        res_summary = self._summarize_tool_result(result, is_error=False)
+        return (
+            f"{model_prefix}🛠️ {normalized_tool}: {args_summary} -> {res_summary}",
+            merge_key,
+            section,
+        )
+
+    def add_tool_call(self, tool_name: str, args: dict | str, *, model_name: str | None = None) -> None:
         """Zobrazí volanie interného nástroja."""
+        normalized_tool = self._normalize_tool_name(tool_name)
+        if not self._tool_raw_enabled():
+            self._pending_tool_calls.append((normalized_tool, args, model_name))
+            return
+
         container = QFrame()
         container.setStyleSheet(
             "background: #1a1208; border-left: 3px solid #ffb74d; border-radius: 4px;"
@@ -668,7 +1272,8 @@ class ChatDialog(QDialog):
         header_layout.setSpacing(8)
         
         icon = QLabel("🛠️")
-        name_label = QLabel(f"Calling: {tool_name}")
+        model_prefix = self._model_prefix(model_name)
+        name_label = QLabel(f"Calling: {model_prefix}{normalized_tool}")
         name_label.setStyleSheet("color: #ffb74d; font-weight: bold; font-family: 'Fira Code', monospace; font-size: 11px;")
         
         header_layout.addWidget(icon)
@@ -687,8 +1292,46 @@ class ChatDialog(QDialog):
         self.chat_layout.addWidget(container, alignment=Qt.AlignLeft)
         self._scroll_to_bottom()
 
-    def add_tool_result(self, tool_name: str, result: Any, is_error: bool = False) -> None:
+    def add_tool_result(
+        self,
+        tool_name: str,
+        result: Any,
+        is_error: bool = False,
+        *,
+        model_name: str | None = None,
+    ) -> None:
         """Zobrazí výsledok volania nástroja."""
+        normalized_tool = self._normalize_tool_name(tool_name)
+        if not self._tool_raw_enabled():
+            call_args: dict | str = {}
+            has_call_args = False
+            for idx, (pending_name, pending_args, pending_model_name) in enumerate(self._pending_tool_calls):
+                if pending_name != normalized_tool:
+                    continue
+                if model_name and pending_model_name and pending_model_name != model_name:
+                    continue
+                call_args = pending_args
+                has_call_args = True
+                del self._pending_tool_calls[idx]
+                break
+            if not has_call_args:
+                for idx, (pending_name, pending_args, _pending_model_name) in enumerate(self._pending_tool_calls):
+                    if pending_name != normalized_tool:
+                        continue
+                    call_args = pending_args
+                    has_call_args = True
+                    del self._pending_tool_calls[idx]
+                    break
+            message, merge_key, section = self._build_tool_event_message(
+                tool_name=tool_name,
+                args=call_args,
+                result=result,
+                is_error=is_error,
+                model_name=model_name,
+            )
+            self.add_agent_activity(message, merge_key=merge_key, section=section)
+            return
+
         container = QFrame()
         color = "#ff5c5c" if is_error else "#00ff41"
         bg = "#2a0e0e" if is_error else "#0c1a12"
@@ -703,7 +1346,8 @@ class ChatDialog(QDialog):
         
         header_layout = QHBoxLayout()
         icon = QLabel("❌" if is_error else "✅")
-        title = QLabel(f"{tool_name} -> {'Error' if is_error else 'Result'}")
+        model_prefix = self._model_prefix(model_name)
+        title = QLabel(f"{model_prefix}{normalized_tool} -> {'Error' if is_error else 'Result'}")
         title.setStyleSheet(f"color: {color}; font-weight: bold; font-family: 'Fira Code', monospace; font-size: 11px;")
         
         header_layout.addWidget(icon)
@@ -726,16 +1370,46 @@ class ChatDialog(QDialog):
         self.chat_layout.addWidget(container, alignment=Qt.AlignLeft)
         self._scroll_to_bottom()
 
-    def add_agent_activity(self, message: str) -> None:
-        """Pridá informačnú správu o aktivite agenta ako chatový event."""
-        bubble = ChatBubble(f"- {message}", is_user=False)
-        bubble.setStyleSheet(
-            "QFrame { background: #112019; border: 1px solid #2f5c39; border-radius: 8px; padding: 6px 8px; }"
-            "QLabel { color: #cce7d0; font-size: 12px; font-family: 'Fira Sans', 'Segoe UI', sans-serif; }"
+    def add_agent_activity(
+        self,
+        message: str,
+        *,
+        merge_key: str | None = None,
+        section: str | None = None,
+    ) -> None:
+        """Pridá informačnú správu o aktivite agenta do sekčného feedu."""
+        normalized = self._normalize_section(section)
+        if normalized is None:
+            normalized = self._infer_activity_section(message, merge_key)
+        if normalized not in self._SECTION_META:
+            normalized = "planning"
+
+        if not self._turn_sections_ready:
+            self._start_new_turn_sections()
+
+        card = self._ensure_section_card(normalized)
+        entry_key = merge_key or ""
+        entry_label, merged = card.append_entry(
+            message,
+            merge_key=entry_key if entry_key else None,
         )
-        self.chat_layout.addWidget(bubble, alignment=Qt.AlignLeft)
-        self._highlight_bubble(bubble)
-        self.chat_history.append(message)
+        self.last_message_bubble = None
+        entry_label.setStyleSheet(
+            "color: #ebf7ed; font-size: 12px; line-height: 1.35; "
+            "font-family: 'Fira Sans', 'Segoe UI', sans-serif;"
+        )
+
+        history_lookup = (normalized, entry_key)
+        if entry_key and merged and history_lookup in self._section_history_indices:
+            idx = self._section_history_indices[history_lookup]
+            if 0 <= idx < len(self.chat_history):
+                self.chat_history[idx] = f"[{normalized}] {message}"
+        else:
+            self.chat_history.append(f"[{normalized}] {message}")
+            if entry_key:
+                self._section_history_indices[history_lookup] = len(self.chat_history) - 1
+
+        self._reset_activity_merge_state()
         self._render_context_info()
         self._scroll_to_bottom()
 

@@ -3548,7 +3548,8 @@ class MainWindow(QMainWindow):
                 self._ai_local_fallback_used = True
                 try:
                     self.chat_dialog.add_agent_activity(
-                        "AI skúša núdzový lokálny nízkobodový ťah namiesto výmeny."
+                        "AI skúša núdzový lokálny nízkobodový ťah namiesto výmeny.",
+                        section="final",
                     )
                 except Exception:
                     pass
@@ -3595,7 +3596,7 @@ class MainWindow(QMainWindow):
         message = status_message or "AI mení písmená"
         self.status.showMessage(message)
         try:
-            self.chat_dialog.add_agent_activity(message)
+            self.chat_dialog.add_agent_activity(message, section="final")
         except Exception:
             pass
 
@@ -3917,6 +3918,7 @@ class MainWindow(QMainWindow):
         # Profiling info pre chat dialog
         if self.chat_dialog:
             try:
+                self.chat_dialog.reset_tool_tracking()
                 self.chat_dialog.add_profiling_info("AI začína ťah", {
                     "Rack": "".join(self.ai_rack),
                     "Skóre": f"AI {self.ai_score} : {self.human_score} Hráč",
@@ -4163,7 +4165,10 @@ class MainWindow(QMainWindow):
         if self.chat_dialog and use_multi and selected_models:
             model_chain = " -> ".join(str(m.get("name") or m.get("id") or "?") for m in selected_models)
             provider_label = "Google" if provider_type == "vertex" else ("Novita" if provider_type == "novita" else "OpenRouter")
-            self.chat_dialog.add_agent_activity(f"🧠 {provider_label} model chain: {model_chain}")
+            self.chat_dialog.add_agent_activity(
+                f"🧠 {provider_label} model chain: {model_chain}",
+                section="planning",
+            )
         # Start countdown for this AI turn
         self._ai_deadline = time.monotonic() + timeout_seconds
         self._ai_countdown_timer.start()
@@ -4266,11 +4271,16 @@ class MainWindow(QMainWindow):
             tool_data = result.get("tool_calls_data")
             if tool_data and self.chat_dialog:
                 for tc in tool_data:
-                    self.chat_dialog.add_tool_call(tc["name"], tc["args"])
+                    tool_name = tc.get("name", "?")
+                    tool_args = tc.get("args", {})
+                    self.chat_dialog.add_tool_call(tool_name, tool_args, model_name=model_name)
             else:
                 message = result.get("message", "🛠️ Používam nástroj...")
                 if self.chat_dialog:
-                    self.chat_dialog.add_agent_activity(message)
+                    self.chat_dialog.add_agent_activity(
+                        f"[{model_name}] {message}",
+                        section="planning",
+                    )
             # Update table status too
             self.model_results_table.update_result(result)
             return
@@ -4280,7 +4290,12 @@ class MainWindow(QMainWindow):
                 tool_name = result.get("tool_name", "?")
                 res_data = result.get("result", {})
                 is_error = isinstance(res_data, dict) and "error" in res_data
-                self.chat_dialog.add_tool_result(tool_name, res_data, is_error=is_error)
+                self.chat_dialog.add_tool_result(
+                    tool_name,
+                    res_data,
+                    is_error=is_error,
+                    model_name=model_name,
+                )
             return
 
         if status == "retry":
@@ -4289,7 +4304,10 @@ class MainWindow(QMainWindow):
                 retry_note = "Model skúša nový variant ťahu."
                 if isinstance(error_msg, str) and "exchange/pass too early" in error_msg:
                     retry_note = "Model skúša znova: musí nájsť slovný ťah (nie exchange/pass)."
-                self.chat_dialog.add_agent_activity(f"🔄 {model_name}: {retry_note}")
+                self.chat_dialog.add_agent_activity(
+                    f"🔄 {model_name}: {retry_note}",
+                    section="planning",
+                )
             # Continue to update table
 
         self.model_results_table.update_result(result)
@@ -4300,7 +4318,8 @@ class MainWindow(QMainWindow):
             score_text = f"{score} b" if isinstance(score, (int, float)) else "—"
             if self.chat_dialog:
                 self.chat_dialog.add_agent_activity(
-                    f"✅ {model_name}: kandidát '{word_preview}' ({score_text})"
+                    f"✅ {model_name}: kandidát '{word_preview}' ({score_text})",
+                    section="final",
                 )
             self.status.showMessage(
                 f"{model_name} odpovedal: {word_preview} ({score_text})"
@@ -4308,7 +4327,8 @@ class MainWindow(QMainWindow):
         elif status == "parse_error":
             if self.chat_dialog:
                 self.chat_dialog.add_agent_activity(
-                    f"⚠️ {model_name}: neplatný formát odpovede, skúšam ďalšie modely."
+                    f"⚠️ {model_name}: neplatný formát odpovede, skúšam ďalšie modely.",
+                    section="planning",
                 )
             self.status.showMessage(f"{model_name}: neplatná odpoveď – čakám na ostatné modely")
             # Update timer display using the existing ChatDialog method
@@ -4320,13 +4340,15 @@ class MainWindow(QMainWindow):
         if status == "error":
             if self.chat_dialog:
                 self.chat_dialog.add_agent_activity(
-                    f"❌ {model_name}: API chyba, pokračujem ďalšími modelmi."
+                    f"❌ {model_name}: API chyba, pokračujem ďalšími modelmi.",
+                    section="final",
                 )
             self.status.showMessage(f"{model_name}: API chyba – čakám na ostatné modely")
         elif status == "timeout":
             if self.chat_dialog:
                 self.chat_dialog.add_agent_activity(
-                    f"⏳ {model_name}: timeout, pokračujem ďalšími modelmi."
+                    f"⏳ {model_name}: timeout, pokračujem ďalšími modelmi.",
+                    section="final",
                 )
             self.status.showMessage(f"{model_name}: Timeout – čakám na ostatné modely")
 
@@ -4365,7 +4387,8 @@ class MainWindow(QMainWindow):
                 )
                 if self.chat_dialog:
                     self.chat_dialog.add_agent_activity(
-                        f"🔁 Google fallback: {fallback_from} -> {fallback_to}"
+                        f"🔁 Google fallback: {fallback_from} -> {fallback_to}",
+                        section="final",
                     )
                 break
         
@@ -4381,7 +4404,8 @@ class MainWindow(QMainWindow):
             winner_score = winner.get("score", 0)
             if self.chat_dialog:
                 self.chat_dialog.add_agent_activity(
-                    f"🏆 Víťaz návrhov: {self._current_ai_model} -> {winner_word} ({winner_score} b)"
+                    f"🏆 Víťaz návrhov: {self._current_ai_model} -> {winner_word} ({winner_score} b)",
+                    section="final",
                 )
             self.status.showMessage(
                 f"✓ Víťaz: {self._current_ai_model} - {winner_word} ({winner_score} bodov)"
@@ -4395,14 +4419,18 @@ class MainWindow(QMainWindow):
                 self._current_ai_model_id = fallback.get("model")
                 if self.chat_dialog:
                     self.chat_dialog.add_agent_activity(
-                        f"⚠️ Žiadny model nedal judge-valid návrh, beriem najlepší dostupný: {self._current_ai_model}"
+                        f"⚠️ Žiadny model nedal judge-valid návrh, beriem najlepší dostupný: {self._current_ai_model}",
+                        section="final",
                     )
                 self.status.showMessage(f"⚠️ Žiadne platné návrhy, používam {self._current_ai_model}")
             else:
                 self._current_ai_model = "AI"
                 self._current_ai_model_id = None
                 if self.chat_dialog:
-                    self.chat_dialog.add_agent_activity("❌ Žiadne návrhy od modelov.")
+                    self.chat_dialog.add_agent_activity(
+                        "❌ Žiadne návrhy od modelov.",
+                        section="final",
+                    )
                 self.status.showMessage("⚠️ Žiadne platné návrhy od modelov")
     
     def _update_table_for_judging(self, words: list[str]) -> None:
@@ -4585,7 +4613,8 @@ class MainWindow(QMainWindow):
         log.info("AI slová na overenie: %s", words)
         if self.chat_dialog and words:
             self.chat_dialog.add_agent_activity(
-                f"📤 AI navrhla slová na overenie: {', '.join(words)}"
+                f"📤 AI navrhla slová na overenie: {', '.join(words)}",
+                section="word_check",
             )
 
         # --- Kontrola zlepeného hlavného slova vs. deklarované 'word' ---
@@ -4772,7 +4801,8 @@ class MainWindow(QMainWindow):
                 if self.chat_dialog:
                     reason_text = summary_reason or "neplatné slovo podľa rozhodcu"
                     self.chat_dialog.add_agent_activity(
-                        f"⚖️ Rozhodca zamietol AI ťah ({summary_word}): {reason_text}"
+                        f"⚖️ Rozhodca zamietol AI ťah ({summary_word}): {reason_text}",
+                        section="word_check",
                     )
             # fallback: exchange instead of pass
             self.board.clear_letters(getattr(self, "_ai_ps2"))
@@ -4828,7 +4858,8 @@ class MainWindow(QMainWindow):
             played_words = [word for word, _coords in words_coords]
             words_label = ", ".join(played_words) if played_words else "?"
             self.chat_dialog.add_agent_activity(
-                f"✅ AI odohrala: {words_label} za {total} bodov."
+                f"✅ AI odohrala: {words_label} za {total} bodov.",
+                section="final",
             )
         # spotrebuj rack AI a doplň z tašky
         before = "".join(self.ai_rack)
@@ -5346,7 +5377,7 @@ class MainWindow(QMainWindow):
                 return
             if len(first_line) > 220:
                 first_line = first_line[:220] + "..."
-            self.chat_dialog.add_agent_activity(f"ℹ️ {first_line}")
+            self.chat_dialog.add_agent_activity(f"ℹ️ {first_line}", section="planning")
         except Exception:
             log.debug("Debug log to chat skipped")
     
