@@ -418,7 +418,12 @@ class OpenAIClient:
                 try:
                     usage = getattr(chat, "usage", None)
                     if usage:
-                        prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or usage.get("prompt_tokens", 0))  # type: ignore[attr-defined]
+                        prompt_tokens_raw: Any = 0
+                        if hasattr(usage, "prompt_tokens"):
+                            prompt_tokens_raw = getattr(usage, "prompt_tokens", 0)
+                        elif isinstance(usage, dict):
+                            prompt_tokens_raw = usage.get("prompt_tokens", 0)
+                        prompt_tokens = int(prompt_tokens_raw or 0)
                         context_len = 0
                         if hasattr(chat, "model") and getattr(chat, "model", None):
                             from .lmstudio_utils import get_context_length
@@ -514,7 +519,7 @@ class OpenAIClient:
             except Exception as e:  # noqa: BLE001
                 log.exception("OpenAI judge fallback failed: %s", e)
                 # Mark unresolved words as invalid but keep previous findings
-                error_results = [
+                error_results: list[JudgeResult] = [
                     {"word": w, "valid": False, "reason": f"OpenAI judge failed: {e}"}
                     for w in openai_needed
                 ]

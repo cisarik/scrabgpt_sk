@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from .tool_registry import get_all_tool_names
 
@@ -61,14 +61,17 @@ def load_agent_config(agent_file: Path) -> dict[str, Any]:
         raise AgentConfigError(f"Invalid JSON in {agent_file}: {e}") from e
     except Exception as e:
         raise AgentConfigError(f"Failed to load {agent_file}: {e}") from e
+    if not isinstance(config, dict):
+        raise AgentConfigError(f"Invalid config payload in {agent_file}: expected object")
+    config_dict = cast(dict[str, Any], config)
     
     # Validate schema
-    validate_agent_schema(config)
+    validate_agent_schema(config_dict)
     
     # Validate tools exist
-    validate_agent_tools(config)
+    validate_agent_tools(config_dict)
     
-    return config
+    return config_dict
 
 
 def validate_agent_schema(config: dict[str, Any]) -> None:
@@ -132,7 +135,7 @@ def discover_agents(agents_dir: Path) -> list[dict[str, Any]]:
     Returns:
         List of valid agent configurations
     """
-    agents = []
+    agents: list[dict[str, Any]] = []
     
     if not agents_dir.exists():
         log.warning("Agents directory does not exist: %s", agents_dir)

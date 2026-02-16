@@ -5,15 +5,17 @@ from __future__ import annotations
 import logging
 import os
 from functools import lru_cache
-from typing import Iterable
+from typing import Any, Iterable
 
 log = logging.getLogger("scrabgpt.ai.lmstudio")
 
 
 try:  # Optional dependency
-    import lmstudio as _lms  # type: ignore
+    import lmstudio as _lmstudio_runtime  # type: ignore[import-not-found]
 except Exception:  # pragma: no cover - optional
-    _lms = None  # type: ignore[misc]
+    _lms: Any = None
+else:
+    _lms = _lmstudio_runtime
 
 
 def _default_model_key() -> str | None:
@@ -22,7 +24,7 @@ def _default_model_key() -> str | None:
 
 
 @lru_cache(maxsize=2)
-def _load_model(model_key: str):
+def _load_model(model_key: str) -> Any:
     if _lms is None:
         raise RuntimeError("lmstudio SDK nie je nainštalované")
     return _lms.llm(model_key)

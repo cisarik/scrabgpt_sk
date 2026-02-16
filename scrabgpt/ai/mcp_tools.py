@@ -13,7 +13,7 @@ import logging
 import time
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 import httpx
 
@@ -45,7 +45,9 @@ _CACHE_MAX_SIZE = 10000
 _CACHE_TTL_SECONDS = 3600  # 1 hour
 
 # Performance metrics
-_VALIDATION_STATS = defaultdict(lambda: {"count": 0, "time_ms": 0.0, "hits": 0, "misses": 0})
+_VALIDATION_STATS: defaultdict[str, dict[str, int | float]] = defaultdict(
+    lambda: {"count": 0, "time_ms": 0.0, "hits": 0, "misses": 0}
+)
 
 # Word length threshold for online validation
 # Words <= this length: only local dict (fast, 99% coverage)
@@ -117,7 +119,10 @@ def _get_cached_validation(word: str, language: str) -> dict[str, Any] | None:
         if age_seconds < _CACHE_TTL_SECONDS:
             _VALIDATION_STATS[f"{language}_cache"]["hits"] += 1
             log.debug("Cache HIT for '%s' (age: %.1fs)", word, age_seconds)
-            return cached["result"]
+            cached_result = cached.get("result")
+            if isinstance(cached_result, dict):
+                return cached_result
+            return None
         else:
             # Expired, remove it
             del _VALIDATION_CACHE[cache_key]
@@ -371,7 +376,7 @@ def tool_rules_extract_all_words(
 
 def tool_scoring_score_words(
     board_grid: list[str],
-    premium_grid: list[list[dict | None]],
+    premium_grid: list[list[dict[str, Any] | None]],
     placements: list[dict[str, Any]],
     words: list[dict[str, Any]],
 ) -> dict[str, Any]:
@@ -401,9 +406,10 @@ def tool_scoring_score_words(
                 # Non-empty: apply provided premiums
                 for r in range(BOARD_SIZE):
                     for c in range(BOARD_SIZE):
-                        if premium_grid[r][c]:
-                            prem_type = premium_grid[r][c]["type"]
-                            prem_used = premium_grid[r][c]["used"]
+                        premium_cell = premium_grid[r][c]
+                        if premium_cell:
+                            prem_type = premium_cell["type"]
+                            prem_used = premium_cell["used"]
                             board.cells[r][c].premium = Premium[prem_type]
                             board.cells[r][c].premium_used = prem_used
             else:
@@ -693,7 +699,7 @@ def tool_validate_word_slovak(
     # ========== Tier 2: JULS Online API with Retry ==========
     if use_online:
         tier2_start = time.time()
-        last_error = None
+        last_error: Exception | None = None
         
         for attempt in range(1, retry_count + 1):
             try:
@@ -1035,7 +1041,7 @@ def tool_validate_move_legality(
 
 def tool_calculate_move_score(
     board_grid: list[str],
-    premium_grid: list[list[dict | None]],
+    premium_grid: list[list[dict[str, Any] | None]],
     placements: list[dict[str, Any]],
 ) -> dict[str, Any]:
     """Calculate total score for a move (extracts words + scores them).
@@ -1106,7 +1112,7 @@ ALL_TOOLS = {
 }
 
 
-def get_tool_function(tool_name: str):
+def get_tool_function(tool_name: str) -> Callable[..., Any]:
     """Get tool function by name.
     
     Args:
@@ -1121,7 +1127,7 @@ def get_tool_function(tool_name: str):
     if tool_name not in ALL_TOOLS:
         raise KeyError(f"Tool not found: {tool_name}")
     
-    return ALL_TOOLS[tool_name]
+    return cast(Callable[..., Any], ALL_TOOLS[tool_name])
 
 
 def get_all_tool_names() -> list[str]:

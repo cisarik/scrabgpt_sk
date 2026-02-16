@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
+from .juls_online import is_word_in_juls
 from .mcp_tools import (
     ALL_TOOLS,
     get_all_tool_names,
     get_tool_function,
-    is_word_in_juls,
     tool_calculate_move_score,
     tool_get_board_state,
     tool_get_premium_squares,

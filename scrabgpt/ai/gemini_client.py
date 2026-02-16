@@ -6,11 +6,13 @@ import time
 from typing import Any, Callable
 
 try:
-    import google.generativeai as genai  # type: ignore
+    import google.generativeai as _genai
     from google.generativeai.types import FunctionDeclaration, Tool, GenerationConfig
 except Exception:  # pragma: no cover - optional dependency
-    genai = None  # type: ignore
+    genai: Any = None
     FunctionDeclaration = Tool = GenerationConfig = None  # type: ignore
+else:
+    genai = _genai
 
 log = logging.getLogger("scrabgpt.ai.gemini")
 
@@ -93,11 +95,8 @@ class GeminiClient:
     def _call_tool(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
         """Dispatch to local Scrabble tools."""
         from .tool_registry import (
-            tool_rules_first_move_must_cover_center,
-            tool_rules_placements_in_line,
-            tool_rules_connected_to_existing,
-            tool_rules_no_gaps_in_line,
-            tool_scoring_score_words,
+            tool_validate_move_legality,
+            tool_calculate_move_score,
             tool_rules_extract_all_words,
         )
         # Simplified mapping to exposed tools
@@ -109,18 +108,13 @@ class GeminiClient:
         if name == "validate_move_legality":
             # Basic combo of rule checks
             placements = args.get("placements", [])
-            checks = {
-                "first_move": tool_rules_first_move_must_cover_center(placements),
-                "line": tool_rules_placements_in_line(placements),
-                "connected": tool_rules_connected_to_existing(
-                    args.get("board_grid", []), placements
-                ),
-                "gaps": tool_rules_no_gaps_in_line(placements),
-            }
-            valid = all(c.get("valid", False) for c in checks.values())
-            return {"valid": valid, "checks": checks, "reason": "ok" if valid else "invalid"}
+            return tool_validate_move_legality(
+                args.get("board_grid", []),
+                placements,
+                bool(args.get("is_first_move", False)),
+            )
         if name == "calculate_move_score":
-            return tool_scoring_score_words(
+            return tool_calculate_move_score(
                 args.get("board_grid", []),
                 args.get("premium_grid", []),
                 args.get("placements", []),

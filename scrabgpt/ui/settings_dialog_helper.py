@@ -1,7 +1,9 @@
 """Helper method for settings dialog - language fetch animation."""
 
+from typing import Any
 
-def update_lang_status_animation(dialog) -> None:
+
+def update_lang_status_animation(dialog: Any) -> None:
     """Update language fetch status with animated dots.
     
     Args:

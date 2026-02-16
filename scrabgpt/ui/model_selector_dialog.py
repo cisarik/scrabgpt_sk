@@ -6,7 +6,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from PySide6.QtCore import QThread, Signal
 from PySide6.QtWidgets import (
@@ -31,7 +31,7 @@ class ModelSelectorDialog(QDialog):
     - Dropdown na výber modelu
     """
     
-    def __init__(self, parent: Optional[QWidget] = None):
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
         """Initialize dialog.
         
         Args:
@@ -40,7 +40,7 @@ class ModelSelectorDialog(QDialog):
         super().__init__(parent)
         
         self.selected_model: Optional[str] = None
-        self.models_data: list[dict] = []
+        self.models_data: list[dict[str, Any]] = []
         
         self.setWindowTitle("Nastavenie AI Modelu")
         self.setModal(True)
@@ -234,7 +234,7 @@ class ModelSelectorDialog(QDialog):
         self.log_text.append(f"<span style='color: #8a9aaa;'>💭 {thought}</span>")
         self.log_text.moveCursor(QTextCursor.MoveOperation.End)
     
-    def _on_models_found(self, models: list[dict]) -> None:
+    def _on_models_found(self, models: list[dict[str, Any]]) -> None:
         """Handle found models."""
         self.models_data = models
         
@@ -281,7 +281,7 @@ class ModelSelectorDialog(QDialog):
             f"Agent narazil na chybu:\n\n{error}"
         )
     
-    def _format_model_display(self, model: dict) -> str:
+    def _format_model_display(self, model: dict[str, Any]) -> str:
         """Format model for display in combo box."""
         name = model.get("id", "unknown")
         
@@ -351,7 +351,7 @@ class ModelSelectorDialog(QDialog):
         # Store selected model
         self.selected_model = model.get("id")
     
-    def _save_models_to_file(self, models: list[dict]) -> None:
+    def _save_models_to_file(self, models: list[dict[str, Any]]) -> None:
         """Save models to openai.models file."""
         try:
             # Get project root
@@ -454,7 +454,7 @@ class AgentWorkerThread(QThread):
             self.log_message.emit("→ Aplikujem váhovaný scoring algoritmus...")
             
             # Filter and score (simplified - just get top models)
-            text_models = agent._filter_text_generation_models(enriched)
+            text_models = agent._filter_models(enriched)
             self.thinking.emit(
                 f"Po filtrovaní zostalo {len(text_models)} vhodných modelov"
             )

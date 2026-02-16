@@ -54,6 +54,11 @@ class ModelScore:
     cost_score: float
     availability_score: float
     reasoning: str
+    tier: str = "unknown"
+    context_window: int = 0
+    max_output_tokens: int = 0
+    input_price: float = 0.0
+    output_price: float = 0.0
 
 
 class ModelSelectorAgent:
@@ -73,7 +78,7 @@ class ModelSelectorAgent:
         criteria: SelectionCriteria = SelectionCriteria.BALANCED,
         exclude_preview: bool = True,
         exclude_legacy: bool = True,
-    ):
+    ) -> None:
         """Initialize the model selector agent.
         
         Args:
@@ -168,6 +173,10 @@ class ModelSelectorAgent:
             ]
         
         return filtered
+
+    def _filter_text_generation_models(self, models: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Backward-compatible alias used by older UI code."""
+        return self._filter_models(models)
     
     def _score_models(self, models: list[dict[str, Any]]) -> list[ModelScore]:
         """Score each model based on criteria (LOGIC).
@@ -195,6 +204,8 @@ class ModelSelectorAgent:
         for model in models:
             model_id = model["id"]
             pricing = model.get("pricing", {})
+            if not isinstance(pricing, dict):
+                pricing = {}
             
             # Performance score (0-100)
             perf_score = self._calculate_performance_score(pricing)
@@ -224,6 +235,11 @@ class ModelSelectorAgent:
                 cost_score=cost_score,
                 availability_score=avail_score,
                 reasoning=reasoning,
+                tier=str(pricing.get("tier", "unknown")),
+                context_window=int(pricing.get("context_window", 0) or 0),
+                max_output_tokens=int(pricing.get("max_output_tokens", 0) or 0),
+                input_price=float(pricing.get("input_price_per_1m", 0.0) or 0.0),
+                output_price=float(pricing.get("output_price_per_1m", 0.0) or 0.0),
             ))
         
         # Sort by total score
@@ -233,9 +249,10 @@ class ModelSelectorAgent:
     
     def _calculate_performance_score(self, pricing: dict[str, Any]) -> float:
         """Calculate performance score based on tier and context window."""
-        tier = pricing.get("tier", "unknown")
-        context_window = pricing.get("context_window", 0)
-        max_output = pricing.get("max_output_tokens", 0)
+        tier_value = pricing.get("tier", "unknown")
+        tier = tier_value if isinstance(tier_value, str) else "unknown"
+        context_window = float(pricing.get("context_window", 0) or 0)
+        max_output = float(pricing.get("max_output_tokens", 0) or 0)
         
         # Tier scoring
         tier_scores = {
@@ -254,15 +271,15 @@ class ModelSelectorAgent:
         # Max output bonus (normalize to 16k)
         output_bonus = min(max_output / 16384 * 10, 10)
         
-        return min(tier_score + context_bonus + output_bonus, 100.0)
+        return float(min(float(tier_score) + context_bonus + output_bonus, 100.0))
     
     def _calculate_cost_score(self, pricing: dict[str, Any]) -> float:
         """Calculate cost score (higher = cheaper).
         
         We use total cost per 1M tokens (input + output assuming 1:1 ratio)
         """
-        input_price = pricing.get("input_price_per_1m", 999.0)
-        output_price = pricing.get("output_price_per_1m", 999.0)
+        input_price = float(pricing.get("input_price_per_1m", 999.0) or 999.0)
+        output_price = float(pricing.get("output_price_per_1m", 999.0) or 999.0)
         
         # Total cost (assuming equal input/output)
         total_cost = (input_price + output_price) / 2
@@ -275,11 +292,10 @@ class ModelSelectorAgent:
         # Inverse scoring: cheaper = higher score
         if total_cost >= max_cost:
             return 0.0
-        elif total_cost <= min_cost:
+        if total_cost <= min_cost:
             return 100.0
-        else:
-            # Linear inverse scale
-            return 100.0 * (1 - (total_cost - min_cost) / (max_cost - min_cost))
+        # Linear inverse scale
+        return float(100.0 * (1 - (total_cost - min_cost) / (max_cost - min_cost)))
     
     def _generate_reasoning(
         self,

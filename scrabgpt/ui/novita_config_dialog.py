@@ -590,13 +590,13 @@ class NovitaConfigDialog(QDialog):
 
         # Select free models up to limit
         for model in free_models[: self.max_selection]:
-            checkbox = self.model_checkboxes.get(model["id"])
-            if checkbox is None:
+            free_checkbox = self.model_checkboxes.get(model["id"])
+            if free_checkbox is None:
                 self._selection_state[model["id"]] = True
                 continue
-            checkbox.blockSignals(True)
-            checkbox.setChecked(True)
-            checkbox.blockSignals(False)
+            free_checkbox.blockSignals(True)
+            free_checkbox.setChecked(True)
+            free_checkbox.blockSignals(False)
             self._selection_state[model["id"]] = True
 
         self._update_cost()

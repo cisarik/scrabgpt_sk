@@ -151,8 +151,8 @@ class VertexClient:
         messages: list[dict[str, Any]] | None = None,
         max_tokens: int | None = None,
         thinking_mode: bool = False,
-        tools: list[types.Tool] | None = None,
-        tool_config: types.ToolConfig | None = None,
+        tools: list[Any] | None = None,
+        tool_config: Any | None = None,
         progress_callback: Callable[[dict[str, Any]], Any] | None = None,
         _fallback_depth: int = 0,
     ) -> dict[str, Any]:
@@ -195,10 +195,11 @@ class VertexClient:
             if tools:
                 # Vertex tools are wrappers; count actual function declarations
                 for t in tools:
-                    if hasattr(t, "function_declarations"):
-                        tool_count += len(t.function_declarations)
-                    else:
-                        tool_count += 1
+                    declarations = getattr(t, "function_declarations", None)
+                    if isinstance(declarations, list):
+                        tool_count += len(declarations)
+                        continue
+                    tool_count += 1
 
             log.info(
                 "[%s] Calling Vertex model %s (max_tokens=%d, thinking=%s, tools=%d)",
@@ -213,7 +214,7 @@ class VertexClient:
             
             try:
                 # Construct contents
-                contents = []
+                contents: list[Any] = []
                 
                 # If messages are provided, convert them
                 if messages:
@@ -225,7 +226,7 @@ class VertexClient:
                 if prompt and not messages:
                     contents.append(types.Content(role="user", parts=[types.Part(text=prompt)]))
                     
-                config_args = {
+                config_args: dict[str, Any] = {
                     "max_output_tokens": resolved_max_tokens,
                     "temperature": 0.7,
                 }
@@ -233,14 +234,14 @@ class VertexClient:
                 if thinking_mode:
                     config_args["thinking_config"] = types.ThinkingConfig(include_thoughts=True)
                     
-                config = types.GenerateContentConfig(**config_args)
+                config: Any = types.GenerateContentConfig(**config_args)
                 
                 if tools:
                     config.tools = tools
                 if tool_config:
                     config.tool_config = tool_config
                 
-                kwargs = {
+                request_kwargs: dict[str, Any] = {
                     "model": model_id,
                     "contents": contents,
                     "config": config
@@ -256,8 +257,8 @@ class VertexClient:
                     
                     # IMPORTANT: Ensure system_instruction is NOT in kwargs, as it was removed
                     # from GenerateContentConfig but generate_content signature might not accept it directly
-                    if "system_instruction" in kwargs:
-                        del kwargs["system_instruction"]
+                    if "system_instruction" in request_kwargs:
+                        del request_kwargs["system_instruction"]
                 
                 # --- Tool Execution Loop ---
                 from .tool_adapter import execute_tool
@@ -268,17 +269,38 @@ class VertexClient:
                     if self._executor_closed:
                         raise RuntimeError("Vertex client executor is closed")
                     loop = asyncio.get_running_loop()
-                    response = await loop.run_in_executor(
+                    response: Any = await loop.run_in_executor(
                         self._executor,
-                        partial(self.client.models.generate_content, **kwargs),
+                        partial(self.client.models.generate_content, **request_kwargs),
                     )
                     
                     # Check for tool calls
-                    tool_calls = []
-                    if response.candidates and response.candidates[0].content.parts:
-                        for part in response.candidates[0].content.parts:
-                            if part.function_call:
-                                tool_calls.append(part.function_call)
+                    tool_calls: list[tuple[str, dict[str, Any]]] = []
+                    candidate_content: Any = None
+                    candidates = getattr(response, "candidates", None)
+                    if isinstance(candidates, list) and candidates:
+                        candidate = candidates[0]
+                        candidate_content = getattr(candidate, "content", None)
+                        parts = getattr(candidate_content, "parts", None)
+                        if isinstance(parts, list):
+                            for part in parts:
+                                function_call = getattr(part, "function_call", None)
+                                if function_call is None:
+                                    continue
+                                tool_name_raw = getattr(function_call, "name", None)
+                                if not isinstance(tool_name_raw, str) or not tool_name_raw:
+                                    continue
+
+                                raw_args = getattr(function_call, "args", None)
+                                args_dict: dict[str, Any] = {}
+                                if isinstance(raw_args, dict):
+                                    args_dict = dict(raw_args)
+                                elif raw_args is not None and hasattr(raw_args, "items"):
+                                    try:
+                                        args_dict = dict(raw_args.items())
+                                    except Exception:
+                                        args_dict = {"raw": str(raw_args)}
+                                tool_calls.append((tool_name_raw, args_dict))
                     
                     if not tool_calls:
                         # No tool calls, we are done
@@ -292,26 +314,16 @@ class VertexClient:
                         try:
                             # Extract args for display
                             tool_calls_data = []
-                            for tc in tool_calls:
-                                args_dict = {}
-                                if tc.args:
-                                    # Convert MapComposite to dict
-                                    try:
-                                        # Depending on SDK version, it might be dict or MapComposite
-                                        if hasattr(tc.args, "items"):
-                                            args_dict = dict(tc.args.items())
-                                        else:
-                                            args_dict = dict(tc.args)
-                                    except Exception:
-                                        args_dict = {"raw": str(tc.args)}
-                                tool_calls_data.append({"name": tc.name, "args": args_dict})
+                            tool_names = [tool_name for tool_name, _ in tool_calls]
+                            for tool_name, args_dict in tool_calls:
+                                tool_calls_data.append({"name": tool_name, "args": args_dict})
 
                             res = progress_callback({
                                 "status": "tool_use",
                                 "model": model_id,
-                                "tool_calls": [tc.name for tc in tool_calls],
+                                "tool_calls": tool_names,
                                 "tool_calls_data": tool_calls_data,
-                                "message": f"🛠️ Volám nástroje: {', '.join(tc.name for tc in tool_calls)}"
+                                "message": f"🛠️ Volám nástroje: {', '.join(tool_names)}"
                             })
                             if inspect.isawaitable(res):
                                 await res
@@ -319,13 +331,14 @@ class VertexClient:
                             log.warning("Progress callback failed in tool loop", exc_info=True)
                     
                     # Append model's response (with tool calls) to history
-                    kwargs["contents"].append(response.candidates[0].content)
+                    if candidate_content is not None:
+                        contents.append(candidate_content)
                     
                     # Execute each tool and append result
-                    tool_outputs = []
-                    for tc in tool_calls:
-                        log.info("[%s] Executing tool: %s", trace_id, tc.name)
-                        result = execute_tool(tc.name, tc.args)
+                    tool_outputs: list[Any] = []
+                    for tool_name, tool_args in tool_calls:
+                        log.info("[%s] Executing tool: %s", trace_id, tool_name)
+                        result = execute_tool(tool_name, tool_args)
                         
                         # Report result via progress callback
                         if progress_callback:
@@ -333,9 +346,9 @@ class VertexClient:
                                 res = progress_callback({
                                     "status": "tool_result",
                                     "model": model_id,
-                                    "tool_name": tc.name,
+                                    "tool_name": tool_name,
                                     "result": result,
-                                    "message": f"✅ Výsledok {tc.name}"
+                                    "message": f"✅ Výsledok {tool_name}"
                                 })
                                 if inspect.isawaitable(res):
                                     await res
@@ -344,14 +357,14 @@ class VertexClient:
                         
                         tool_outputs.append(
                             types.Part.from_function_response(
-                                name=tc.name,
+                                name=tool_name,
                                 response=result
                             )
                         )
                     
                     # Append tool outputs as a single 'user' message (or 'function' role if supported)
                     # For Gemini 2.0, we send back a Content with role='tool' containing the function responses
-                    kwargs["contents"].append(types.Content(role="tool", parts=tool_outputs))
+                    contents.append(types.Content(role="tool", parts=tool_outputs))
                     
                     # Loop continues to send tool outputs back to model
                 
@@ -363,9 +376,9 @@ class VertexClient:
                 if response.text:
                     text_content = response.text
                 
-                usage = response.usage_metadata
-                prompt_tokens = usage.prompt_token_count if usage else 0
-                completion_tokens = usage.candidates_token_count if usage else 0
+                usage = getattr(response, "usage_metadata", None)
+                prompt_tokens = int(getattr(usage, "prompt_token_count", 0) or 0) if usage else 0
+                completion_tokens = int(getattr(usage, "candidates_token_count", 0) or 0) if usage else 0
                 
                 log.info(
                     "[%s] Vertex model %s responded in %.2fs (tokens: %d/%d)",

@@ -14,7 +14,7 @@ import asyncio
 import json
 import logging
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Any, Callable, Optional, cast
 
 from .client import OpenAIClient
 from .variants import LanguageInfo, _LANG_CACHE_PATH, _ensure_variants_dir
@@ -254,7 +254,7 @@ class LanguageAgent:
             "objektom so štruktúrou languages=[...]."
         )
     
-    def _call_openai(self, client: OpenAIClient, prompt: str) -> dict:
+    def _call_openai(self, client: OpenAIClient, prompt: str) -> dict[str, Any]:
         """Call OpenAI API synchronously (to be wrapped in asyncio.to_thread)."""
         schema = {
             "type": "object",
@@ -278,9 +278,9 @@ class LanguageAgent:
             "additionalProperties": False,
         }
         
-        return client._call_json(prompt, schema)
+        return cast(dict[str, Any], client._call_json(prompt, schema))
     
-    def _parse_response(self, data: dict) -> list[LanguageInfo]:
+    def _parse_response(self, data: dict[str, Any]) -> list[LanguageInfo]:
         """Parse OpenAI response into LanguageInfo objects."""
         languages: list[LanguageInfo] = []
         

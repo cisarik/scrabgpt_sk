@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from typing import Any, Optional
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
@@ -21,7 +21,7 @@ class AgentConfigDialog(QDialog):
         self,
         parent: QWidget | None = None,
         *,
-        available_agents: list[dict] | None = None,
+        available_agents: list[dict[str, Any]] | None = None,
         current_agent_name: Optional[str] = None,
     ) -> None:
         """Initialize agent configuration dialog.

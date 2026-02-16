@@ -19,6 +19,7 @@ from PySide6.QtCore import (
     QSize,
     QRect,
     QRectF,
+    QEvent,
     QTimer,
     Signal,
     QObject,
@@ -73,7 +74,6 @@ from ..core.rules import first_move_must_cover_center, connected_to_existing, no
 from ..core.scoring import score_words, apply_premium_consumption
 from ..core.types import Placement, Premium
 from ..ai.client import OpenAIClient
-from ..ai.gemini_client import GeminiClient
 from ..ai.player import (
     propose_move as ai_propose_move,
     should_auto_trigger_ai_opening,
@@ -109,7 +109,6 @@ from ..ai.variants import (
     fetch_supported_languages,
     get_languages_for_ui,
     match_language,
-    persist_variant,
 )
 from ..ai.variant_agent import SummaryResult, VariantBootstrapAgent, VariantBootstrapProgress
 from ..ai.agent_config import discover_agents, get_default_agents_dir
@@ -572,28 +571,20 @@ class SettingsDialog(QDialog):
         dialog = NewVariantDialog(self, self._languages or get_languages_for_ui(), current_lang)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
-        definition = dialog.selected_variant()
-        if definition is None:
-            QMessageBox.warning(self, "Nový variant", "Žiadny variant nebol vybraný.")
+        summary = dialog.selected_summary
+        if summary is None:
+            QMessageBox.warning(self, "Nová sumarizácia", "Žiadna sumarizácia nebola vytvorená.")
             return
-        try:
-            stored = persist_variant(definition)
-        except Exception as exc:  # noqa: BLE001
-            log.exception("persist_variant_failed", exc_info=exc)
-            QMessageBox.critical(self, "Nový variant", f"Ukladanie variantu zlyhalo: {exc}")
-            return
-        self.selected_variant_slug = stored.slug
-        if not match_language(stored.language, self._languages):
-            inferred_code = stored.language_code
-            new_language = LanguageInfo(name=stored.language, code=inferred_code)
+
+        if not match_language(summary.language.name, self._languages):
+            new_language = LanguageInfo(name=summary.language.name, code=summary.language.code)
             self._languages.append(new_language)
             self.languages_combo.addItem(new_language.display_label(), new_language)
-        self._load_installed_variants(select_slug=stored.slug)
-        self._sync_language_with_variant(stored.slug)
+
         QMessageBox.information(
             self,
-            "Nový variant",
-            f"Variant '{stored.display_label}' bol uložený (slug {stored.slug}).",
+            "Nová sumarizácia",
+            f"Sumarizácia pre jazyk '{summary.language.name}' bola uložená do:\n{summary.file_path}",
         )
 
     def test_connection(self) -> None:
@@ -1967,7 +1958,7 @@ class MainWindow(QMainWindow):
         self.status = QStatusBar()
         self.setStatusBar(self.status)
         # Pridať click handler na statusbar - otvorí chat dialog
-        self.status.mousePressEvent = self._on_statusbar_click
+        self.status.installEventFilter(self)
         self.status.messageChanged.connect(self._on_status_message_changed)
         self._chat_status_last_message: str = ""
         self._chat_status_last_ts: float = 0.0
@@ -2158,7 +2149,7 @@ class MainWindow(QMainWindow):
             return "LMStudio agent"
         for agent in self.available_agents:
             name = agent.get("name")
-            if name:
+            if isinstance(name, str) and name.strip():
                 return name
         return "OpenAI Agent"
 
@@ -2326,7 +2317,7 @@ class MainWindow(QMainWindow):
     def _update_env_value(self, key: str, value: str) -> None:
         os.environ[key] = value
         try:
-            from dotenv import set_key as _set_key  # type: ignore
+            from dotenv import set_key as _set_key
             _set_key(ENV_PATH, key, value)
         except Exception:
             self._write_env_value_manually(key, value)
@@ -3937,7 +3928,7 @@ class MainWindow(QMainWindow):
             debug_log: Signal = Signal(str)
             def __init__(
                 self,
-                client: OpenAIClient | GeminiClient,
+                client: OpenAIClient,
                 state_str: str,
                 trace_id: str,
                 variant: VariantDefinition,
@@ -4443,7 +4434,7 @@ class MainWindow(QMainWindow):
         judge_status = f"Rozhodca validuje: {words_str} (navrhol {model_name})"
         self.status.showMessage(judge_status)
 
-    def _validate_ai_move(self, proposal: dict[str, object]) -> Optional[str]:
+    def _validate_ai_move(self, proposal: dict[str, Any]) -> Optional[str]:
         # zakladna validacia schema a rack
         if bool(proposal.get("exchange")):
             exchange_letters = self._normalize_exchange_letters(proposal.get("exchange"))
@@ -4459,17 +4450,23 @@ class MainWindow(QMainWindow):
         try:
             placements_list: list[dict[str, Any]] = cast(list[dict[str, Any]], placements_obj)
             ps: list[Placement] = []
-            for p in placements_list:
-                if not isinstance(p, dict):
+            for placement_dict in placements_list:
+                if not isinstance(placement_dict, dict):
                     return "Placement nie je dict."
-                if "row" not in p or "col" not in p or "letter" not in p:
-                    return f"Placement chýbajú kľúče (row/col/letter): {p}"
-                ps.append(Placement(int(p["row"]), int(p["col"]), str(p["letter"])))
+                if "row" not in placement_dict or "col" not in placement_dict or "letter" not in placement_dict:
+                    return f"Placement chýbajú kľúče (row/col/letter): {placement_dict}"
+                ps.append(
+                    Placement(
+                        int(placement_dict["row"]),
+                        int(placement_dict["col"]),
+                        str(placement_dict["letter"]),
+                    )
+                )
         except (KeyError, ValueError, TypeError) as e:
             return f"Placements nemajú správny tvar: {e}"
         # nesmie prepisovať existujúce písmená
-        for p in ps:
-            if self.board.cells[p.row][p.col].letter:
+        for placement in ps:
+            if self.board.cells[placement.row][placement.col].letter:
                 return "AI sa pokúsila položiť na obsadené pole."
         dir_ = placements_in_line(ps)
         if dir_ is None:
@@ -4495,25 +4492,25 @@ class MainWindow(QMainWindow):
         # mapovaný na 'E'. V takom prípade musíme spotrebovať '?' z racku,
         # nie písmeno 'E'.
         rack_copy = self.ai_rack.copy()
-        for p in ps:
-            consume_as_blank = (p.row, p.col) in blank_map
-            if p.letter == "?" or consume_as_blank:
+        for placement in ps:
+            consume_as_blank = (placement.row, placement.col) in blank_map
+            if placement.letter == "?" or consume_as_blank:
                 if "?" in rack_copy:
                     rack_copy.remove("?")
                 else:
                     return "AI použila viac blankov než má."
             else:
-                if p.letter in rack_copy:
-                    rack_copy.remove(p.letter)
+                if placement.letter in rack_copy:
+                    rack_copy.remove(placement.letter)
                 else:
                     return "AI použila písmeno, ktoré nemá."
         # ak blanky, musia mat mapovanie
-        for p in ps:
-            if p.letter == "?" and (p.row, p.col) not in blank_map:
+        for placement in ps:
+            if placement.letter == "?" and (placement.row, placement.col) not in blank_map:
                 return "AI použila blank bez 'blanks' mapovania."
         return None
 
-    def _on_ai_proposal(self, proposal: dict[str, object]) -> None:
+    def _on_ai_proposal(self, proposal: dict[str, Any]) -> None:
         if getattr(self, "_shutting_down", False):
             log.debug("Ignoring AI proposal during shutdown")
             return
@@ -4523,11 +4520,12 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         log.info("AI navrhla: %s", proposal)
-        usage = proposal.get("_usage") if isinstance(proposal, dict) else None
+        usage = proposal.get("_usage")
         if usage:
             try:
-                prompt_tokens = int(usage.get("prompt_tokens", 0))
-                context_length = int(usage.get("context_length", 0))
+                usage_dict = cast(dict[str, Any], usage)
+                prompt_tokens = int(usage_dict.get("prompt_tokens", 0))
+                context_length = int(usage_dict.get("context_length", 0))
                 if prompt_tokens > 0 and context_length > 0:
                     self.chat_dialog.update_context_usage(prompt_tokens, context_length)
             except Exception:
@@ -4575,9 +4573,14 @@ class MainWindow(QMainWindow):
         placements_obj = proposal.get("placements", [])
         placements_list: list[dict[str, Any]] = cast(list[dict[str, Any]], placements_obj) if isinstance(placements_obj, list) else []
         ps: list[Placement] = []
-        for p in placements_list:
-            if not isinstance(p, dict) or "row" not in p or "col" not in p or "letter" not in p:
-                log.error("Invalid placement dict: %s", p)
+        for placement_dict in placements_list:
+            if (
+                not isinstance(placement_dict, dict)
+                or "row" not in placement_dict
+                or "col" not in placement_dict
+                or "letter" not in placement_dict
+            ):
+                log.error("Invalid placement dict: %s", placement_dict)
                 self._apply_ai_exchange_turn(
                     reason="invalid-placement-dict",
                     requested_exchange=None,
@@ -4588,7 +4591,9 @@ class MainWindow(QMainWindow):
             # Robustness fix: If AI tries to place a letter on an occupied square,
             # and it matches the existing letter, we ignore it (redundant).
             # If it mismatches, we keep it so validation can catch the error.
-            r, c, letter = int(p["row"]), int(p["col"]), str(p["letter"])
+            r = int(placement_dict["row"])
+            c = int(placement_dict["col"])
+            letter = str(placement_dict["letter"])
             existing_letter = self.board.cells[r][c].letter
             if existing_letter and existing_letter == letter:
                 log.info("Ignoring redundant AI placement at (%d, %d) letter=%s", r, c, letter)
@@ -4600,11 +4605,18 @@ class MainWindow(QMainWindow):
         blank_map, _ = self._parse_blank_map(blanks)
         # nastav blank_as; ak AI oznacila v `blanks`, prekonvertuj na '?'
         ps2: list[Placement] = []
-        for p in ps:
-            if (p.row, p.col) in blank_map:
-                ps2.append(Placement(p.row, p.col, "?", blank_as=blank_map[(p.row,p.col)]))
+        for placement in ps:
+            if (placement.row, placement.col) in blank_map:
+                ps2.append(
+                    Placement(
+                        placement.row,
+                        placement.col,
+                        "?",
+                        blank_as=blank_map[(placement.row, placement.col)],
+                    )
+                )
             else:
-                ps2.append(p)
+                ps2.append(placement)
         self.board.place_letters(ps2)
         self._refresh_board_view()
         words_found = extract_all_words(self.board, ps2)
@@ -4982,7 +4994,7 @@ class MainWindow(QMainWindow):
         )
         
         # Connect accepted signal to handle dialog results
-        def on_settings_accepted():
+        def on_settings_accepted() -> None:
             # Get and save opponent mode
             new_mode = dlg.get_selected_mode()
             new_agent = dlg.get_selected_agent_name()
@@ -5258,6 +5270,14 @@ class MainWindow(QMainWindow):
             f"Dostal som tvoju správu: '{message}'. Chat protokol bude funkčný po dokončení integrácie.",
             use_typing_effect=False
         )
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
+        """Open chat when user clicks status bar."""
+        if watched is self.status and event.type() == QEvent.Type.MouseButtonPress:
+            mouse_event = cast(QMouseEvent, event)
+            self._on_statusbar_click(mouse_event)
+            return True
+        return super().eventFilter(watched, event)
     
     def _on_statusbar_click(self, event: QMouseEvent) -> None:
         """Handler pre kliknutie na statusbar - otvorí chat dialog.
@@ -5400,7 +5420,7 @@ class MainWindow(QMainWindow):
         )
         
         # Connect accepted signal to handle dialog results
-        def on_opponent_settings_accepted():
+        def on_opponent_settings_accepted() -> None:
             new_mode = dialog.get_selected_mode()
             new_agent = dialog.get_selected_agent_name()
             new_google_model = dialog.get_selected_google_model()

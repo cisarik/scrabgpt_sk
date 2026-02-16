@@ -9,7 +9,7 @@ NOTE: This is a STUB implementation. Full integration requires:
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, cast
 
 from ..core.board import Board
 from ..core.variant_store import VariantDefinition
@@ -72,7 +72,7 @@ class ToolExecutor:
             result = tool_func(**kwargs)
             
             log.debug("Tool %s executed successfully", tool_name)
-            return result
+            return cast(dict[str, Any], result)
         
         except Exception as e:
             log.exception("Tool %s execution failed: %s", tool_name, e)

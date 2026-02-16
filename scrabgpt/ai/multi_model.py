@@ -143,7 +143,7 @@ async def propose_move_multi_model(
             attempt_count += 1
 
             # Prepare kwargs
-            kwargs = {}
+            kwargs: dict[str, Any] = {}
             sig = inspect.signature(client.call_model)
             if "thinking_mode" in sig.parameters:
                 kwargs["thinking_mode"] = thinking_mode

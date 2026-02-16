@@ -125,7 +125,7 @@ def extract_language_fragments(html_body: str) -> List[LanguageFragment]:
             continue
         seen_tables.add(identity)
 
-        label = anchor.get_text(strip=True) or anchor["href"]
+        label = anchor.get_text(strip=True) or str(anchor.get("href", ""))
         heading = anchor.find_previous(["h2", "h3", "h4"]) or anchor
 
         fragment_soup = BeautifulSoup(
@@ -133,6 +133,8 @@ def extract_language_fragments(html_body: str) -> List[LanguageFragment]:
             "html.parser",
         )
         fragment_body = fragment_soup.body
+        if fragment_body is None:
+            continue
         fragment_body.append(copy.deepcopy(heading))
         fragment_body.append(copy.deepcopy(table))
 

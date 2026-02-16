@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from PySide6.QtCore import Qt, QTimer, QEvent, Signal
+from PySide6.QtCore import Qt, QTimer, QEvent, Signal, QObject
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QTableWidget, QTableWidgetItem,
@@ -127,7 +127,7 @@ class AIModelResultsTable(QWidget):
         else:
             self.table.viewport().setCursor(Qt.CursorShape.ArrowCursor)
 
-    def eventFilter(self, obj, event) -> bool:
+    def eventFilter(self, obj: QObject, event: QEvent) -> bool:
         """Reset cursor when leaving the table viewport."""
         if obj is self.table.viewport() and event.type() == QEvent.Type.Leave:
             self.table.viewport().setCursor(Qt.CursorShape.ArrowCursor)
@@ -266,10 +266,12 @@ class AIModelResultsTable(QWidget):
         words = result.get("words", [])
 
         score_value = result.get("score")
-        try:
-            score_int = int(score_value)
-        except (TypeError, ValueError):
-            score_int = None
+        score_int: int | None = None
+        if isinstance(score_value, (int, float, str)):
+            try:
+                score_int = int(score_value)
+            except (TypeError, ValueError):
+                score_int = None
 
         # Determine styling (dark mode compatible)
         font_bold = False

@@ -7,7 +7,7 @@ import re
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Any, Callable, Sequence
 
 from ..core.assets import get_assets_path
 from ..core.variant_store import slugify
@@ -115,7 +115,7 @@ class VariantBootstrapAgent:
         for idx, fragment in enumerate(fragments, start=1):
             heading = fragment.label
 
-            def _emit(status: str, **kwargs) -> None:
+            def _emit(status: str, **kwargs: Any) -> None:
                 emit(status, language=heading, **kwargs)
 
             result = await self._process_fragment(
@@ -328,7 +328,7 @@ class _SimpleTableParser(HTMLParser):
         self._buffer: list[str] = []
         self._current_row: list[str] | None = None
 
-    def handle_starttag(self, tag: str, attrs) -> None:  # noqa: ANN001
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         tag = tag.lower()
         self._tag_stack.append(tag)
         if tag == "caption":

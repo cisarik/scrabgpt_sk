@@ -9,7 +9,7 @@ This module provides tools for fetching OpenAI model information including:
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, cast
 from datetime import datetime, timedelta
 
 from openai import OpenAI
@@ -47,9 +47,9 @@ def fetch_openai_models(api_key: str | None = None, use_cache: bool = True) -> l
     if use_cache and _cache_timestamp:
         if datetime.now() - _cache_timestamp < _cache_ttl:
             cached_models = _model_cache.get("models")
-            if cached_models:
+            if isinstance(cached_models, list) and cached_models:
                 log.debug("Using cached OpenAI models (%d models)", len(cached_models))
-                return cached_models
+                return cast(list[dict[str, Any]], cached_models)
     
     try:
         client = OpenAI(api_key=api_key)

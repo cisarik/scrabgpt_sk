@@ -170,11 +170,10 @@ class OpenRouterClient:
             except Exception as e:
                 elapsed = time.perf_counter() - start
                 response_data: str | None = None
+                status: int | str = "?"
                 if isinstance(e, httpx.HTTPStatusError):
                     response_data = e.response.text
                     status = e.response.status_code
-                else:
-                    status = "?"
                 log.error(
                     "[%s] Failed to fetch models (status=%s, elapsed=%.2fs): %s",
                     trace_id,

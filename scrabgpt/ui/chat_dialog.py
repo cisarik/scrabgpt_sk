@@ -18,6 +18,7 @@ from typing import Any, Optional
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import (
     QCloseEvent,
+    QShowEvent,
 )
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QLineEdit,
@@ -27,6 +28,17 @@ from PySide6.QtWidgets import (
 from ..ai.lmstudio_utils import get_context_stats
 
 log = logging.getLogger("scrabgpt.ui.chat")
+
+# Qt enum aliases for mypy-friendly typing with PySide6 stubs.
+ALIGN_LEFT = Qt.AlignmentFlag.AlignLeft
+ALIGN_RIGHT = Qt.AlignmentFlag.AlignRight
+ALIGN_TOP = Qt.AlignmentFlag.AlignTop
+ALIGN_CENTER = Qt.AlignmentFlag.AlignCenter
+ALIGN_HCENTER = Qt.AlignmentFlag.AlignHCenter
+SCROLLBAR_ALWAYS_OFF = Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+POINTING_HAND_CURSOR = Qt.CursorShape.PointingHandCursor
+TEXT_SELECTABLE_BY_MOUSE = Qt.TextInteractionFlag.TextSelectableByMouse
+PLAIN_TEXT = Qt.TextFormat.PlainText
 
 
 class ChatBubble(QFrame):
@@ -76,7 +88,7 @@ class ChatBubble(QFrame):
             """
         )
         
-        layout.setAlignment(Qt.AlignRight if self.is_user else Qt.AlignLeft)
+        layout.setAlignment(ALIGN_RIGHT if self.is_user else ALIGN_LEFT)
         self.setMaximumWidth(420)
         
         self.body_container = QWidget()
@@ -139,7 +151,7 @@ class ChatBubble(QFrame):
         self._clear_body()
         label = QLabel(text)
         label.setWordWrap(True)
-        label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        label.setTextInteractionFlags(TEXT_SELECTABLE_BY_MOUSE)
         label.setStyleSheet(self._body_text_style())
         self.body_layout.addWidget(label)
         self.message_label = label
@@ -168,7 +180,7 @@ class ChatBubble(QFrame):
                 bullet_index += 1
                 
                 bullet_label = QLabel("•")
-                bullet_label.setAlignment(Qt.AlignCenter)
+                bullet_label.setAlignment(ALIGN_CENTER)
                 bullet_label.setFixedSize(18, 18)
                 bullet_label.setStyleSheet(
                     f"background: {bullet_color}; border: 1px solid rgba(0,0,0,0.35); "
@@ -178,7 +190,7 @@ class ChatBubble(QFrame):
                 
                 text_label = QLabel(bullet_text or " ")
                 text_label.setWordWrap(True)
-                text_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+                text_label.setTextInteractionFlags(TEXT_SELECTABLE_BY_MOUSE)
                 text_label.setStyleSheet(self._body_text_style())
                 
                 row_layout.addWidget(bullet_label)
@@ -187,7 +199,7 @@ class ChatBubble(QFrame):
             else:
                 para_label = QLabel(line.strip())
                 para_label.setWordWrap(True)
-                para_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+                para_label.setTextInteractionFlags(TEXT_SELECTABLE_BY_MOUSE)
                 para_label.setStyleSheet(self._body_text_style())
                 self.body_layout.addWidget(para_label)
 
@@ -275,7 +287,7 @@ class SectionFeedCard(QFrame):
 
         step_label = QLabel(f"{self._entry_count}.")
         step_label.setFixedWidth(24)
-        step_label.setAlignment(Qt.AlignTop | Qt.AlignRight)
+        step_label.setAlignment(ALIGN_TOP | ALIGN_RIGHT)
         step_label.setStyleSheet(
             f"color: {self._accent}; font-size: 11px; font-weight: 700; font-family: 'Fira Code', 'Consolas';"
         )
@@ -283,7 +295,7 @@ class SectionFeedCard(QFrame):
 
         text_label = QLabel(message)
         text_label.setWordWrap(True)
-        text_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        text_label.setTextInteractionFlags(TEXT_SELECTABLE_BY_MOUSE)
         text_label.setStyleSheet(
             "color: #d6ead8; font-size: 12px; line-height: 1.35; font-family: 'Fira Sans', 'Segoe UI', sans-serif;"
         )
@@ -370,7 +382,7 @@ class ChatDialog(QDialog):
         self.reasoning_text: str = ""
         self.reasoning_spinner_timer: Optional[QTimer] = None
         self._reasoning_spinner_phase = 0
-        self._pending_tool_calls: list[tuple[str, dict | str, str | None]] = []
+        self._pending_tool_calls: list[tuple[str, dict[str, Any] | str, str | None]] = []
         self._last_activity_merge_key: str | None = None
         self._last_activity_bubble: ChatBubble | None = None
         self._last_activity_history_index: int | None = None
@@ -414,7 +426,7 @@ class ChatDialog(QDialog):
         self.context_bar.setRange(0, 100)
         self.context_bar.setValue(0)
         self.context_bar.setTextVisible(True)
-        self.context_bar.setAlignment(Qt.AlignCenter)
+        self.context_bar.setAlignment(ALIGN_CENTER)
         self.context_bar.setStyleSheet("""
             QProgressBar {
                 background: #1a241c;
@@ -441,7 +453,7 @@ class ChatDialog(QDialog):
         # Chat area (scrollable) - tmavé plátno
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setHorizontalScrollBarPolicy(SCROLLBAR_ALWAYS_OFF)
         scroll.setStyleSheet("""
             QScrollArea {
                 background: #0f1812;
@@ -467,7 +479,7 @@ class ChatDialog(QDialog):
         # Chat container
         self.chat_container = QWidget()
         self.chat_layout = QVBoxLayout(self.chat_container)
-        self.chat_layout.setAlignment(Qt.AlignTop)
+        self.chat_layout.setAlignment(ALIGN_TOP)
         self.chat_layout.setSpacing(10)
         self.chat_layout.setContentsMargins(14, 14, 14, 14)
         
@@ -529,7 +541,7 @@ class ChatDialog(QDialog):
         # Close button - minimalistický
         close_btn = QPushButton("✕")
         close_btn.setFixedSize(24, 24)
-        close_btn.setCursor(Qt.PointingHandCursor)
+        close_btn.setCursor(POINTING_HAND_CURSOR)
         close_btn.setStyleSheet("""
             QPushButton {
                 background: transparent;
@@ -589,7 +601,7 @@ class ChatDialog(QDialog):
         # Send button - neónový zelený s hover efektom
         send_btn = QPushButton("Odoslať")
         send_btn.setFixedSize(90, 40)
-        send_btn.setCursor(Qt.PointingHandCursor)
+        send_btn.setCursor(POINTING_HAND_CURSOR)
         send_btn.setStyleSheet("""
             QPushButton {
                 background: #d64b3e;
@@ -645,7 +657,7 @@ class ChatDialog(QDialog):
         """Pridaj user správu do chatu."""
         self._reset_activity_merge_state()
         bubble = ChatBubble(message, is_user=True)
-        self.chat_layout.addWidget(bubble, alignment=Qt.AlignRight)
+        self.chat_layout.addWidget(bubble, alignment=ALIGN_RIGHT)
         self._highlight_bubble(bubble)
         self.chat_history.append(message)
         self._render_context_info()
@@ -660,7 +672,7 @@ class ChatDialog(QDialog):
         if use_typing_effect:
             # Vytvor prázdnu bublinu a postupne naplň
             bubble = ChatBubble("", is_user=False)
-            self.chat_layout.addWidget(bubble, alignment=Qt.AlignLeft)
+            self.chat_layout.addWidget(bubble, alignment=ALIGN_LEFT)
             self._highlight_bubble(bubble)
             self._scroll_to_bottom()
             
@@ -669,7 +681,7 @@ class ChatDialog(QDialog):
         else:
             # Priamy display bez animácie
             bubble = ChatBubble(message, is_user=False)
-            self.chat_layout.addWidget(bubble, alignment=Qt.AlignLeft)
+            self.chat_layout.addWidget(bubble, alignment=ALIGN_LEFT)
             self._highlight_bubble(bubble)
             self._scroll_to_bottom()
         
@@ -686,7 +698,7 @@ class ChatDialog(QDialog):
             "QFrame { background: #2a0e0e; border: 1px solid #ff5c5c; border-radius: 8px; padding: 6px 8px; }"
             "QLabel { color: #ffb3b3; font-size: 13px; font-family: 'Fira Sans', 'Segoe UI', sans-serif; }"
         )
-        self.chat_layout.addWidget(bubble, alignment=Qt.AlignLeft)
+        self.chat_layout.addWidget(bubble, alignment=ALIGN_LEFT)
         self._highlight_bubble(bubble)
         self.chat_history.append(message)
         self._render_context_info()
@@ -741,7 +753,7 @@ class ChatDialog(QDialog):
             "border-radius: 8px; padding: 6px 10px; font-size: 11px; font-weight: 700; "
             "font-family: 'Fira Sans', 'Segoe UI', sans-serif;"
         )
-        self.chat_layout.addWidget(banner, alignment=Qt.AlignHCenter)
+        self.chat_layout.addWidget(banner, alignment=ALIGN_HCENTER)
         self.chat_history.append(f"AI turn {self._turn_index} started")
         self._render_context_info()
         self._scroll_to_bottom()
@@ -889,26 +901,26 @@ class ChatDialog(QDialog):
         
         label = QLabel(text)
         label.setWordWrap(True)
-        label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        label.setTextInteractionFlags(TEXT_SELECTABLE_BY_MOUSE)
         label.setStyleSheet(
             "color: #d7e4d8; background: #0b1410; border: 1px solid #2f5c39; "
             "border-radius: 6px; padding: 8px 10px; font-family: 'Fira Code', 'Consolas'; "
             "font-size: 11px;"
         )
         self.context_snapshot_label = label
-        self.chat_layout.addWidget(label, alignment=Qt.AlignLeft)
+        self.chat_layout.addWidget(label, alignment=ALIGN_LEFT)
 
     def add_debug_message(self, message: str) -> None:
         """Pridá debug/info blok (napr. celý prompt/odpoveď LLM)."""
         label = QLabel(message)
         label.setWordWrap(True)
-        label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        label.setTextInteractionFlags(TEXT_SELECTABLE_BY_MOUSE)
         label.setStyleSheet(
             "color: #9ac7ff; background: #0d1620; border: 1px solid #3a4c63; "
             "border-radius: 6px; padding: 6px 10px; font-family: 'Fira Code', 'Consolas'; "
             "font-size: 11px;"
         )
-        self.chat_layout.addWidget(label, alignment=Qt.AlignLeft)
+        self.chat_layout.addWidget(label, alignment=ALIGN_LEFT)
         self._scroll_to_bottom()
 
     def add_profiling_info(self, title: str, data: dict[str, str]) -> None:
@@ -970,7 +982,7 @@ class ChatDialog(QDialog):
             return word_preview
         return f"{word_preview} @ ({start[0]},{start[1]})"
 
-    def _summarize_tool_args(self, tool_name: str, args: dict | str) -> str:
+    def _summarize_tool_args(self, tool_name: str, args: dict[str, Any] | str) -> str:
         if not isinstance(args, dict):
             return self._short_text(args, 120)
 
@@ -1093,7 +1105,7 @@ class ChatDialog(QDialog):
     def _build_tool_event_message(
         self,
         tool_name: str,
-        args: dict | str,
+        args: dict[str, Any] | str,
         result: Any,
         is_error: bool = False,
         model_name: str | None = None,
@@ -1185,15 +1197,15 @@ class ChatDialog(QDialog):
             words_value = result_dict.get("words")
             words_text = ""
             if isinstance(words_value, list) and words_value:
-                words: list[str] = []
+                scored_words: list[str] = []
                 for item in words_value[:3]:
                     if isinstance(item, dict):
-                        w = item.get("word")
-                        if isinstance(w, str) and w:
-                            words.append(w)
-                if words:
+                        word_text = item.get("word")
+                        if isinstance(word_text, str) and word_text:
+                            scored_words.append(word_text)
+                if scored_words:
                     suffix = "..." if len(words_value) > 3 else ""
-                    words_text = f", slová: {', '.join(words)}{suffix}"
+                    words_text = f", slová: {', '.join(scored_words)}{suffix}"
             merge_key = f"tool:{normalized_tool}:{model_name or '-'}"
             return (
                 f"{model_prefix}🧮 Skóre ({placement_text}): {score} bodov{words_text}",
@@ -1203,19 +1215,19 @@ class ChatDialog(QDialog):
 
         if normalized_tool == "rules_extract_all_words":
             words_value = result_dict.get("words")
-            words: list[str] = []
+            extracted_words: list[str] = []
             if isinstance(words_value, list):
                 for item in words_value[:4]:
                     if isinstance(item, dict):
-                        word = item.get("word")
-                        if isinstance(word, str) and word:
-                            words.append(word)
+                        word_text = item.get("word")
+                        if isinstance(word_text, str) and word_text:
+                            extracted_words.append(word_text)
             placement_text = self._placements_summary(args_dict.get("placements"))
             merge_key = f"tool:{normalized_tool}:{model_name or '-'}"
-            if words:
+            if extracted_words:
                 suffix = "..." if isinstance(words_value, list) and len(words_value) > 4 else ""
                 return (
-                    f"{model_prefix}🔤 Slová z ťahu ({placement_text}): {', '.join(words)}{suffix}",
+                    f"{model_prefix}🔤 Slová z ťahu ({placement_text}): {', '.join(extracted_words)}{suffix}",
                     merge_key,
                     "word_check",
                 )
@@ -1252,7 +1264,13 @@ class ChatDialog(QDialog):
             section,
         )
 
-    def add_tool_call(self, tool_name: str, args: dict | str, *, model_name: str | None = None) -> None:
+    def add_tool_call(
+        self,
+        tool_name: str,
+        args: dict[str, Any] | str,
+        *,
+        model_name: str | None = None,
+    ) -> None:
         """Zobrazí volanie interného nástroja."""
         normalized_tool = self._normalize_tool_name(tool_name)
         if not self._tool_raw_enabled():
@@ -1285,11 +1303,11 @@ class ChatDialog(QDialog):
         arg_str = json.dumps(args, ensure_ascii=False, indent=2) if isinstance(args, dict) else str(args)
         arg_label = QLabel(arg_str)
         # Preserve newlines for JSON pretty print
-        arg_label.setTextFormat(Qt.PlainText)
+        arg_label.setTextFormat(PLAIN_TEXT)
         arg_label.setStyleSheet("color: #d7e4d8; font-family: 'Fira Code', monospace; font-size: 10px; padding-left: 24px;")
         layout.addWidget(arg_label)
         
-        self.chat_layout.addWidget(container, alignment=Qt.AlignLeft)
+        self.chat_layout.addWidget(container, alignment=ALIGN_LEFT)
         self._scroll_to_bottom()
 
     def add_tool_result(
@@ -1303,7 +1321,7 @@ class ChatDialog(QDialog):
         """Zobrazí výsledok volania nástroja."""
         normalized_tool = self._normalize_tool_name(tool_name)
         if not self._tool_raw_enabled():
-            call_args: dict | str = {}
+            call_args: dict[str, Any] | str = {}
             has_call_args = False
             for idx, (pending_name, pending_args, pending_model_name) in enumerate(self._pending_tool_calls):
                 if pending_name != normalized_tool:
@@ -1362,12 +1380,12 @@ class ChatDialog(QDialog):
             res_str = res_str[:2000] + "... (truncated)"
             
         res_label = QLabel(res_str)
-        res_label.setTextFormat(Qt.PlainText)
-        res_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        res_label.setTextFormat(PLAIN_TEXT)
+        res_label.setTextInteractionFlags(TEXT_SELECTABLE_BY_MOUSE)
         res_label.setStyleSheet("color: #d7e4d8; font-family: 'Fira Code', monospace; font-size: 10px; padding-left: 24px;")
         layout.addWidget(res_label)
         
-        self.chat_layout.addWidget(container, alignment=Qt.AlignLeft)
+        self.chat_layout.addWidget(container, alignment=ALIGN_LEFT)
         self._scroll_to_bottom()
 
     def add_agent_activity(
@@ -1439,7 +1457,7 @@ class ChatDialog(QDialog):
                 border: 1px solid #00ff41;
                 border-radius: 6px;
             """)
-            self.chat_layout.addWidget(self.loading_label, alignment=Qt.AlignLeft)
+            self.chat_layout.addWidget(self.loading_label, alignment=ALIGN_LEFT)
         
         self.loading_dots = 0
         
@@ -1537,7 +1555,7 @@ class ChatDialog(QDialog):
         self._hide_loading_animation()
         self.streaming_text = ""
         bubble = ChatBubble("", is_user=False)
-        self.chat_layout.addWidget(bubble, alignment=Qt.AlignLeft)
+        self.chat_layout.addWidget(bubble, alignment=ALIGN_LEFT)
         self._highlight_bubble(bubble)
         self.streaming_bubble = bubble
         self.streaming_label = bubble.set_plain_text("")
@@ -1554,10 +1572,10 @@ class ChatDialog(QDialog):
         )
         bubble.setMinimumWidth(500) # Ensure wide enough for code
         
-        self.chat_layout.addWidget(bubble, alignment=Qt.AlignLeft)
+        self.chat_layout.addWidget(bubble, alignment=ALIGN_LEFT)
         self.reasoning_bubble = bubble
         self.reasoning_label = bubble.set_plain_text("⏳ ")
-        self.reasoning_label.setTextFormat(Qt.PlainText) # Ensure whitespace preserved
+        self.reasoning_label.setTextFormat(PLAIN_TEXT) # Ensure whitespace preserved
         
         # Spinner timer for ⏳ animation
         if self.reasoning_spinner_timer is None:
@@ -1639,7 +1657,7 @@ class ChatDialog(QDialog):
         
         log.debug("Chat dialog hidden")
     
-    def showEvent(self, event) -> None:
+    def showEvent(self, event: QShowEvent) -> None:
         """Auto-focus input field when shown."""
         super().showEvent(event)
         self.input_field.setFocus()

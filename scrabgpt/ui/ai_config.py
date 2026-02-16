@@ -76,6 +76,7 @@ class AIConfigDialog(QDialog):
         self.free_models_label: QLabel | None = None
         self.select_free_btn: QPushButton | None = None
         self._default_shared_tokens = self._clamp_shared_tokens(default_tokens)
+        self._updating_shared_tokens = False
         self.search_edit: QLineEdit | None = None
         self._search_text: str = ""
         self._selection_state: dict[str, bool] = {}
@@ -528,9 +529,10 @@ class AIConfigDialog(QDialog):
             return
 
         for model in models:
-            model_id = model.get("id")
-            if not model_id:
+            candidate_model_id = model.get("id")
+            if not isinstance(candidate_model_id, str) or not candidate_model_id:
                 continue
+            model_id = candidate_model_id
             model_name = model.get("name", model_id)
             display_name = model.get("display_name", model_name)
             context_length = model.get("context_length")
@@ -787,13 +789,13 @@ class AIConfigDialog(QDialog):
             checkbox.blockSignals(False)
 
         for model in free_models[: self.max_selection]:
-            checkbox = self.model_checkboxes.get(model["id"])
-            if checkbox is None:
+            free_checkbox = self.model_checkboxes.get(model["id"])
+            if free_checkbox is None:
                 self._selection_state[model["id"]] = True
                 continue
-            checkbox.blockSignals(True)
-            checkbox.setChecked(True)
-            checkbox.blockSignals(False)
+            free_checkbox.blockSignals(True)
+            free_checkbox.setChecked(True)
+            free_checkbox.blockSignals(False)
             self._selection_state[model["id"]] = True
 
         self._update_cost()

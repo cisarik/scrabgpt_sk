@@ -696,7 +696,7 @@ async def propose_move_chat(
     # Zavolať OpenRouter API s messages (chat protocol)
     response_dict = await openrouter_client.call_model(
         model_id=model_id,
-        messages=messages,
+        messages=cast(list[dict[str, Any]], messages),
         max_tokens=openrouter_client.ai_move_max_output_tokens,
     )
     

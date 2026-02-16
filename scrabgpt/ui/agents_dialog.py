@@ -244,7 +244,9 @@ class AgentActivityWidget(QWidget):
         # Reasoning flash (fade in/out)
         self.reasoning_flash = QLabel("")
         self.reasoning_flash.setWordWrap(True)
-        self.reasoning_flash.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        self.reasoning_flash.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop
+        )
         self.reasoning_flash.setStyleSheet(
             "background: #050805; color: #8cd9a0; border: 1px solid #1f2f23; "
             "border-radius: 6px; padding: 8px; font-family: 'Fira Code', 'Consolas'; "
@@ -375,12 +377,13 @@ class AgentActivityWidget(QWidget):
 
     def _show_reasoning_flash(self, text: str) -> None:
         """Zobraz krátky fade-in/out blok s reasoning obsahom."""
-        if not self._reasoning_effect:
+        effect = self._reasoning_effect
+        if effect is None:
             return
         self.reasoning_flash.setText(text)
-        self._reasoning_effect.setOpacity(0.0)
+        effect.setOpacity(0.0)
         
-        anim = QPropertyAnimation(self._reasoning_effect, b"opacity", self)
+        anim = QPropertyAnimation(effect, b"opacity", self)
         anim.setDuration(220)
         anim.setStartValue(0.0)
         anim.setEndValue(1.0)
@@ -389,7 +392,7 @@ class AgentActivityWidget(QWidget):
         self._reasoning_anim = anim
         
         def _fade_out() -> None:
-            out_anim = QPropertyAnimation(self._reasoning_effect, b"opacity", self)
+            out_anim = QPropertyAnimation(effect, b"opacity", self)
             out_anim.setDuration(350)
             out_anim.setStartValue(1.0)
             out_anim.setEndValue(0.0)
@@ -445,28 +448,44 @@ class AgentActivityWidget(QWidget):
         form = QFormLayout(dialog)
         form.setContentsMargins(12, 12, 12, 12)
         form.setSpacing(10)
+        cfg_map = self.llm_config or {}
+
+        def _cfg_int(key: str, default: int) -> int:
+            raw = cfg_map.get(key, default)
+            if isinstance(raw, bool):
+                return default
+            if isinstance(raw, int):
+                return raw
+            if isinstance(raw, float):
+                return int(raw)
+            if isinstance(raw, str):
+                try:
+                    return int(raw)
+                except ValueError:
+                    return default
+            return default
         
         url_edit = QLineEdit(dialog)
         url_edit.setPlaceholderText("http://127.0.0.1:1234")
         url_edit.setText(
-            str((self.llm_config or {}).get("base_url", "http://127.0.0.1:1234"))
+            str(cfg_map.get("base_url", "http://127.0.0.1:1234"))
         )
         form.addRow("Server URL:", url_edit)
         
         model_edit = QLineEdit(dialog)
         model_edit.setPlaceholderText("gpt-4o-mini")
-        model_edit.setText(str((self.llm_config or {}).get("model", "")))
+        model_edit.setText(str(cfg_map.get("model", "")))
         form.addRow("Model:", model_edit)
         
         max_tokens_spin = QSpinBox(dialog)
         max_tokens_spin.setRange(500, 20000)
-        max_tokens_spin.setValue(int((self.llm_config or {}).get("max_tokens", 4000) or 4000))
+        max_tokens_spin.setValue(_cfg_int("max_tokens", 4000))
         form.addRow("Max tokens:", max_tokens_spin)
         
         timeout_spin = QSpinBox(dialog)
         timeout_spin.setRange(5, 120)
         timeout_spin.setSuffix(" s")
-        timeout_spin.setValue(int((self.llm_config or {}).get("timeout", 30) or 30))
+        timeout_spin.setValue(_cfg_int("timeout", 30))
         form.addRow("Timeout:", timeout_spin)
         
         buttons = QDialogButtonBox(
@@ -477,7 +496,7 @@ class AgentActivityWidget(QWidget):
         buttons.rejected.connect(dialog.reject)
         form.addRow(buttons)
         
-        if dialog.exec() == QDialog.Accepted:
+        if dialog.exec() == QDialog.DialogCode.Accepted:
             try:
                 cfg = normalize_llm_config(
                     url_edit.text(),
