@@ -15,7 +15,7 @@ async def test_generate():
         with open("vertexaccount.json", "r") as f:
             creds = json.load(f)
             project_id = creds.get("project_id", project_id)
-    except:
+    except Exception:
         pass
         
     location = os.getenv("VERTEX_LOCATION", "us-central1")

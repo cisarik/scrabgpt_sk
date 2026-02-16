@@ -13,16 +13,15 @@ from __future__ import annotations
 import logging
 import os
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 
-from PySide6.QtCore import Qt, QTimer, Signal, QSize
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import (
-    QFont, QTextCursor, QCloseEvent, QColor, QPalette, QTextCharFormat,
-    QLinearGradient, QBrush, QPainter,
+    QCloseEvent,
 )
 from PySide6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QTextEdit, QLineEdit,
-    QWidget, QSizePolicy, QScrollArea, QLabel, QFrame, QProgressBar,
+    QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QLineEdit,
+    QWidget, QScrollArea, QLabel, QFrame, QProgressBar,
 )
 
 from ..ai.lmstudio_utils import get_context_stats

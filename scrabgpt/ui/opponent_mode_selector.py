@@ -22,6 +22,7 @@ class OpponentModeSelector(QWidget):
     
     mode_changed = Signal(OpponentMode)
     agent_changed = Signal(str)  # Agent name
+    configure_google_requested = Signal()  # Request to configure Google model
     configure_openrouter_requested = Signal()  # Request to configure OpenRouter models
     configure_novita_requested = Signal()  # Request to configure Novita models
     configure_agent_requested = Signal()  # Request to configure AI agent
@@ -71,7 +72,7 @@ class OpponentModeSelector(QWidget):
         self.button_group = QButtonGroup(self)
         self.button_group.buttonClicked.connect(self._on_mode_changed)
         
-        # Radio buttons for each mode - include Gemini (OpenRouter single-model)
+        # Radio buttons for each mode - include Google/Gemini
         mode_order = [
             OpponentMode.GEMINI,
             OpponentMode.BEST_MODEL,
@@ -191,8 +192,8 @@ class OpponentModeSelector(QWidget):
                 config_btn.clicked.connect(lambda: self.configure_novita_requested.emit())
             elif mode == OpponentMode.AGENT:
                 config_btn.clicked.connect(lambda: self.configure_agent_requested.emit())
-            else:  # GEMINI/OpenRouter single
-                config_btn.clicked.connect(lambda: self.configure_openrouter_requested.emit())
+            else:  # GEMINI/Google
+                config_btn.clicked.connect(lambda: self.configure_google_requested.emit())
             
             desc_layout.addWidget(config_btn)
             

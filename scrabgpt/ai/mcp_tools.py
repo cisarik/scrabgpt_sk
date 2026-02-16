@@ -504,7 +504,7 @@ def tool_get_rack_letters(rack: list[str]) -> dict[str, Any]:
         return {"rack": "", "count": 0, "letters": [], "error": str(e)}
 
 
-def tool_get_premium_squares(board: Board) -> dict[str, Any]:
+def tool_get_premium_squares(board: Board | None = None) -> dict[str, Any]:
     """Get all unused premium squares on board.
     
     Args:
@@ -514,6 +514,9 @@ def tool_get_premium_squares(board: Board) -> dict[str, Any]:
         {premiums: list[{row, col, type, used}]}
     """
     try:
+        if board is None:
+            board = Board(get_premiums_path())
+
         premiums = []
         
         for r in range(BOARD_SIZE):

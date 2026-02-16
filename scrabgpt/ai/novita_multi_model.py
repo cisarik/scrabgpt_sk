@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import re
 from copy import deepcopy
 from dataclasses import asdict
 from typing import Any, Callable, Optional
@@ -21,6 +22,23 @@ from .client import OpenAIClient
 from .parsing_fallbacks import compute_parser_attempts, gpt_fallback_parse
 
 log = logging.getLogger("scrabgpt.ai.novita_multi_model")
+
+
+def _extract_rack_letters(compact_state: str) -> list[str]:
+    """Best-effort rack extraction from compact state."""
+    rack_match = re.search(r"(?:ai_)?rack:\s*(?:\[(.*?)\]|(.*))", compact_state)
+    if not rack_match:
+        return []
+    rack_raw = (rack_match.group(1) or rack_match.group(2) or "").strip()
+    if not rack_raw:
+        return []
+
+    cleaned = rack_raw.replace("'", "").replace('"', "").replace("[", "").replace("]", "")
+    if "," in cleaned:
+        tokens = [token.strip() for token in cleaned.split(",") if token.strip()]
+    else:
+        tokens = [ch for ch in cleaned if not ch.isspace()]
+    return [token for token in tokens if len(token) == 1]
 
 
 async def propose_move_novita_multi_model(
@@ -71,6 +89,16 @@ async def propose_move_novita_multi_model(
                 maybe = progress_callback(payload)
                 if inspect.isawaitable(maybe):
                     await maybe
+            except RuntimeError as cb_err:
+                if "Signal source has been deleted" in str(cb_err):
+                    log.debug("Progress callback ignored for %s: %s", model_id, cb_err)
+                else:
+                    log.warning(
+                        "Progress callback runtime error for model %s: %s",
+                        model_id,
+                        cb_err,
+                        exc_info=True,
+                    )
             except Exception:  # noqa: BLE001
                 log.exception("Progress callback failed for model %s", model_id)
             return payload
@@ -384,13 +412,14 @@ async def propose_move_novita_multi_model(
             summary += f"; +{len(failure_summaries) - 3} more errors"
 
         reason = summary or "No valid move returned by any model"
-        log.warning("No models returned valid moves; forcing pass. Reason=%s", reason)
+        rack_letters = _extract_rack_letters(compact_state)
+        log.warning("No models returned valid moves; fallback to exchange. Reason=%s", reason)
         fallback_move: dict[str, Any] = {
-            "pass": True,
+            "pass": False,
             "placements": [],
             "blanks": {},
             "word": "",
-            "exchange": [],
+            "exchange": rack_letters,
             "reason": reason,
         }
         return fallback_move, all_results

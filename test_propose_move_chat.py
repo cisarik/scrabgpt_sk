@@ -41,8 +41,8 @@ async def _step_first_move():
     variant = load_variant("slovak")
     
     print(f"AI Rack: {ai_rack}")
-    print(f"Model: openai/gpt-4o-mini")
-    print(f"Calling OpenRouter API...")
+    print("Model: openai/gpt-4o-mini")
+    print("Calling OpenRouter API...")
     
     # Call propose_move_chat
     move = await propose_move_chat(
@@ -99,7 +99,7 @@ async def _step_second_move(first_move):
     
     print(f"AI Rack: {ai_rack}")
     print(f"Board after first move: {len([c for r in board.cells for c in r if c.letter])} tiles")
-    print(f"Calling OpenRouter API with DELTA...")
+    print("Calling OpenRouter API with DELTA...")
     
     # Call with is_first_move=False (delta update)
     move = await propose_move_chat(

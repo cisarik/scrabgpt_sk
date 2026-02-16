@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (
     QProgressBar, QFrame, QComboBox, QLineEdit, QInputDialog,
 )
 
-from ..ai.openrouter import OpenRouterClient, calculate_estimated_cost
+from ..ai.openrouter import OpenRouterClient
 from ..core.team_config import TeamConfig, get_team_manager
 
 log = logging.getLogger("scrabgpt.ui")

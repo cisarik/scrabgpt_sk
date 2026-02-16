@@ -7,8 +7,9 @@ import uuid
 import json
 import logging
 import time
-import webbrowser
 import html
+from itertools import permutations
+from copy import deepcopy
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal, Optional, Sequence, cast
@@ -85,32 +86,11 @@ from ..ai.vertex import VertexClient
 from ..ai.multi_model import propose_move_multi_model
 from ..ai.novita import NovitaClient
 from ..ai.novita_multi_model import propose_move_novita_multi_model
+from ..ai.mcp_tools import tool_validate_word_english, tool_validate_word_slovak
 from .agents_dialog import AgentsDialog, AsyncAgentWorker
 from .agent_status_widget import AgentStatusWidget
 from .chat_dialog import ChatDialog
-from ..ai.vertex import VertexClient
 from google.genai import types as vertex_types
-
-class GeminiProbeWorker(QObject):
-    """Background worker to check if Gemini 3.0 Pro is available."""
-    finished = Signal(bool)
-    
-    def run(self) -> None:
-        try:
-            # Use default credentials/location from environment or VertexClient defaults
-            client = VertexClient(timeout_seconds=10)
-            # Try minimal generation to probe availability
-            # We use the underlying google-genai client directly to be sync/fast
-            response = client.client.models.generate_content(
-                model="gemini-3-pro-preview",
-                contents="Hi",
-                config=vertex_types.GenerateContentConfig(max_output_tokens=1)
-            )
-            # If we get here without exception, it exists and we have access
-            self.finished.emit(True)
-        except Exception as e:
-            log.info("Gemini 3 Pro probe failed: %s", e)
-            self.finished.emit(False)
 
 from ..core.state import build_ai_state_dict
 from ..core.rack import consume_rack, restore_rack
@@ -134,6 +114,30 @@ from ..ai.variants import (
 from ..ai.variant_agent import SummaryResult, VariantBootstrapAgent, VariantBootstrapProgress
 from ..ai.agent_config import discover_agents, get_default_agents_dir
 from .model_results import AIModelResultsTable
+
+
+class GeminiProbeWorker(QObject):
+    """Background worker to check if Gemini 3.0 Pro is available."""
+
+    finished = Signal(bool)
+
+    def run(self) -> None:
+        try:
+            # Use default credentials/location from environment or VertexClient defaults
+            client = VertexClient(timeout_seconds=10)
+            # Try minimal generation to probe availability
+            # We use the underlying google-genai client directly to be sync/fast
+            client.client.models.generate_content(
+                model="gemini-3-pro-preview",
+                contents="Hi",
+                config=vertex_types.GenerateContentConfig(max_output_tokens=1),
+            )
+            # If we get here without exception, it exists and we have access
+            self.finished.emit(True)
+        except Exception as e:
+            log.info("Gemini 3 Pro probe failed: %s", e)
+            self.finished.emit(False)
+
 
 ASSETS = str(Path(__file__).parent / ".." / "assets")
 PREMIUMS_PATH = get_premiums_path()
@@ -1998,6 +2002,8 @@ class MainWindow(QMainWindow):
         self._ai_ps2: list[Placement] = []
         # flag jednorazového retry pre AI návrh
         self._ai_retry_used: bool = False
+        # Núdzový lokálny fallback (aby sa neopakoval v jednom AI ťahu).
+        self._ai_local_fallback_used: bool = False
         # pomocné uloženie hlavného slova a anchoru pre retry po judge
         self._ai_last_main_word: str = ""
         self._ai_last_anchor: str = ""
@@ -2006,9 +2012,11 @@ class MainWindow(QMainWindow):
         self._starter_side: StarterSide | None = None
         self._starter_decided: bool = False
         
-        # Default preferovaný model pre Gemini mód
-        # Ak sa podarí detekovať 3.0 Pro, zmení sa na "gemini-3-pro-preview"
-        self._preferred_gemini_model = "gemini-2.5-pro"
+        # Default preferovaný model pre Google/Gemini mód.
+        # Ak používateľ explicitne vyberie model, probe ho neprepíše.
+        env_google_model = (os.getenv("GOOGLE_GEMINI_MODEL") or "").strip()
+        self._preferred_gemini_model = env_google_model or "gemini-2.5-pro"
+        self._google_model_user_selected = bool(env_google_model)
         
         # Spustiť detekciu Gemini 3.0 na pozadí
         self._start_gemini_probe()
@@ -2029,6 +2037,13 @@ class MainWindow(QMainWindow):
     
     def _on_gemini_probe_finished(self, available: bool) -> None:
         """Callback when Gemini probe finishes."""
+        if self._google_model_user_selected:
+            log.info(
+                "Gemini probe ignored: using user-selected model %s",
+                self._preferred_gemini_model,
+            )
+            return
+
         if available:
             log.info("Gemini 3.0 Pro detected! Switching preferred model.")
             self._preferred_gemini_model = "gemini-3-pro-preview"
@@ -2098,7 +2113,7 @@ class MainWindow(QMainWindow):
         # If stratégia je byť na OpenRouter a máme modely, prepnúť na OpenRouter
         if self.selected_ai_models and self.opponent_mode == OpponentMode.GEMINI:
             self.opponent_mode = OpponentMode.GEMINI
-            log.info("Switched opponent mode to Gemini (OpenRouter)")
+            log.info("Switched opponent mode to Google")
         self._refresh_model_results_table()
         self._update_mode_status_label()
 
@@ -2147,6 +2162,19 @@ class MainWindow(QMainWindow):
                 return name
         return "OpenAI Agent"
 
+    def _resolve_google_model_label(self) -> str:
+        """Resolve human-readable label for selected Google/Gemini model."""
+        model_id = (getattr(self, "_preferred_gemini_model", "") or "").strip()
+        if not model_id:
+            model_id = "gemini-2.5-pro"
+        if "3-pro" in model_id:
+            return "Gemini 3 Pro"
+        if "2.5-flash" in model_id:
+            return "Gemini 2.5 Flash"
+        if "2.5-pro" in model_id:
+            return "Gemini 2.5 Pro"
+        return model_id
+
     def _update_mode_status_label(self) -> None:
         """Update mode status label to show current opponent mode and active model/team."""
         mode = self.opponent_mode
@@ -2162,6 +2190,8 @@ class MainWindow(QMainWindow):
             team = self.team_manager.load_active_team_config("novita")
             team_name = team.name if team else "Žiadny team"
             text = f"Novita AI - {team_name}"
+        elif mode == OpponentMode.GEMINI:
+            text = f"Google - {self._resolve_google_model_label()}"
         elif mode == OpponentMode.AGENT:
             agent_name = self._resolve_agent_display_name()
             text = f"Agent - {agent_name}"
@@ -2214,6 +2244,10 @@ class MainWindow(QMainWindow):
             entries.append(
                 _entry(f"openai:{model_name}", f"OpenAI API – {model_name}", 0)
             )
+        elif mode == OpponentMode.GEMINI:
+            model_id = getattr(self, "_preferred_gemini_model", "gemini-2.5-pro")
+            label = self._resolve_google_model_label()
+            entries.append(_entry(f"google:{model_id}", f"Google – {label}", 0))
         elif mode == OpponentMode.AGENT:
             agent_name = self._resolve_agent_display_name()
             entries.append(
@@ -3213,6 +3247,328 @@ class MainWindow(QMainWindow):
         self._consecutive_passes = 0
         self._no_moves_possible = False
 
+    @staticmethod
+    def _normalize_exchange_letters(value: object) -> list[str]:
+        """Normalize AI-provided exchange payload into a list of single-letter strings."""
+        if not isinstance(value, list):
+            return []
+        normalized: list[str] = []
+        for item in value:
+            if not isinstance(item, str):
+                continue
+            letter = item.strip()
+            if len(letter) != 1:
+                continue
+            normalized.append(letter)
+        return normalized
+
+    def _local_word_valid(self, word: str) -> bool:
+        """Best-effort local dictionary validation for fallback move search."""
+        normalized = word.strip().upper()
+        if len(normalized) < 2:
+            return False
+
+        language = (self.variant_language or getattr(self.variant_definition, "language", "")).lower()
+        try:
+            if "slov" in language:
+                result = tool_validate_word_slovak(normalized, use_online=False)
+                return bool(result.get("valid", False))
+            if "eng" in language:
+                result = tool_validate_word_english(normalized, use_online=False)
+                return bool(result.get("valid", False))
+            # Unknown lexicon - don't block fallback on unsupported variants.
+            return True
+        except Exception as exc:  # noqa: BLE001
+            log.debug("Local dictionary validation failed for %s: %s", normalized, exc)
+            return False
+
+    def _all_words_locally_valid(self, words: list[str]) -> bool:
+        for word in words:
+            if not self._local_word_valid(word):
+                return False
+        return True
+
+    @staticmethod
+    def _infer_main_word_from_words(
+        words_found: list[Any], placements: list[Placement]
+    ) -> str:
+        placements_set = {(p.row, p.col) for p in placements}
+        for wf in words_found:
+            coords = {(r, c) for (r, c) in wf.letters}
+            if placements_set.issubset(coords):
+                return str(wf.word)
+        if not words_found:
+            return ""
+        longest = max(words_found, key=lambda wf: len(str(wf.word)))
+        return str(longest.word)
+
+    def _build_move_from_placements(
+        self,
+        placements: list[Placement],
+        words_found: list[Any],
+    ) -> dict[str, Any] | None:
+        direction = placements_in_line(placements)
+        if direction is None:
+            return None
+
+        if direction.name == "ACROSS":
+            ordered = sorted(placements, key=lambda p: (p.row, p.col))
+        else:
+            ordered = sorted(placements, key=lambda p: (p.col, p.row))
+
+        if not ordered:
+            return None
+
+        start = {"row": ordered[0].row, "col": ordered[0].col}
+        payload_placements = [
+            {"row": p.row, "col": p.col, "letter": p.letter}
+            for p in ordered
+        ]
+        main_word = self._infer_main_word_from_words(words_found, ordered)
+        return {
+            "start": start,
+            "direction": direction.name,
+            "placements": payload_placements,
+            "word": main_word,
+            "pass": False,
+            "exchange": [],
+            "reason": "local_low_score_fallback",
+        }
+
+    def _try_local_low_score_move(self) -> dict[str, Any] | None:
+        """Try a fast local fallback move before exchanging tiles.
+
+        Strategy:
+        - Prefer short legal scoring moves validated by local dictionary tools.
+        - Search single-tile hooks first, then two-tile hooks near existing letters.
+        - On empty board, try short rack permutations crossing center.
+        """
+        rack_letters = [ch for ch in self.ai_rack if isinstance(ch, str) and len(ch) == 1 and ch != "?"]
+        if not rack_letters:
+            return None
+
+        board_has_letters = self._has_any_letters()
+        best_score = -1
+        best_move: dict[str, Any] | None = None
+        checked = 0
+        max_candidates = 6000
+
+        def consider(placements: list[Placement]) -> None:
+            nonlocal best_score, best_move, checked
+            if checked >= max_candidates:
+                return
+            checked += 1
+
+            if not placements:
+                return
+
+            for p in placements:
+                if self.board.cells[p.row][p.col].letter:
+                    return
+
+            direction = placements_in_line(placements)
+            if direction is None:
+                return
+            if not no_gaps_in_line(self.board, placements, direction):
+                return
+
+            if board_has_letters:
+                if not connected_to_existing(self.board, placements):
+                    return
+            elif not first_move_must_cover_center(placements):
+                return
+
+            board_snapshot = deepcopy(self.board)
+            board_snapshot.place_letters(placements)
+            words_found = extract_all_words(board_snapshot, placements)
+            words = [wf.word for wf in words_found]
+            if not words:
+                return
+            if not self._all_words_locally_valid(words):
+                return
+
+            words_coords = [(wf.word, wf.letters) for wf in words_found]
+            score, _ = score_words(board_snapshot, placements, words_coords)
+            move = self._build_move_from_placements(placements, words_found)
+            if move is None:
+                return
+
+            if score > best_score:
+                best_score = score
+                best_move = move
+
+        if not board_has_letters:
+            max_len = min(5, len(rack_letters))
+            for length in range(2, max_len + 1):
+                seen_words: set[str] = set()
+                for perm in set(permutations(rack_letters, length)):
+                    word = "".join(perm)
+                    if word in seen_words:
+                        continue
+                    seen_words.add(word)
+                    if not self._local_word_valid(word):
+                        continue
+                    for center_offset in range(length):
+                        start_col = 7 - center_offset
+                        if start_col < 0 or start_col + length > 15:
+                            continue
+                        placements = [
+                            Placement(row=7, col=start_col + idx, letter=letter)
+                            for idx, letter in enumerate(perm)
+                        ]
+                        consider(placements)
+                        if checked >= max_candidates:
+                            break
+                    if checked >= max_candidates:
+                        break
+                if checked >= max_candidates:
+                    break
+            return best_move
+
+        occupied_cells = [
+            (r, c)
+            for r in range(15)
+            for c in range(15)
+            if self.board.cells[r][c].letter
+        ]
+        if not occupied_cells:
+            return None
+
+        anchor_empties: set[tuple[int, int]] = set()
+        for r, c in occupied_cells:
+            for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                rr, cc = r + dr, c + dc
+                if 0 <= rr < 15 and 0 <= cc < 15 and not self.board.cells[rr][cc].letter:
+                    anchor_empties.add((rr, cc))
+
+        for rr, cc in anchor_empties:
+            for letter in rack_letters:
+                consider([Placement(row=rr, col=cc, letter=letter)])
+                if checked >= max_candidates:
+                    break
+            if checked >= max_candidates:
+                break
+
+        if len(rack_letters) >= 2 and checked < max_candidates:
+            pair_segments: set[tuple[tuple[int, int], tuple[int, int]]] = set()
+            for r, c in anchor_empties:
+                for dr, dc in [(0, 1), (1, 0)]:
+                    for step in (-1, 1):
+                        r2, c2 = r + dr * step, c + dc * step
+                        if not (0 <= r2 < 15 and 0 <= c2 < 15):
+                            continue
+                        if self.board.cells[r2][c2].letter:
+                            continue
+                        coords = tuple(sorted(((r, c), (r2, c2))))
+                        pair_segments.add(cast(tuple[tuple[int, int], tuple[int, int]], coords))
+
+            pair_perms = set(permutations(rack_letters, 2))
+            for (r1, c1), (r2, c2) in pair_segments:
+                for l1, l2 in pair_perms:
+                    consider(
+                        [
+                            Placement(row=r1, col=c1, letter=l1),
+                            Placement(row=r2, col=c2, letter=l2),
+                        ]
+                    )
+                    if checked >= max_candidates:
+                        break
+                if checked >= max_candidates:
+                    break
+
+        if best_move:
+            log.info(
+                "[AI] local fallback move selected word=%s score>=? checked=%d",
+                best_move.get("word", "?"),
+                checked,
+            )
+        else:
+            log.info("[AI] local fallback found no legal move (checked=%d)", checked)
+        return best_move
+
+    def _apply_ai_exchange_turn(
+        self,
+        *,
+        reason: str,
+        requested_exchange: object | None = None,
+        status_message: str | None = None,
+    ) -> None:
+        """Fallback for AI failures: exchange tiles instead of passing."""
+        self._stop_status_spinner("judge")
+        self._stop_status_spinner("ai")
+        self._ai_thinking = False
+
+        if not self._ai_local_fallback_used:
+            fallback_move = self._try_local_low_score_move()
+            if fallback_move is not None:
+                self._ai_local_fallback_used = True
+                try:
+                    self.chat_dialog.add_agent_activity(
+                        "AI skúša núdzový lokálny nízkobodový ťah namiesto výmeny."
+                    )
+                except Exception:
+                    pass
+                self._on_ai_proposal(fallback_move)
+                return
+
+        requested = self._normalize_exchange_letters(requested_exchange)
+        rack_copy = self.ai_rack.copy()
+        selected: list[str] = []
+        for letter in requested:
+            if letter in rack_copy:
+                selected.append(letter)
+                rack_copy.remove(letter)
+
+        if not selected:
+            selected = self.ai_rack.copy()
+
+        if self.bag.remaining() < 7:
+            selected = []
+
+        if not selected:
+            # No tiles to exchange - fall back to pass as last resort.
+            self._enable_human_inputs()
+            self.status.showMessage("AI pasuje (výmena nie je možná)")
+            self._register_scoreless_turn("AI")
+            if self._ai_opening_active:
+                self._ai_opening_active = False
+            self._check_endgame()
+            return
+
+        before = "".join(self.ai_rack)
+        drawn = self.bag.exchange(selected)
+        remaining = self.ai_rack.copy()
+        for letter in selected:
+            try:
+                remaining.remove(letter)
+            except ValueError:
+                pass
+        remaining.extend(drawn)
+        self.ai_rack = remaining
+
+        self._enable_human_inputs()
+        self._register_scoreless_turn("AI")
+        message = status_message or "AI mení písmená"
+        self.status.showMessage(message)
+        try:
+            self.chat_dialog.add_agent_activity(message)
+        except Exception:
+            pass
+
+        log.info(
+            "[AI] exchange fallback reason=%s requested=%s exchanged=%s before=%s after=%s drawn=%d",
+            reason,
+            "".join(requested),
+            "".join(selected),
+            before,
+            "".join(self.ai_rack),
+            len(drawn),
+        )
+
+        if self._ai_opening_active:
+            self._ai_opening_active = False
+        self._check_endgame()
+
     def _validate_move(self) -> Optional[str]:
         """Overi pravidla tahu, vrati chybovu spravu alebo None ak je OK."""
         if not self.pending:
@@ -3496,6 +3852,7 @@ class MainWindow(QMainWindow):
         self._start_status_spinner("ai", "Hrá AI", wait_cursor=False)
         # reset flagu pre nový ťah
         self._ai_retry_used = False
+        self._ai_local_fallback_used = False
         # priraď trace_id pre AI ťah
         TRACE_ID_VAR.set(str(uuid.uuid4())[:8])
         log.info("[AI] start turn")
@@ -3562,7 +3919,11 @@ class MainWindow(QMainWindow):
 
                             async def run_novita_multi() -> tuple[dict[str, Any], list[dict[str, Any]]]:
                                 def on_partial(res: dict[str, Any]) -> None:
-                                    self.partial_result.emit(res)
+                                    try:
+                                        self.partial_result.emit(res)
+                                    except RuntimeError:
+                                        # Worker/object can be deleted during shutdown.
+                                        pass
                                 try:
                                     move, results = await propose_move_novita_multi_model(
                                         novita_client,
@@ -3588,7 +3949,11 @@ class MainWindow(QMainWindow):
                             
                             async def run_vertex_multi() -> tuple[dict[str, Any], list[dict[str, Any]]]:
                                 def on_partial(res: dict[str, Any]) -> None:
-                                    self.partial_result.emit(res)
+                                    try:
+                                        self.partial_result.emit(res)
+                                    except RuntimeError:
+                                        # Worker/object can be deleted during shutdown.
+                                        pass
                                 try:
                                     # Reuse propose_move_multi_model but with VertexClient
                                     # VertexClient must implement call_model compatible with OpenRouterClient
@@ -3598,54 +3963,28 @@ class MainWindow(QMainWindow):
                                     
                                     # Pass model_id to inner scope if needed, but we have self.selected_models
                                     current_model_id = self.selected_models[0]["id"] if self.selected_models else "gemini-2.5-pro"
-                                    
-                                    # Start timer thread
-                                    import threading
-                                    stop_timer = threading.Event()
-                                    
-                                    def timer_loop():
-                                        remaining = 120 # 2 minutes
-                                        while remaining > 0 and not stop_timer.is_set():
-                                            msg = f"⏳ Čas na ťah: {remaining}s"
-                                            # Send timer update as a partial result with special status
-                                            on_partial({
-                                                "id": "timer",
-                                                "status": "timer",
-                                                "message": msg,
-                                                "remaining": remaining
-                                            })
-                                            time.sleep(1)
-                                            remaining -= 1
-                                    
-                                    timer_thread = threading.Thread(target=timer_loop, daemon=True)
-                                    # Announce timer start
-                                    on_partial({
-                                        "status": "tool_use",
-                                        "message": "⏱️ Rozhodca spustil časomieru (120s)"
-                                    })
-                                    timer_thread.start()
-                                    
-                                    try:
-                                        # Enable thinking only for models that support it (like 2.5 pro, 3.0 pro)
-                                        # We can assume all models we select here support it for now
-                                        # Or check model ID
-                                        use_thinking = "thinking" in current_model_id or "pro" in current_model_id or "flash" in current_model_id
-                                        
-                                        move, results = await propose_move_multi_model(
-                                            vertex_client, # type: ignore
-                                            self.selected_models,
-                                            self.state_str,
-                                            self.variant,
-                                            self.board,
-                                            self.client,
-                                            progress_callback=on_partial,
-                                            timeout_seconds=self.timeout_seconds,
-                                            thinking_mode=use_thinking,
-                                            tools=tools # Pass tools
-                                        )
-                                    finally:
-                                        stop_timer.set()
-                                        timer_thread.join(timeout=1.0)
+
+                                    # Enable thinking only for models that support it (like 2.5 pro, 3.0 pro)
+                                    # We can assume all models we select here support it for now
+                                    # Or check model ID
+                                    use_thinking = (
+                                        "thinking" in current_model_id
+                                        or "pro" in current_model_id
+                                        or "flash" in current_model_id
+                                    )
+
+                                    move, results = await propose_move_multi_model(
+                                        vertex_client, # type: ignore
+                                        self.selected_models,
+                                        self.state_str,
+                                        self.variant,
+                                        self.board,
+                                        self.client,
+                                        progress_callback=on_partial,
+                                        timeout_seconds=self.timeout_seconds,
+                                        thinking_mode=use_thinking,
+                                        tools=tools # Pass tools
+                                    )
                                 finally:
                                     await vertex_client.close()
                                 return move, results
@@ -3663,7 +4002,11 @@ class MainWindow(QMainWindow):
 
                         async def run_multi() -> tuple[dict[str, Any], list[dict[str, Any]]]:
                             def on_partial(res: dict[str, Any]) -> None:
-                                self.partial_result.emit(res)
+                                try:
+                                    self.partial_result.emit(res)
+                                except RuntimeError:
+                                    # Worker/object can be deleted during shutdown.
+                                    pass
                             try:
                                 move, results = await propose_move_multi_model(
                                     openrouter_client,
@@ -3744,7 +4087,12 @@ class MainWindow(QMainWindow):
             provider_type = "vertex"
             # Dynamically use preferred model
             model_id = getattr(self, "_preferred_gemini_model", "gemini-2.5-pro")
-            display_name = "Gemini 3 Pro" if "3-pro" in model_id else "Gemini 2.5 Pro"
+            if "3-pro" in model_id:
+                display_name = "Gemini 3 Pro"
+            elif "2.5-flash" in model_id:
+                display_name = "Gemini 2.5 Flash"
+            else:
+                display_name = "Gemini 2.5 Pro"
             selected_models = [{"id": model_id, "name": display_name}]
             timeout_seconds = self.ai_move_timeout_seconds
             use_multi = True
@@ -3841,7 +4189,12 @@ class MainWindow(QMainWindow):
         # Update status to show models are being called
         if use_multi and selected_models:
             model_count = len(selected_models)
-            provider_name = "Novita" if provider_type == "novita" else "OpenRouter"
+            if provider_type == "novita":
+                provider_name = "Novita"
+            elif provider_type == "vertex":
+                provider_name = "Google"
+            else:
+                provider_name = "OpenRouter"
             model_names = ", ".join(
                 [m.get("name", m.get("id", "?"))[:20] for m in selected_models[:3]]
             )
@@ -3917,6 +4270,34 @@ class MainWindow(QMainWindow):
         
         # Update table immediately with results
         self.model_results_table.set_results(results)
+
+        if self.opponent_mode == OpponentMode.GEMINI:
+            for entry in results:
+                if entry.get("status") != "ok":
+                    continue
+                fallback_from = entry.get("fallback_from")
+                fallback_to = entry.get("model")
+                if not isinstance(fallback_from, str) or not fallback_from.strip():
+                    continue
+                if not isinstance(fallback_to, str) or not fallback_to.strip():
+                    continue
+                fallback_to = fallback_to.strip()
+                if fallback_to == self._preferred_gemini_model:
+                    continue
+                self._preferred_gemini_model = fallback_to
+                self._google_model_user_selected = True
+                self._update_env_value("GOOGLE_GEMINI_MODEL", fallback_to)
+                self._update_mode_status_label()
+                log.warning(
+                    "Persisting Google fallback model due to unavailable %s -> %s",
+                    fallback_from,
+                    fallback_to,
+                )
+                self.status.showMessage(
+                    f"Google model {fallback_from} nie je dostupný, prepínam na {fallback_to}",
+                    5000,
+                )
+                break
         
         # Store the winning model name for status messages
         # Find the best valid result
@@ -3957,9 +4338,12 @@ class MainWindow(QMainWindow):
     def _validate_ai_move(self, proposal: dict[str, object]) -> Optional[str]:
         # zakladna validacia schema a rack
         if bool(proposal.get("exchange")):
-            return "AI navrhla exchange — odmietame v tomto slici."
+            exchange_letters = self._normalize_exchange_letters(proposal.get("exchange"))
+            if not exchange_letters:
+                return "AI navrhla neplatný exchange formát."
+            return None
         if bool(proposal.get("pass", False)):
-            return None  # pass povoleny
+            return "AI pass nie je povolený."
         placements_obj = proposal.get("placements", [])
         if not isinstance(placements_obj, list) or not placements_obj:
             return "Žiadne placements v návrhu."
@@ -4050,28 +4434,32 @@ class MainWindow(QMainWindow):
             self.chat_dialog.finish_streaming_ai_message()
         except Exception:
             log.debug("Finish streaming skipped")
-        # validacia - bez retry, jednoducho pass pri chybe
-        err = self._validate_ai_move(proposal)
-        if err is not None and not bool(proposal.get("pass", False)):
-            # Neplatný návrh - AI pasuje bez retry
-            model_name = getattr(self, '_current_ai_model', "AI")
-            self.status.showMessage(f"[{model_name}] Neplatný návrh ({err}), AI pasuje")
-            log.warning("AI navrhol neplatný ťah: %s", err)
-            proposal = {"pass": True}
-
+        # If model requests pass or exchange, convert to exchange turn.
         if bool(proposal.get("pass", False)):
-            self._stop_status_spinner("ai")
-            self._ai_thinking = False
-            self._enable_human_inputs()
-            self._register_scoreless_turn("AI")
-            self.status.showMessage("AI pasuje")
-            if self._ai_opening_active:
-                try:
-                    log.info("ai_opening done result=%s", "invalid_retry_pass" if self._ai_retry_used else "pass")
-                except Exception:
-                    pass
-                self._ai_opening_active = False
-            self._check_endgame()
+            self._apply_ai_exchange_turn(
+                reason="model_requested_pass",
+                requested_exchange=proposal.get("exchange"),
+                status_message="AI preskakuje pass a mení písmená",
+            )
+            return
+        if bool(proposal.get("exchange")):
+            self._apply_ai_exchange_turn(
+                reason="model_requested_exchange",
+                requested_exchange=proposal.get("exchange"),
+                status_message="AI mení písmená",
+            )
+            return
+
+        # validacia - pri chybe vynúť exchange namiesto passu
+        err = self._validate_ai_move(proposal)
+        if err is not None:
+            model_name = getattr(self, '_current_ai_model', "AI")
+            log.warning("AI navrhol neplatný ťah: %s", err)
+            self._apply_ai_exchange_turn(
+                reason=f"invalid_move:{err}",
+                requested_exchange=None,
+                status_message=f"[{model_name}] Neplatný návrh ({err}), AI mení písmená",
+            )
             return
 
         # aplikuj navrhnute placements (len docasne) a ziskaj slova
@@ -4082,11 +4470,11 @@ class MainWindow(QMainWindow):
         for p in placements_list:
             if not isinstance(p, dict) or "row" not in p or "col" not in p or "letter" not in p:
                 log.error("Invalid placement dict: %s", p)
-                self.status.showMessage("AI vrátila neplatný placement")
-                self._stop_status_spinner("ai")
-                self._ai_thinking = False
-                self._enable_human_inputs()
-                self._register_scoreless_turn("AI")
+                self._apply_ai_exchange_turn(
+                    reason="invalid-placement-dict",
+                    requested_exchange=None,
+                    status_message="AI vrátila neplatný placement, mení písmená",
+                )
                 return
             
             # Robustness fix: If AI tries to place a letter on an occupied square,
@@ -4178,22 +4566,15 @@ class MainWindow(QMainWindow):
             and not bool(proposal.get("pass", False))
         ):
             # Mismatch = pravdepodobné lepenie na existujúci reťazec
-            # Neplatné - AI pasuje bez retry
+            # Neplatné - fallback to exchange instead of pass
             self.board.clear_letters(ps2)
             self._refresh_board_view()
             log.warning("AI vytvorila neplatné lepené slovo: main=%s anchor=%s", main_word, anchor)
-            self._stop_status_spinner("ai")
-            self._ai_thinking = False
-            self._enable_human_inputs()
-            self.status.showMessage(f"AI vytvorila neplatné lepené slovo '{main_word}' — pasuje")
-            self._register_scoreless_turn("AI")
-            if self._ai_opening_active:
-                try:
-                    log.info("ai_opening done result=invalid_glued_word")
-                except Exception:
-                    pass
-                self._ai_opening_active = False
-            self._check_endgame()
+            self._apply_ai_exchange_turn(
+                reason=f"invalid_glued_word:{main_word}",
+                requested_exchange=None,
+                status_message=f"AI vytvorila neplatné slovo '{main_word}', mení písmená",
+            )
             return
 
         # For retry success, show in table
@@ -4264,23 +4645,16 @@ class MainWindow(QMainWindow):
             self.chat_dialog.update_countdown(0)
         except Exception:
             pass
-        self._stop_status_spinner("ai")
-        self._ai_thinking = False
-        self._enable_human_inputs()
         log.exception("AI navrh zlyhal: %s", e)
-        self.status.showMessage("AI pasuje (chyba)")
         try:
             self.chat_dialog.add_error_message(f"AI chyba: {e}")
         except Exception:
             pass
-        self._register_scoreless_turn("AI")
-        if self._ai_opening_active:
-            try:
-                log.info("ai_opening done result=%s", "invalid_retry_pass" if self._ai_retry_used else "pass")
-            except Exception:
-                pass
-            self._ai_opening_active = False
-        self._check_endgame()
+        self._apply_ai_exchange_turn(
+            reason=f"ai-fail:{e}",
+            requested_exchange=None,
+            status_message="AI chyba, mení písmená",
+        )
 
     def _on_ai_judge_ok(self, resp: dict[str, object]) -> None:
         if getattr(self, "_shutting_down", False):
@@ -4311,14 +4685,14 @@ class MainWindow(QMainWindow):
                     summary_word,
                     summary_reason,
                 )
-            # inak: pass
+            # fallback: exchange instead of pass
             self.board.clear_letters(getattr(self, "_ai_ps2"))
             self._refresh_board_view()
-            self._ai_thinking = False
-            self._enable_human_inputs()
-            self.status.showMessage("AI navrhla neplatné slovo — pass")
-            self._register_scoreless_turn("AI")
-            self._check_endgame()
+            self._apply_ai_exchange_turn(
+                reason="judge-rejected-move",
+                requested_exchange=None,
+                status_message="AI navrhla neplatné slovo, mení písmená",
+            )
             return
         # validne: spocitaj, aplikuj prémie, refill
         words_coords = self._ai_judge_words_coords
@@ -4397,22 +4771,14 @@ class MainWindow(QMainWindow):
         if getattr(self, "_shutting_down", False):
             log.debug("Ignoring AI judge failure during shutdown: %s", e)
             return
-        self._stop_status_spinner("judge")
-        self._stop_status_spinner("ai")
         log.exception("AI judge zlyhal: %s", e)
         self.board.clear_letters(getattr(self, "_ai_ps2", []))
         self._refresh_board_view()
-        self._ai_thinking = False
-        self._enable_human_inputs()
-        self.status.showMessage("AI pasuje (chyba rozhodcu)")
-        self._register_scoreless_turn("AI")
-        if self._ai_opening_active:
-            try:
-                log.info("ai_opening done result=%s", "invalid_retry_pass" if self._ai_retry_used else "pass")
-            except Exception:
-                pass
-            self._ai_opening_active = False
-        self._check_endgame()
+        self._apply_ai_exchange_turn(
+            reason=f"judge-fail:{e}",
+            requested_exchange=None,
+            status_message="AI chyba rozhodcu, mení písmená",
+        )
 
     def _check_endgame(self) -> None:
         if self._game_over:
@@ -4494,6 +4860,7 @@ class MainWindow(QMainWindow):
             # Get and save opponent mode
             new_mode = dlg.get_selected_mode()
             new_agent = dlg.get_selected_agent_name()
+            new_google_model = dlg.get_selected_google_model()
             
             if new_mode != self.opponent_mode or new_agent != self.selected_agent_name:
                 self.opponent_mode = new_mode
@@ -4509,6 +4876,14 @@ class MainWindow(QMainWindow):
                     self.status.showMessage(f"AI Režim: {mode_name} ({new_agent})", 3000)
                 else:
                     self.status.showMessage(f"AI Režim: {mode_name}", 3000)
+
+            if isinstance(new_google_model, str) and new_google_model.strip():
+                model_value = new_google_model.strip()
+                if model_value != self._preferred_gemini_model:
+                    log.info("Updated Google model to %s", model_value)
+                self._preferred_gemini_model = model_value
+                self._google_model_user_selected = True
+                self._update_env_value("GOOGLE_GEMINI_MODEL", model_value)
             
             new_ai_tokens, from_env = self._load_ai_move_max_tokens()
             self.ai_move_max_tokens = new_ai_tokens
@@ -4874,6 +5249,7 @@ class MainWindow(QMainWindow):
         def on_opponent_settings_accepted():
             new_mode = dialog.get_selected_mode()
             new_agent = dialog.get_selected_agent_name()
+            new_google_model = dialog.get_selected_google_model()
             
             log.info("=== Settings Accepted: mode=%s, agent=%s ===", new_mode.value, new_agent)
             
@@ -4884,6 +5260,14 @@ class MainWindow(QMainWindow):
             # Save opponent mode to config
             self.team_manager.save_opponent_mode(new_mode.value)
             log.info("Saved opponent mode to config: %s", new_mode.value)
+
+            if isinstance(new_google_model, str) and new_google_model.strip():
+                model_value = new_google_model.strip()
+                if model_value != self._preferred_gemini_model:
+                    log.info("Updated Google model to %s", model_value)
+                self._preferred_gemini_model = model_value
+                self._google_model_user_selected = True
+                self._update_env_value("GOOGLE_GEMINI_MODEL", model_value)
             
             # Check if any models were configured
             openrouter_models = dialog.get_selected_openrouter_models()

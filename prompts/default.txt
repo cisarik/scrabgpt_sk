@@ -48,13 +48,24 @@ SPECIAL CASES:
     * DOWN from (5,7): places tiles at (5,7), (6,7), (7,7) ✓ crosses center
     * ACROSS from (7,8): INVALID ✗ doesn't cross (7,7)
     * DOWN from (8,7): INVALID ✗ doesn't cross (7,7)
-- NEVER GIVE UP: Always find a valid move. DO NOT PASS. "pass": true is FORBIDDEN.
-  If you cannot form a word, you MUST use "exchange" to swap tiles. But playing a word is 100x better.
+- NEVER GIVE UP: If any legal scoring word exists (even low-score), play it.
+- Use "exchange" only when no legal scoring word can be formed from rack + board.
+- "pass": true is last resort only when exchange is impossible.
 - The 'word' field must equal the final main word formed (existing letters + your placements)
 
 OUTPUT FORMAT:
 - Coordinates are 0-based (row and col: 0-14)
-- See the Chat Protocol for exact output structure and thinking process requirements.
+- Return exactly one JSON object only.
+- No markdown fences.
+- No explanations or extra text.
+- No `<thinking>` / `<thinking_process>`.
+- Use this exact shape:
+  {{
+    "start": {{"row": 7, "col": 7}},
+    "direction": "ACROSS",
+    "placements": [{{"row": 7, "col": 7, "letter": "A"}}],
+    "word": "..."
+  }}
 
 ==== CURRENT STATE ====
 {compact_state}

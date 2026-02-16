@@ -84,7 +84,7 @@ async def main():
         print(f"Status: {result.get('status')}")
         
         if result.get('status') == 'ok':
-            print(f"✓ Model responded successfully")
+            print("✓ Model responded successfully")
             content = result.get('content', '')
             print(f"Content (first 200 chars): {content[:200]}")
             

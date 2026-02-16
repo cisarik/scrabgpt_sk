@@ -195,6 +195,62 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             },
         },
     },
+    "get_premium_squares": {
+        "name": "get_premium_squares",
+        "description": "Get premium squares on board and whether they are already used",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "board": {
+                    "type": ["object", "null"],
+                    "description": "Board instance (optional, null for default premium layout)",
+                }
+            },
+        },
+    },
+    "validate_word_slovak": {
+        "name": "validate_word_slovak",
+        "description": "Validate Slovak word against local dictionary cache and optional online source",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "word": {"type": "string", "minLength": 1},
+                "use_online": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Allow online JULS lookup for long words",
+                },
+                "retry_count": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 5,
+                    "default": 2,
+                },
+                "online_min_length": {
+                    "type": ["integer", "null"],
+                    "minimum": 2,
+                    "maximum": 32,
+                    "default": 7,
+                },
+            },
+            "required": ["word"],
+        },
+    },
+    "validate_word_english": {
+        "name": "validate_word_english",
+        "description": "Validate English word against local TWL/SOWPODS dictionary cache",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "word": {"type": "string", "minLength": 1},
+                "use_online": {
+                    "type": "boolean",
+                    "default": False,
+                },
+            },
+            "required": ["word"],
+        },
+    },
     "validate_move_legality": {
         "name": "validate_move_legality",
         "description": "Validate complete move legality (combines all rule checks)",
@@ -225,5 +281,12 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "required": ["board_grid", "premium_grid", "placements"],
         },
     },
+    "get_validation_stats": {
+        "name": "get_validation_stats",
+        "description": "Get dictionary validation and cache statistics",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+        },
+    },
 }
-

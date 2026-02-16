@@ -15,7 +15,7 @@ from PySide6.QtGui import QIntValidator, QFont, QMouseEvent
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QPushButton,
     QLabel, QTabWidget, QWidget, QMessageBox, QFormLayout,
-    QLineEdit, QCheckBox, QComboBox, QTextEdit, QInputDialog, QSpinBox,
+    QLineEdit, QCheckBox, QComboBox, QTextEdit, QInputDialog, QSpinBox, QDialogButtonBox,
 )
 
 from ..core.opponent_mode import OpponentMode
@@ -112,6 +112,11 @@ class SettingsDialog(QDialog):
         # Store Novita config from nested dialog
         self.selected_novita_models: list[dict[str, Any]] = []
         self.novita_tokens: int = ai_move_max_tokens
+        
+        # Store Google model selection for GEMINI mode
+        self.selected_google_model: str = (
+            os.getenv("GOOGLE_GEMINI_MODEL", "gemini-2.5-pro").strip() or "gemini-2.5-pro"
+        )
         
         # API settings state
         self.selected_variant_slug = get_active_variant_slug()
@@ -272,14 +277,11 @@ class SettingsDialog(QDialog):
         self.mode_selector.set_mode(self.current_mode)
         
         # Connect configuration signals
+        self.mode_selector.configure_google_requested.connect(self._configure_google)
         self.mode_selector.configure_openrouter_requested.connect(self._configure_openrouter)
         self.mode_selector.configure_novita_requested.connect(self._configure_novita)
         self.mode_selector.configure_agent_requested.connect(self._configure_agent)
         self.mode_selector.configure_offline_requested.connect(self._configure_offline)
-        
-        # Disable if game in progress
-        if self.game_in_progress:
-            self.mode_selector.set_enabled(False)
         
         layout.addWidget(self.mode_selector)
         
@@ -328,6 +330,10 @@ class SettingsDialog(QDialog):
         """
         return self.selected_openrouter_models
     
+    def get_selected_novita_models(self) -> list[dict[str, Any]]:
+        """Get selected Novita models (if configured)."""
+        return self.selected_novita_models
+
     def get_openrouter_tokens(self) -> int:
         """Get OpenRouter token limit (if configured).
         
@@ -335,6 +341,53 @@ class SettingsDialog(QDialog):
             Token limit
         """
         return self.openrouter_tokens
+    
+    def get_novita_tokens(self) -> int:
+        """Get Novita token limit (if configured)."""
+        return self.novita_tokens
+    
+    def get_selected_google_model(self) -> str:
+        """Get selected Google Gemini model for GEMINI mode."""
+        return self.selected_google_model
+    
+    def _configure_google(self) -> None:
+        """Open Google Gemini model configuration dialog."""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Google Model")
+        form = QFormLayout(dialog)
+        form.setContentsMargins(12, 12, 12, 12)
+        form.setSpacing(10)
+
+        model_combo = QComboBox(dialog)
+        model_combo.addItem("Gemini 3 Pro", "gemini-3-pro-preview")
+        model_combo.addItem("Gemini 2.5 Pro", "gemini-2.5-pro")
+        model_combo.addItem("Gemini 2.5 Flash", "gemini-2.5-flash")
+        index = model_combo.findData(self.selected_google_model)
+        if index >= 0:
+            model_combo.setCurrentIndex(index)
+        form.addRow("Model:", model_combo)
+
+        info = QLabel(
+            "Vyber model pre Google režim. Ak je model nedostupný pre tvoje Vertex konto,\n"
+            "hra sa pokúsi použiť fallback model."
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet("color: #b6e0bd; font-size: 11px;")
+        form.addRow("", info)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
+            parent=dialog,
+        )
+        form.addRow(buttons)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            selected = model_combo.currentData()
+            if isinstance(selected, str) and selected.strip():
+                self.selected_google_model = selected.strip()
+                log.info("Google model configured: %s", self.selected_google_model)
     
     def _configure_openrouter(self) -> None:
         """Open OpenRouter model configuration dialog."""
@@ -1247,7 +1300,7 @@ SPECIAL CASES:
     * DOWN from (5,7): places tiles at (5,7), (6,7), (7,7) ✓ crosses center
     * ACROSS from (7,8): INVALID ✗ doesn't cross (7,7)
     * DOWN from (8,7): INVALID ✗ doesn't cross (7,7)
-- If no legal move exists: pass (set 'pass': true), but prefer gaining points over passing
+- If no legal word is found, prefer exchange over pass. Avoid "pass": true.
 - The 'word' field must equal the final main word formed (existing letters + your placements)
 
 OUTPUT FORMAT:

@@ -11,7 +11,9 @@ import logging
 import os
 import time
 import inspect
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from functools import partial
 from itertools import count
 from typing import Any, Callable, Iterator
 
@@ -77,6 +79,11 @@ class VertexClient:
         
         self._call_counter = count(1)
         self.ai_move_max_output_tokens = self._resolve_ai_move_max_tokens()
+        self._executor = ThreadPoolExecutor(
+            max_workers=4,
+            thread_name_prefix="vertex-ai",
+        )
+        self._executor_closed = False
 
     @staticmethod
     def _parse_positive_int(value: Any) -> int | None:
@@ -95,6 +102,31 @@ class VertexClient:
         if env_tokens is not None:
             return max(500, min(env_tokens, 20000))
         return 8192  # Higher default for Gemini 1.5/2.0
+
+    @staticmethod
+    def _is_model_unavailable_error(error_text: str) -> bool:
+        lowered = error_text.lower()
+        markers = (
+            "404",
+            "not_found",
+            "not found",
+            "publisher model",
+            "does not have access",
+            "invalid model version",
+        )
+        return any(marker in lowered for marker in markers)
+
+    @classmethod
+    def _fallback_model_for_error(cls, model_id: str, error_text: str) -> str | None:
+        if not cls._is_model_unavailable_error(error_text):
+            return None
+        normalized = model_id.replace("google/", "").strip().lower()
+        chain = {
+            "gemini-3-pro": "gemini-2.5-pro",
+            "gemini-3-pro-preview": "gemini-2.5-pro",
+            "gemini-2.5-pro": "gemini-2.5-flash",
+        }
+        return chain.get(normalized)
     
     def _next_call_id(self, kind: str) -> str:
         """Return a unique identifier for logging scopes."""
@@ -122,6 +154,7 @@ class VertexClient:
         tools: list[types.Tool] | None = None,
         tool_config: types.ToolConfig | None = None,
         progress_callback: Callable[[dict[str, Any]], Any] | None = None,
+        _fallback_depth: int = 0,
     ) -> dict[str, Any]:
         """
         Call the Vertex AI model.
@@ -230,10 +263,14 @@ class VertexClient:
                 from .tool_adapter import execute_tool
                 
                 while True:
-                    # Run blocking call in thread executor
-                    response = await asyncio.to_thread(
-                        self.client.models.generate_content,
-                        **kwargs
+                    # Run blocking call via dedicated executor.
+                    # Avoid asyncio default executor lifecycle issues in nested worker threads.
+                    if self._executor_closed:
+                        raise RuntimeError("Vertex client executor is closed")
+                    loop = asyncio.get_running_loop()
+                    response = await loop.run_in_executor(
+                        self._executor,
+                        partial(self.client.models.generate_content, **kwargs),
                     )
                     
                     # Check for tool calls
@@ -352,6 +389,32 @@ class VertexClient:
                 }
                 
             except Exception as e:
+                fallback_model = None
+                if _fallback_depth < 2:
+                    fallback_model = self._fallback_model_for_error(model_id, str(e))
+                if fallback_model and fallback_model != model_id:
+                    log.warning(
+                        "[%s] Model %s unavailable (%s). Retrying with fallback %s",
+                        trace_id,
+                        model_id,
+                        e,
+                        fallback_model,
+                    )
+                    fallback_result = await self.call_model(
+                        fallback_model,
+                        prompt,
+                        messages=messages,
+                        max_tokens=resolved_max_tokens,
+                        thinking_mode=thinking_mode,
+                        tools=tools,
+                        tool_config=tool_config,
+                        progress_callback=progress_callback,
+                        _fallback_depth=_fallback_depth + 1,
+                    )
+                    if fallback_result.get("status") == "ok":
+                        fallback_result["fallback_from"] = model_id
+                    return fallback_result
+
                 elapsed = time.perf_counter() - start
                 log.error(
                     "[%s] Failed to call Vertex model %s (elapsed=%.2fs): %s",
@@ -373,5 +436,8 @@ class VertexClient:
                 }
     
     async def close(self) -> None:
-        """No-op for sync client, but kept for interface compatibility."""
-        pass
+        """Release resources tied to the client executor."""
+        if self._executor_closed:
+            return
+        self._executor_closed = True
+        self._executor.shutdown(wait=False, cancel_futures=True)

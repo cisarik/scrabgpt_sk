@@ -120,19 +120,6 @@ def test_parse_json_wrapped_in_markdown_block() -> None:
 
 def test_parse_json_with_reasoning_text_before() -> None:
     """Test parsovania JSON keď pred ním je reasoning text (ako na screenshote)"""
-    payload = {
-        "start": {"row": 8, "col": 2},
-        "direction": "ACROSS",
-        "placements": [
-            {"row": 8, "col": 2, "letter": "F"},
-            {"row": 8, "col": 3, "letter": "L"},
-            {"row": 8, "col": 4, "letter": "O"},
-            {"row": 8, "col": 5, "letter": "R"},
-            {"row": 8, "col": 6, "letter": "A"},
-        ],
-        "word": "FLORA",
-    }
-    
     # Simuluj odpoveď ako na screenshote - reasoning text pred JSON blokom
     response = """Let me play ORAL across at row 8, using existing letters if any:
 ORAL at (8,6) going across: O(8,6), R(8,7), A(8,8), L(8,9)

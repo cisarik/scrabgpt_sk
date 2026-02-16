@@ -5,9 +5,10 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import re
 from copy import deepcopy
 from dataclasses import asdict
-from typing import Any, Callable, Optional
+from typing import Any, Callable
 
 from ..core.variant_store import VariantDefinition
 from ..core.board import Board
@@ -24,9 +25,40 @@ from .openrouter import OpenRouterClient
 from .schema import parse_ai_move, to_move_payload
 from .player import _build_prompt
 from .client import OpenAIClient
-from .parsing_fallbacks import compute_parser_attempts, gpt_fallback_parse
 
 log = logging.getLogger("scrabgpt.ai.multi_model")
+
+_RETRY_JSON_CONTRACT = (
+    "Return ONLY one JSON object. No markdown. No explanations. "
+    "No <thinking> tags. Use exactly keys: start, direction, placements, word. "
+    "Example: "
+    '{"start":{"row":7,"col":7},"direction":"ACROSS","placements":[{"row":7,"col":7,"letter":"A"}],"word":"..."}'
+)
+
+_NON_SCORING_RETRY_FEEDBACK = (
+    "You returned exchange/pass too early. "
+    "Try to play ANY legal scoring word, even low points. "
+    "Use dictionary validation tools (validate_word_slovak/validate_word_english) if uncertain. "
+    "Only return exchange when you truly cannot form any legal word."
+)
+
+
+def _extract_rack_letters(compact_state: str) -> list[str]:
+    """Best-effort rack extraction from compact state."""
+    rack_match = re.search(r"(?:ai_)?rack:\s*(?:\[(.*?)\]|(.*))", compact_state)
+    if not rack_match:
+        return []
+    rack_raw = (rack_match.group(1) or rack_match.group(2) or "").strip()
+    if not rack_raw:
+        return []
+
+    cleaned = rack_raw.replace("'", "").replace('"', "").replace("[", "").replace("]", "")
+    if "," in cleaned:
+        tokens = [token.strip() for token in cleaned.split(",") if token.strip()]
+    else:
+        tokens = [ch for ch in cleaned if not ch.isspace()]
+
+    return [token for token in tokens if len(token) == 1]
 
 
 async def propose_move_multi_model(
@@ -49,12 +81,22 @@ async def propose_move_multi_model(
     prompt = _build_prompt(compact_state, variant)
     
     if tools:
-        prompt += "\n\nIMPORTANT: You have access to tools. You MUST use 'get_board_state' to verify the board if needed, OR proceed directly to generating a move. DO NOT ask for permission. DO NOT output conversational text. Output ONLY the JSON move or use a tool. NEVER PASS - always find a valid move."
+        prompt += (
+            "\n\nIMPORTANT: You have access to tools. "
+            "Use dictionary/rules tools to verify candidate moves quickly. "
+            "If any legal word exists, you MUST play it (even low score). "
+            "Exchange is allowed only when no legal word can be formed. "
+            "Pass is last resort only."
+        )
     
     async def call_one_model(model_info: dict[str, Any]) -> dict[str, Any]:
         model_id = model_info["id"]
+        active_model_id = model_id
+        active_model_name = str(model_info.get("name", model_id))
         # Use provided timeout or default, but ensure we have a deadline
         deadline = asyncio.get_event_loop().time() + (timeout_seconds or 60)
+        max_attempts = 3
+        attempt_count = 0
         
         # History for retries
         conversation_history: list[dict[str, Any]] = []
@@ -68,15 +110,26 @@ async def propose_move_multi_model(
                 maybe = progress_callback(payload)
                 if inspect.isawaitable(maybe):
                     await maybe
+            except RuntimeError as cb_err:
+                if "Signal source has been deleted" in str(cb_err):
+                    log.debug("Progress callback ignored for %s: %s", model_id, cb_err)
+                else:
+                    log.warning(
+                        "Progress callback runtime error for model %s: %s",
+                        model_id,
+                        cb_err,
+                        exc_info=True,
+                    )
             except Exception:  # noqa: BLE001
                 log.exception("Progress callback failed for model %s", model_id)
             return payload
 
-        while True:
+        while attempt_count < max_attempts:
             remaining_time = deadline - asyncio.get_event_loop().time()
             if remaining_time <= 0:
                 log.warning("Model %s timeout before call", model_id)
                 break
+            attempt_count += 1
 
             # Prepare kwargs
             kwargs = {}
@@ -106,8 +159,8 @@ async def propose_move_multi_model(
             except asyncio.TimeoutError:
                 log.warning("Model %s timed out", model_id)
                 return await _notify({
-                    "model": model_id,
-                    "model_name": model_info.get("name", model_id),
+                    "model": active_model_id,
+                    "model_name": active_model_name,
                     "status": "timeout",
                     "error": "Timeout during generation",
                     "move": None,
@@ -117,8 +170,8 @@ async def propose_move_multi_model(
             except Exception as e:
                 log.exception("Model %s call failed", model_id)
                 return await _notify({
-                    "model": model_id,
-                    "model_name": model_info.get("name", model_id),
+                    "model": active_model_id,
+                    "model_name": active_model_name,
                     "status": "error",
                     "error": str(e),
                     "move": None,
@@ -127,7 +180,39 @@ async def propose_move_multi_model(
                 })
 
             # Process result
-            raw_content = result.get("content", "")
+            raw_content = str(result.get("content", "") or "")
+            result_model_id = result.get("model")
+            if isinstance(result_model_id, str) and result_model_id.strip():
+                active_model_id = result_model_id.strip()
+            result_model_name = result.get("model_name")
+            if isinstance(result_model_name, str) and result_model_name.strip():
+                active_model_name = result_model_name.strip()
+            elif isinstance(result_model_id, str) and result_model_id.strip():
+                active_model_name = result_model_id.strip()
+
+            call_status = result.get("status")
+            fallback_from = result.get("fallback_from")
+            if isinstance(call_status, str) and call_status != "ok" and not raw_content.strip():
+                error_msg = str(result.get("error") or "Model call failed")
+                log.warning(
+                    "Model %s returned %s before parsing: %s",
+                    active_model_id,
+                    call_status,
+                    error_msg,
+                )
+                payload = {
+                    "model": active_model_id,
+                    "model_name": active_model_name,
+                    "status": call_status,
+                    "error": error_msg,
+                    "move": None,
+                    "score": -1,
+                    "words": [],
+                    "raw_response": raw_content,
+                }
+                if isinstance(fallback_from, str) and fallback_from:
+                    payload["fallback_from"] = fallback_from
+                return await _notify(payload)
             
             # 1. Parse
             parse_error = None
@@ -254,7 +339,20 @@ async def propose_move_multi_model(
                 
             except Exception as e:
                 parse_error = str(e)
-                log.warning("Parse/Board error for %s: %s", model_id, e)
+                log.warning("Parse/Board error for %s: %s", active_model_id, e)
+
+            # Force retries for non-scoring decisions before giving up.
+            if not parse_error and move:
+                has_exchange = bool(move.get("exchange"))
+                wants_pass = bool(move.get("pass"))
+                if (has_exchange or wants_pass) and attempt_count < max_attempts:
+                    parse_error = _NON_SCORING_RETRY_FEEDBACK
+                    log.info(
+                        "Model %s requested non-scoring move at attempt %d/%d; retrying",
+                        active_model_id,
+                        attempt_count,
+                        max_attempts,
+                    )
 
             # 2. Judge Validation (if parsed successfully)
             judge_valid = False
@@ -291,9 +389,9 @@ async def propose_move_multi_model(
                     score = 0
                     breakdowns = []
 
-                return await _notify({
-                    "model": model_id,
-                    "model_name": model_info.get("name", model_id),
+                payload = {
+                    "model": active_model_id,
+                    "model_name": active_model_name,
                     "status": "ok",
                     "move": move,
                     "score": score,
@@ -301,7 +399,10 @@ async def propose_move_multi_model(
                     "judge_valid": True,
                     "raw_response": raw_content,
                     "score_breakdown": breakdowns,
-                })
+                }
+                if isinstance(fallback_from, str) and fallback_from:
+                    payload["fallback_from"] = fallback_from
+                return await _notify(payload)
             
             # Failure - Prepare retry
             remaining_time = deadline - asyncio.get_event_loop().time()
@@ -312,19 +413,40 @@ async def propose_move_multi_model(
             # Construct feedback
             feedback = ""
             if parse_error:
-                feedback = f"Your response was invalid JSON or structurally incorrect: {parse_error}. Please correct it."
+                feedback = (
+                    "Previous response failed parsing/structure checks: "
+                    f"{parse_error}. Fix it now. {_RETRY_JSON_CONTRACT}"
+                )
             elif not judge_valid:
-                feedback = f"Your move '{move.get('word', '?')}' is invalid according to the rules/dictionary: {judge_reason}. Try again with a valid word."
+                feedback = (
+                    "Previous move was invalid by rules/dictionary: "
+                    f"{judge_reason}. Regenerate a legal move now. "
+                    f"{_RETRY_JSON_CONTRACT}"
+                )
             
-            log.info("Retrying %s due to: %s", model_id, feedback)
+            log.info(
+                "Retrying %s (attempt %d/%d) due to: %s",
+                active_model_id,
+                attempt_count,
+                max_attempts,
+                feedback,
+            )
             
             # Update history
-            if not conversation_history:
-                # First retry: add the initial assistant response
+            # Keep assistant response only if it actually resembles JSON.
+            # This avoids polluting the context with plain-text parser feedback echoes.
+            raw_candidate = raw_content.strip()
+            if (
+                raw_candidate
+                and "{" in raw_candidate
+                and "}" in raw_candidate
+            ):
                 conversation_history.append({"role": "assistant", "content": raw_content})
             else:
-                # Subsequent retries: append assistant response
-                conversation_history.append({"role": "assistant", "content": raw_content})
+                log.debug(
+                    "Skipping non-JSON assistant content in retry history for %s",
+                    active_model_id,
+                )
             
             # Append user feedback
             conversation_history.append({"role": "user", "content": feedback})
@@ -332,17 +454,20 @@ async def propose_move_multi_model(
             # Notify UI about retry
             await _notify({
                 "status": "retry",
-                "model": model_id,
+                "model": active_model_id,
+                "model_name": active_model_name,
                 "error": feedback,
-                "remaining": int(remaining_time)
+                "remaining": int(remaining_time),
+                "attempt": attempt_count,
+                "max_attempts": max_attempts,
             })
 
         # Loop finished (timeout or give up) -> Return last error result
         return await _notify({
-            "model": model_id,
-            "model_name": model_info.get("name", model_id),
+            "model": active_model_id,
+            "model_name": active_model_name,
             "status": "error",
-            "error": "Failed to find valid move after retries",
+            "error": f"Failed to find valid move after {attempt_count} attempts",
             "move": None,
             "score": -1,
             "words": [],
@@ -363,13 +488,14 @@ async def propose_move_multi_model(
     valid_results = [r for r in all_results if r.get("status") == "ok"]
     
     if not valid_results:
-         return (
+        rack_letters = _extract_rack_letters(compact_state)
+        return (
             {
-                "pass": True,
-                "exchange": [],
+                "pass": False,
+                "exchange": rack_letters,
                 "placements": [],
                 "word": "",
-                "reason": "No models returned valid moves",
+                "reason": "No models returned valid moves; fallback to exchange",
             },
             all_results,
         )

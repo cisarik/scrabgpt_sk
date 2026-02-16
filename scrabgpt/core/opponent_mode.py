@@ -13,7 +13,7 @@ class OpponentMode(Enum):
     - BEST_MODEL: Uses OpenAI's best available model (auto-fetched)
     - OPENROUTER: Multi-model competition via OpenRouter
     - NOVITA: Multi-model competition via Novita (reasoning models)
-    - GEMINI: OpenRouter Gemini 3 Pro (streaming + reasoning)
+    - GEMINI: Google Gemini model via Vertex AI (streaming + reasoning)
 """
     
     AGENT = "agent"
@@ -30,7 +30,7 @@ class OpponentMode(Enum):
             OpponentMode.BEST_MODEL: "OpenAI",
             OpponentMode.OPENROUTER: "OpenRouter",
             OpponentMode.NOVITA: "Novita AI",
-            OpponentMode.GEMINI: "Gemini (OpenRouter)",
+            OpponentMode.GEMINI: "Google",
         }
         return names[self]
     
@@ -45,7 +45,7 @@ class OpponentMode(Enum):
             OpponentMode.BEST_MODEL: "Hrať oproti najlepšiemu <GPT5> modelu",
             OpponentMode.OPENROUTER: "Paralelné volanie modelov ktoré vybraté na hru.",
             OpponentMode.NOVITA: "Paralelné volanie reasoning modelov (DeepSeek, Qwen, GLM, LLaMA).",
-            OpponentMode.GEMINI: "Gemini 3 Pro cez Google Vertex AI (reasoning + stream).",
+            OpponentMode.GEMINI: "Gemini model cez Google Vertex AI (reasoning + stream).",
         }
         return descriptions[self]
     

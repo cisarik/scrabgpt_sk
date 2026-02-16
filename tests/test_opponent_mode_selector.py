@@ -88,20 +88,20 @@ class TestOpponentModeSelector:
 
         assert selector.get_selected_agent_name() == "Minimal"
 
-    def test_offline_mode_is_disabled(self, qapp, sample_agents: list[dict]) -> None:
+    def test_all_modes_are_present(self, qapp, sample_agents: list[dict]) -> None:
         """Given: Selector created
-        When: Checking OFFLINE mode button
-        Then: Button is disabled
+        When: Reading all radio modes
+        Then: All defined OpponentMode values are represented
         """
         from scrabgpt.ui.opponent_mode_selector import OpponentModeSelector
 
         selector = OpponentModeSelector(available_agents=sample_agents)
-
-        # Find OFFLINE button
-        for button in selector.button_group.buttons():
-            mode = button.property("mode")
-            if mode == OpponentMode.OFFLINE:
-                assert not button.isEnabled()
+        button_modes = {button.property("mode") for button in selector.button_group.buttons()}
+        assert OpponentMode.GEMINI in button_modes
+        assert OpponentMode.BEST_MODEL in button_modes
+        assert OpponentMode.OPENROUTER in button_modes
+        assert OpponentMode.NOVITA in button_modes
+        assert OpponentMode.AGENT in button_modes
 
     def test_emits_signal_on_mode_change(self, qapp, sample_agents: list[dict]) -> None:
         """Given: Selector with mode
@@ -168,7 +168,7 @@ class TestSettingsDialog:
     ) -> None:
         """Given: Settings dialog with game_in_progress=True
         When: Dialog is shown
-        Then: Warning message is visible
+        Then: Mode selector remains enabled (changes apply next game)
         """
         from scrabgpt.ui.settings_dialog import SettingsDialog
 
@@ -178,8 +178,7 @@ class TestSettingsDialog:
             game_in_progress=True,
         )
 
-        # Check that mode selector is disabled
-        assert not dialog.mode_selector.button_group.buttons()[0].isEnabled()
+        assert dialog.mode_selector.button_group.buttons()[0].isEnabled()
 
     def test_validates_agent_selection_for_agent_mode(
         self, qapp, sample_agents: list[dict]

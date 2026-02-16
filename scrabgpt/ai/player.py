@@ -415,6 +415,26 @@ def _format_tile_summary(variant: VariantDefinition) -> str:
     return ", ".join(entries)
 
 
+def _strict_output_contract(language: str) -> str:
+    """Return mandatory output contract appended to every move prompt."""
+    return (
+        "=== STRICT OUTPUT CONTRACT ===\n"
+        "- Final textual output must be exactly one JSON object.\n"
+        "- No markdown fences, no prose, no extra keys.\n"
+        "- No <thinking>, no <thinking_process>, no XML/HTML tags.\n"
+        "- First character must be '{' and last character must be '}'.\n"
+        f"- All created words must be valid in {language}.\n"
+        "- Do NOT output pass=true.\n"
+        "- JSON must have exactly this structure:\n"
+        "{\n"
+        '  "start": {"row": 7, "col": 7},\n'
+        '  "direction": "ACROSS",\n'
+        '  "placements": [{"row": 7, "col": 7, "letter": "A"}],\n'
+        '  "word": "..."'
+        "\n}"
+    )
+
+
 def _build_prompt(compact_state: str, variant: VariantDefinition) -> str:
     """Zostaví prompt pre AI hráča načítaním šablóny zo súboru.
     
@@ -506,8 +526,9 @@ def _build_prompt(compact_state: str, variant: VariantDefinition) -> str:
         premium_legend=premium_legend or "",
         rack=rack_str,
     )
-    
-    return prompt
+
+    # Always enforce strict JSON-only output even with custom prompt templates.
+    return f"{prompt}\n\n{_strict_output_contract(language)}"
 
 
 def propose_move(
@@ -684,9 +705,9 @@ async def propose_move_chat(
         error = response_dict.get("error", "Unknown error")
         log.error("OpenRouter call failed: %s", error)
         return {
-            "pass": True,
+            "pass": False,
             "error": error,
-            "exchange": [],
+            "exchange": ai_rack.copy(),
         }
     
     # Extrahovať content
@@ -694,9 +715,9 @@ async def propose_move_chat(
     if not content or not content.strip():
         log.error("OpenRouter returned empty content")
         return {
-            "pass": True,
+            "pass": False,
             "error": "Empty response from model",
-            "exchange": [],
+            "exchange": ai_rack.copy(),
         }
     
     # Parsovať JSON odpoveď
@@ -707,9 +728,9 @@ async def propose_move_chat(
         log.exception("Failed to parse OpenRouter response: %s", e)
         log.error("Raw content: %s", content)
         return {
-            "pass": True,
+            "pass": False,
             "error": f"Parse error: {e}",
-            "exchange": [],
+            "exchange": ai_rack.copy(),
         }
     
     # Zapamätať odpoveď do context session
