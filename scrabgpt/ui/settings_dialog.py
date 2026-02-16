@@ -404,7 +404,7 @@ class SettingsDialog(QDialog):
                 )
 
     def _configure_offline(self) -> None:
-        """Open dialog to configure offline LLM (LMStudio/LLMStudio + MCP)."""
+        """Open dialog to configure offline LLM (LMStudio/LLMStudio)."""
         dialog = QDialog(self)
         dialog.setWindowTitle("Offline LLM (LMStudio)")
         form = QFormLayout(dialog)
@@ -436,11 +436,6 @@ class SettingsDialog(QDialog):
         timeout.setValue(int(os.getenv("AI_MOVE_TIMEOUT_SECONDS", "30") or 30))
         form.addRow("Timeout:", timeout)
         
-        mcp_url = QLineEdit(dialog)
-        mcp_url.setPlaceholderText("http://127.0.0.1:1234")
-        mcp_url.setText(os.getenv("SCRABBLE_MCP_SERVER_URL", "http://127.0.0.1:1234"))
-        form.addRow("MCP server URL:", mcp_url)
-        
         buttons_layout = QHBoxLayout()
         save_btn = QPushButton("Uložiť", dialog)
         cancel_btn = QPushButton("Zrušiť", dialog)
@@ -456,13 +451,11 @@ class SettingsDialog(QDialog):
                 return
             tokens_val = str(tokens.value())
             timeout_val = str(timeout.value())
-            mcp_val = mcp_url.text().strip() or "http://127.0.0.1:1234"
             
             os.environ["OPENAI_BASE_URL"] = url_val
             os.environ["OPENAI_MODEL"] = model_val
             os.environ["AI_MOVE_MAX_OUTPUT_TOKENS"] = tokens_val
             os.environ["AI_MOVE_TIMEOUT_SECONDS"] = timeout_val
-            os.environ["SCRABBLE_MCP_SERVER_URL"] = mcp_val
             
             try:
                 from dotenv import set_key as _set_key
@@ -470,7 +463,6 @@ class SettingsDialog(QDialog):
                 _set_key(ENV_PATH, "OPENAI_MODEL", model_val)
                 _set_key(ENV_PATH, "AI_MOVE_MAX_OUTPUT_TOKENS", tokens_val)
                 _set_key(ENV_PATH, "AI_MOVE_TIMEOUT_SECONDS", timeout_val)
-                _set_key(ENV_PATH, "SCRABBLE_MCP_SERVER_URL", mcp_val)
             except Exception:
                 pass
             

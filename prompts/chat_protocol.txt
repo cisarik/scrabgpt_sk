@@ -1,4 +1,4 @@
-Hráš Scrabble v jazyku {language}. Používaj MCP tools na validáciu ťahov a slov.
+Hráš Scrabble v jazyku {language}. Používaj interné validačné nástroje na overenie ťahov a slov.
 
 === PRAVIDLÁ ===
 - Prvý ťah musí pokrývať stred dosky (7,7)
@@ -20,7 +20,7 @@ $ = TL (Triple Letter - písmeno ×3)
 
 Prémiá sa uplatňujú len pri prvom použití políčka. Už použité prémiá sa neuvádzajú.
  
-=== DOSTUPNÉ MCP TOOLS ===
+=== DOSTUPNÉ NÁSTROJE ===
 
 Máš prístup k validačným nástrojom. Použi ich na overenie svojho ťahu pred odpoveďou.
 

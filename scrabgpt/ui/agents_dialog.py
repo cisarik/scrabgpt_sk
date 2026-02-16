@@ -1,8 +1,4 @@
-"""Agents Activity Dialog - Shows agent thinking, status, and responses.
-
-This dialog provides visibility into agent operations without exposing MCP
-terminology to end users. Each agent gets its own tab showing real-time activity.
-"""
+"""Agents Activity Dialog - Shows agent thinking, status, and responses."""
 
 from __future__ import annotations
 
@@ -60,11 +56,6 @@ def load_env_llm_defaults() -> dict[str, object] | None:
         "max_tokens": max(500, min(20000, _to_int(max_tokens_env) or 4000)),
         "timeout": max(5, min(120, _to_int(timeout_env) or 30)),
     }
-
-
-def load_env_mcp_server() -> str:
-    """Načítaj URL MCP servera zo .env alebo vráť default localhost."""
-    return os.getenv("SCRABBLE_MCP_SERVER_URL", "http://127.0.0.1:1234")
 
 
 def normalize_llm_config(
@@ -176,12 +167,10 @@ class AgentActivityWidget(QWidget):
         agent_name: str,
         parent: QWidget | None = None,
         default_llm_config: dict[str, object] | None = None,
-        default_mcp_url: str | None = None,
     ) -> None:
         super().__init__(parent)
         self.agent_name = agent_name
         self.llm_config: dict[str, object] | None = default_llm_config
-        self.default_mcp_url = default_mcp_url or load_env_mcp_server()
         self._reasoning_anim: QPropertyAnimation | None = None
         self._reasoning_effect: QGraphicsOpacityEffect | None = None
         self._setup_ui()
@@ -319,11 +308,6 @@ class AgentActivityWidget(QWidget):
         if self.llm_config:
             self.set_llm_config(self.llm_config)
         
-        # Auto MCP info
-        if self.default_mcp_url:
-            self.append_status(f"Auto-pripojené MCP: {self.default_mcp_url}")
-            self.context_label.setText("Context: MCP ready")
-
     def set_status(self, status: str, is_working: bool = False) -> None:
         """Update status label and progress bar."""
         self.status_label.setText(status)
@@ -644,7 +628,6 @@ class AgentsDialog(QDialog):
             agent_name,
             parent=self,
             default_llm_config=self.default_llm_config,
-            default_mcp_url=self.default_mcp_url,
         )
         self.agent_tabs[agent_name] = widget
         

@@ -81,7 +81,7 @@ ScrabGPT features a sophisticated async agent system for background operations:
 - Can be closed anytime - agents continue in background
 
 #### Language Agent (`scrabgpt/ai/language_agent.py`)
-- Async/await MCP pattern implementation
+- Async/await pattern implementation
 - Fetches supported languages from OpenAI API
 - Uses `asyncio.to_thread()` for blocking operations
 - Progress callbacks at each step

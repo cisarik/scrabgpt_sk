@@ -685,7 +685,7 @@ class ChatDialog(QDialog):
         self._scroll_to_bottom()
 
     def add_tool_call(self, tool_name: str, args: dict | str) -> None:
-        """Zobrazí volanie MCP nástroja."""
+        """Zobrazí volanie interného nástroja."""
         container = QFrame()
         container.setStyleSheet(
             "background: #1a1208; border-left: 3px solid #ffb74d; border-radius: 4px;"

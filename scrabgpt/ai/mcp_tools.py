@@ -1,7 +1,7 @@
-"""MCP tool wrappers for AI agent.
+"""Tool wrappers for the AI agent.
 
-Each function here is a stateless tool that can be called by the AI agent
-via Model Context Protocol (MCP). All inputs and outputs are JSON-serializable.
+Each function here is a stateless tool that can be called by the AI agent.
+All inputs and outputs are JSON-serializable.
 
 Tool naming convention: tool_<category>_<action>
 Example: tool_rules_placements_in_line, tool_scoring_score_words
@@ -32,7 +32,7 @@ from ..core.assets import get_premiums_path
 from .fastdict import load_dictionary
 from .juls_online import is_word_in_juls
 
-log = logging.getLogger("scrabgpt.ai.mcp_tools")
+log = logging.getLogger("scrabgpt.ai.tools")
 
 # ========== Global Dictionary Cache ==========
 

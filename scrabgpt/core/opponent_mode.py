@@ -9,7 +9,7 @@ class OpponentMode(Enum):
     """AI opponent mode selection.
     
     Determines how the AI opponent generates moves:
-    - AGENT: Uses MCP tools with configurable agent
+    - AGENT: Uses configurable local agent with Scrabble tools
     - BEST_MODEL: Uses OpenAI's best available model (auto-fetched)
     - OPENROUTER: Multi-model competition via OpenRouter
     - NOVITA: Multi-model competition via Novita (reasoning models)
@@ -26,7 +26,7 @@ class OpponentMode(Enum):
     def display_name_sk(self) -> str:
         """Slovak display name for UI."""
         names = {
-            OpponentMode.AGENT: "Agent (MCP)",
+            OpponentMode.AGENT: "Agent",
             OpponentMode.BEST_MODEL: "OpenAI",
             OpponentMode.OPENROUTER: "OpenRouter",
             OpponentMode.NOVITA: "Novita AI",
@@ -39,7 +39,7 @@ class OpponentMode(Enum):
         """Slovak description for UI."""
         descriptions = {
             OpponentMode.AGENT: (
-                "Hrať proti agentovi s MCP nástrojmi (Scrabble tools) a vybraným LLM "
+                "Hrať proti agentovi s lokálnymi Scrabble nástrojmi a vybraným LLM "
                 "napojeným cez .env/LMStudio."
             ),
             OpponentMode.BEST_MODEL: "Hrať oproti najlepšiemu <GPT5> modelu",

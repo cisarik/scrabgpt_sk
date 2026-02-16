@@ -273,7 +273,7 @@ Tests follow the `tests/test_<feature>.py` pattern and use pytest. Name function
 
 ### Test Categories
 1. **Domain tests** (`tests/test_scoring.py`, `test_rules.py`, etc.) - Pure logic, offline, no mocks
-2. **Integration tests** (`tests/test_internet_tools.py`, `test_agent_player.py`, etc.) - Real API calls allowed
+2. **Integration tests** (`tests/test_agent_player.py`, `tests/test_variant_agent.py`, etc.) - Real API calls allowed
 3. **UI tests** - Marked with `@pytest.mark.ui`, skipped on CI
 4. **Stress tests / IQ tests** - Marked with `@pytest.mark.stress`, user-created validation scenarios
 

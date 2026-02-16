@@ -1,6 +1,6 @@
-"""Language Agent - Async MCP agent for fetching supported languages.
+"""Language Agent - Async agent for fetching supported languages.
 
-This is a learning example of how to use MCP agents in ScrabGPT.
+This is a learning example of async agents in ScrabGPT.
 It shows the pattern for:
 1. Async agent execution
 2. Progress/status callbacks
@@ -32,7 +32,7 @@ class AgentProgress:
 
 
 class LanguageAgent:
-    """Agent for fetching supported languages using async MCP pattern.
+    """Agent for fetching supported languages using async pattern.
     
     This agent:
     1. Calls OpenAI to get list of supported languages

@@ -21,7 +21,7 @@ def _require_genai() -> None:
 
 
 def _make_function_decls() -> list[FunctionDeclaration]:
-    """Define MCP tool signatures for Gemini function calling."""
+    """Define local tool signatures for Gemini function calling."""
     return [
         FunctionDeclaration(
             name="validate_word_slovak",
@@ -91,8 +91,8 @@ class GeminiClient:
         log.info("Gemini client init (model=%s, timeout=%ss)", self.model, timeout_seconds)
 
     def _call_tool(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
-        """Dispatch to local MCP tools."""
-        from .mcp_tools import (
+        """Dispatch to local Scrabble tools."""
+        from .tool_registry import (
             tool_rules_first_move_must_cover_center,
             tool_rules_placements_in_line,
             tool_rules_connected_to_existing,
@@ -102,7 +102,7 @@ class GeminiClient:
         )
         # Simplified mapping to exposed tools
         if name == "validate_word_slovak":
-            from .mcp_tools import is_word_in_juls as _is_word
+            from .tool_registry import is_word_in_juls as _is_word
             word = str(args.get("word", "")).strip()
             valid = bool(word) and bool(_is_word(word))
             return {"valid": valid, "reason": "local+JULS" if valid else "not found"}

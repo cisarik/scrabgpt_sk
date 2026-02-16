@@ -1,13 +1,9 @@
-"""AI agent player using MCP tools.
+"""AI agent player using local Scrabble tools.
 
-This module implements the AI player that uses Model Context Protocol (MCP)
-to access game state and validation tools.
-
-NOTE: This is a STUB implementation. Full MCP integration requires:
-1. mcp-use library installation
-2. OpenAI function calling integration
-3. Iterative tool call loop
-4. Error handling and retry logic
+NOTE: This is a STUB implementation. Full integration requires:
+1. OpenAI function calling integration
+2. Iterative tool call loop
+3. Error handling and retry logic
 """
 
 from __future__ import annotations
@@ -33,8 +29,8 @@ class ToolExecutionError(Exception):
     pass
 
 
-class MCPToolExecutor:
-    """Executor for MCP tools with access control.
+class ToolExecutor:
+    """Executor for local tools with access control.
     
     This class wraps tool functions and enforces that agents can only
     call tools they're configured to use.
@@ -47,7 +43,7 @@ class MCPToolExecutor:
             available_tools: List of tool names this agent can use
         """
         self.available_tools = set(available_tools)
-        log.info("Initialized MCP executor with %d tools", len(available_tools))
+        log.info("Initialized tool executor with %d tools", len(available_tools))
     
     async def execute_tool(self, tool_name: str, **kwargs: Any) -> dict[str, Any]:
         """Execute a tool function.
@@ -70,7 +66,7 @@ class MCPToolExecutor:
             )
         
         try:
-            from .mcp_tools import get_tool_function
+            from .tool_registry import get_tool_function
             
             tool_func = get_tool_function(tool_name)
             result = tool_func(**kwargs)
@@ -90,7 +86,7 @@ async def propose_move_agent(
     variant: VariantDefinition,
     max_iterations: int = 10,
 ) -> dict[str, Any]:
-    """Propose move using AI agent with MCP tools.
+    """Propose move using AI agent with local Scrabble tools.
     
     This is a STUB implementation. Full implementation requires:
     1. OpenAI function calling loop
@@ -114,7 +110,7 @@ async def propose_move_agent(
     log.warning("propose_move_agent is STUB ONLY - not functional yet")
     
     # Initialize tool executor
-    executor = MCPToolExecutor(agent_config["tools"])
+    executor = ToolExecutor(agent_config["tools"])
     
     # Build OpenAI function schemas
     tool_schemas = build_tool_schemas_for_agent(agent_config)
@@ -142,9 +138,13 @@ async def propose_move_agent(
     # 6. Parse and return move
     
     raise NotImplementedError(
-        "Agent player requires full MCP integration with OpenAI function calling. "
+        "Agent player requires full tool integration with OpenAI function calling. "
         "Please implement the tool calling loop."
     )
+
+
+# Backward compatibility alias for older tests/imports.
+MCPToolExecutor = ToolExecutor
 
 
 def build_tool_schemas_for_agent(agent_config: dict[str, Any]) -> list[dict[str, Any]]:

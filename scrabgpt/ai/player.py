@@ -4,7 +4,7 @@ import logging
 import json
 import os
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Callable, cast
 
 from openai.types.chat import ChatCompletionMessageParam
 
@@ -31,7 +31,7 @@ class GameContextSession:
     - Delta updates (len zmeny na doske)
     - User chat messages (užívateľ môže AI písať)
     - Kompaktný formát (80-90% úspora tokenov)
-    - MCP tools integration
+    - Integráciu interných validačných nástrojov
     """
 
     def __init__(self, variant_slug: str, *, history_limit: int = _CONTEXT_HISTORY_LIMIT) -> None:
@@ -152,7 +152,6 @@ class GameContextSession:
         # Tu len aktualizujeme legacy log
         word = move.get("word", "?")
         direction = move.get("direction", "?")
-        start = move.get("start", {})
         
         summary = f"{word} {direction} za {score} bodov"
         self._turn_log.append(summary)
@@ -340,11 +339,11 @@ def _load_prompt_template(use_chat_protocol: bool = True) -> str:
     """Load AI prompt template from file specified in .env or use default.
     
     Args:
-        use_chat_protocol: If True, load chat protocol template (delta updates, MCP tools).
+        use_chat_protocol: If True, load chat protocol template (delta updates, local tools).
                           If False, load legacy zero-shot template.
     """
     if use_chat_protocol:
-        # Nový chat protokol s MCP tools
+        # Nový chat protokol s internými validačnými nástrojmi
         prompt_file = os.getenv("AI_PROMPT_FILE_CHAT", "prompts/chat_protocol.txt")
     else:
         # Legacy zero-shot protokol
@@ -362,7 +361,7 @@ def _load_prompt_template(use_chat_protocol: bool = True) -> str:
     # Fallback to embedded default if file loading fails
     if use_chat_protocol:
         # Embedded chat protocol fallback
-        return """Hráš Scrabble v jazyku {language}. Používaj MCP tools na validáciu.
+        return """Hráš Scrabble v jazyku {language}. Používaj interné validačné nástroje.
 
 === PRAVIDLÁ ===
 - Prvý ťah musí pokrývať stred (7,7)
@@ -624,7 +623,7 @@ async def propose_move_chat(
     Nový prístup:
     - Vždy používa context session (úspora 80-90% tokenov)
     - Delta updates namiesto plného stavu
-    - MCP tools v system prompte
+    - Interné validačné nástroje v system prompte
     - OpenRouter ako default provider
     
     Args:
@@ -640,7 +639,7 @@ async def propose_move_chat(
         
     Komentár (SK): Táto funkcia je navrhnutá ako náhrada za pôvodnú 
     `propose_move()` pri používaní chat protokolu. Podporuje delta updates
-    a MCP tools pre efektívnejšiu komunikáciu.
+    a interné validačné nástroje pre efektívnejšiu komunikáciu.
     """
     
     # Získať alebo vytvoriť context session

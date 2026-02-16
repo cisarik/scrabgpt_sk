@@ -1,33 +1,33 @@
-"""Adapter to convert MCP tools to Google Vertex AI tools."""
+"""Adapter to convert internal Scrabble tools to Google Vertex AI tools."""
 
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable
+from typing import Any, cast
 
 from google.genai import types
 
-from .mcp_server import TOOL_SCHEMAS
-from . import mcp_tools
+from .tool_schemas import TOOL_SCHEMAS
+from . import tool_registry
 
-log = logging.getLogger("scrabgpt.ai.mcp_adapter")
+log = logging.getLogger("scrabgpt.ai.tool_adapter")
 
 
 def get_gemini_tools() -> list[types.Tool]:
-    """Convert MCP tool schemas to Vertex AI Tool definitions.
+    """Convert internal tool schemas to Vertex AI Tool definitions.
     
     Returns:
         List of types.Tool objects ready for Vertex AI.
     """
-    function_declarations = []
+    function_declarations: list[types.FunctionDeclaration] = []
     
-    for tool_name, schema in TOOL_SCHEMAS.items():
+    for _tool_name, schema in TOOL_SCHEMAS.items():
         # Deep copy schema to avoid modifying original
         import copy
         sanitized_schema = copy.deepcopy(schema["inputSchema"])
         
         # Helper to recursively fix types
-        def fix_types(obj):
+        def fix_types(obj: Any) -> None:
             if isinstance(obj, dict):
                 for k, v in obj.items():
                     if k == "type":
@@ -83,21 +83,23 @@ def execute_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
         
         # Case-insensitive lookup
         try:
-            tool_func = mcp_tools.get_tool_function(name)
+            tool_func = tool_registry.get_tool_function(name)
         except KeyError:
             # Try to find case-insensitive match
-            all_tools = mcp_tools.ALL_TOOLS
+            all_tools = tool_registry.ALL_TOOLS
             lower_name = name.lower()
             found_name = next((k for k in all_tools.keys() if k.lower() == lower_name), None)
             
             if found_name:
                 log.info("Case mismatch: requested '%s', found '%s'", name, found_name)
-                tool_func = mcp_tools.get_tool_function(found_name)
+                tool_func = tool_registry.get_tool_function(found_name)
             else:
                 raise
 
         result = tool_func(**args)
-        return result
+        if isinstance(result, dict):
+            return cast(dict[str, Any], result)
+        return {"result": result}
     except Exception as e:
         log.exception("Error executing tool %s", name)
         return {"error": str(e)}

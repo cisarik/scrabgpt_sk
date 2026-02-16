@@ -10,7 +10,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from .mcp_tools import get_all_tool_names
+from .tool_registry import get_all_tool_names
 
 log = logging.getLogger("scrabgpt.ai.agent_config")
 
@@ -174,7 +174,7 @@ def get_available_tools() -> list[str]:
     """Get list of all available tool names.
     
     Returns:
-        List of tool names registered in MCP
+        List of registered tool names
     """
     return get_all_tool_names()
 
@@ -191,7 +191,7 @@ def get_tool_schema(tool_name: str) -> dict[str, Any]:
     Raises:
         ToolNotFoundError: If tool not found
     """
-    from .mcp_tools import get_tool_function
+    from .tool_registry import get_tool_function
     
     try:
         tool_func = get_tool_function(tool_name)

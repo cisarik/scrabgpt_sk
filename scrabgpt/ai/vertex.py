@@ -227,7 +227,7 @@ class VertexClient:
                         del kwargs["system_instruction"]
                 
                 # --- Tool Execution Loop ---
-                from .mcp_adapter import execute_tool
+                from .tool_adapter import execute_tool
                 
                 while True:
                     # Run blocking call in thread executor

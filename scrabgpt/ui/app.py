@@ -87,7 +87,6 @@ from ..ai.novita import NovitaClient
 from ..ai.novita_multi_model import propose_move_novita_multi_model
 from .agents_dialog import AgentsDialog, AsyncAgentWorker
 from .agent_status_widget import AgentStatusWidget
-from .mcp_test_dialog import MCPTestDialog
 from .chat_dialog import ChatDialog
 from ..ai.vertex import VertexClient
 from google.genai import types as vertex_types
@@ -134,7 +133,6 @@ from ..ai.variants import (
 )
 from ..ai.variant_agent import SummaryResult, VariantBootstrapAgent, VariantBootstrapProgress
 from ..ai.agent_config import discover_agents, get_default_agents_dir
-from ..ai.internet_tools import register_internet_tools
 from .model_results import AIModelResultsTable
 
 ASSETS = str(Path(__file__).parent / ".." / "assets")
@@ -1597,9 +1595,6 @@ class MainWindow(QMainWindow):
         self.resize(1000, 800)
         self._shutting_down = False
 
-        # Register internet tools
-        register_internet_tools()
-        
         # Opponent mode configuration
         self.opponent_mode = OpponentMode.BEST_MODEL
         self.selected_agent_name: Optional[str] = None
@@ -1707,10 +1702,6 @@ class MainWindow(QMainWindow):
         self.act_agents = QAction("⚙️ Agenti", self)
         self.act_agents.triggered.connect(self.open_agents_dialog)
         self.toolbar.addAction(self.act_agents)
-
-        self.act_mcp_test = QAction("🔧 MCP Test", self)
-        self.act_mcp_test.triggered.connect(self.open_mcp_test_dialog)
-        self.toolbar.addAction(self.act_mcp_test)
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -2173,7 +2164,7 @@ class MainWindow(QMainWindow):
             text = f"Novita AI - {team_name}"
         elif mode == OpponentMode.AGENT:
             agent_name = self._resolve_agent_display_name()
-            text = f"Agent (MCP) - {agent_name}"
+            text = f"Agent - {agent_name}"
         else:
             text = "Offline AI"
         
@@ -2226,7 +2217,7 @@ class MainWindow(QMainWindow):
         elif mode == OpponentMode.AGENT:
             agent_name = self._resolve_agent_display_name()
             entries.append(
-                _entry(f"agent:{agent_name}", f"Agent (MCP) – {agent_name}", 0)
+                _entry(f"agent:{agent_name}", f"Agent – {agent_name}", 0)
             )
 
         return entries
@@ -3601,8 +3592,8 @@ class MainWindow(QMainWindow):
                                 try:
                                     # Reuse propose_move_multi_model but with VertexClient
                                     # VertexClient must implement call_model compatible with OpenRouterClient
-                                    # Load MCP tools for Gemini
-                                    from ..ai.mcp_adapter import get_gemini_tools
+                                    # Load local Scrabble tools for Gemini
+                                    from ..ai.tool_adapter import get_gemini_tools
                                     tools = get_gemini_tools()
                                     
                                     # Pass model_id to inner scope if needed, but we have self.selected_models
@@ -4789,9 +4780,7 @@ class MainWindow(QMainWindow):
         try:
             agents_dialog = self.get_agents_dialog()
             widget = agents_dialog.show_agent_tab(model_name, model_name)
-            # Indikuj použitý MCP server z defaults
-            if getattr(widget, "default_mcp_url", None):
-                widget.append_status(f"Používam MCP server: {widget.default_mcp_url}")
+            widget.append_status("Používam lokálne Scrabble nástroje")
         except Exception:
             log.exception("Nepodarilo sa zobraziť Agents dialog pre agenta %s", model_name)
         self.open_chat_dialog()
@@ -4862,13 +4851,6 @@ class MainWindow(QMainWindow):
             self.chat_dialog.add_debug_message(message)
         except Exception:
             log.debug("Debug log to chat skipped")
-    
-    def open_mcp_test_dialog(self) -> None:
-        """Open MCP testing dialog (non-modal)."""
-        dialog = MCPTestDialog(parent=self)
-        dialog.show()
-        dialog.raise_()
-        dialog.activateWindow()
     
     def open_opponent_settings(self) -> None:
         """Open opponent mode settings dialog."""
