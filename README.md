@@ -22,6 +22,52 @@ cp .env.example .env  # add your keys
 poetry run python -m scrabgpt.ui.app
 ```
 
+## Vertex AI + Gemini 3.1 (preview)
+This project uses the Google Gen AI SDK (`google-genai`) for Vertex calls. Gemini 3.x preview
+models require the Vertex global endpoint (`location=global`), and the client setup now enforces
+that automatically for Gemini 3.x IDs.
+
+### Prerequisites
+- Google Cloud billing enabled for your project
+- Vertex AI API enabled in the same project
+- IAM for caller principal (for example service account role similar to `Vertex AI User`)
+
+### Authentication
+Use one of these:
+1. ADC:
+```bash
+gcloud auth application-default login
+```
+2. Service account JSON:
+```bash
+export GOOGLE_APPLICATION_CREDENTIALS=/abs/path/to/service-account.json
+```
+
+### Required env vars
+```bash
+export GOOGLE_CLOUD_PROJECT=your-project-id
+export GOOGLE_CLOUD_LOCATION=global
+export GEMINI_MODEL=gemini-3.1-pro-preview
+```
+
+### Verify setup
+```bash
+# Option A (pip workflow)
+pip install -r requirements.txt
+
+# Option B (Poetry workflow)
+poetry install
+
+python scripts/list_models.py
+python scripts/smoke_test_gemini31.py
+```
+
+If you run through Poetry virtualenv explicitly:
+```bash
+poetry run python scripts/list_models.py
+poetry run python scripts/smoke_test_gemini31.py
+```
+
 > All OpenAI requests/responses are pretty-printed to the terminal (key masked).
 > Agent activities are tracked in real-time with OpenAI-style animations.
 

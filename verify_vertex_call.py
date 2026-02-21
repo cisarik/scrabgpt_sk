@@ -1,50 +1,42 @@
+from __future__ import annotations
+
 import os
-import asyncio
+
 from dotenv import load_dotenv
-from google import genai
 from google.genai import types
 
-# Load .env
-load_dotenv(override=True)
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.abspath("vertexaccount.json")
+from scrabgpt.ai.vertex_genai_client import build_client, vertex_error_hint
 
-async def test_generate():
-    project_id = "vertexaccount"
+
+def main() -> None:
+    load_dotenv(override=False)
+
+    model_id = os.getenv("GEMINI_MODEL", "gemini-2.5-pro").strip() or "gemini-2.5-pro"
+    client, config = build_client(model=model_id, verbose=True)
+
+    print(f"Testing generate_content for model={model_id} location={config.location}")
+
     try:
-        import json
-        with open("vertexaccount.json", "r") as f:
-            creds = json.load(f)
-            project_id = creds.get("project_id", project_id)
-    except Exception:
-        pass
-        
-    location = os.getenv("VERTEX_LOCATION", "us-central1")
-    print(f"Testing generate for project: {project_id} in {location}")
-    
-    client = genai.Client(
-        vertexai=True,
-        project=project_id,
-        location=location
-    )
-    
-    model_id = "gemini-2.5-pro"
-    print(f"Model: {model_id}")
-    
-    try:
-        config = types.GenerateContentConfig(
-            max_output_tokens=100,
-            temperature=0.7,
-            thinking_config=types.ThinkingConfig(include_thoughts=True)
-        )
-        
         response = client.models.generate_content(
             model=model_id,
-            contents=[types.Content(role="user", parts=[types.Part(text="Hello")])],
-            config=config
+            contents=[
+                types.Content(role="user", parts=[types.Part(text="Hello from Vertex test script.")])
+            ],
+            config=types.GenerateContentConfig(
+                max_output_tokens=100,
+                temperature=0.7,
+            ),
         )
-        print(f"Response: {response.text}")
-    except Exception as e:
-        print(f"Error: {e}")
+    except Exception as exc:  # noqa: BLE001
+        hint = vertex_error_hint(str(exc), model_id=model_id, location=config.location)
+        print(f"FAILED: {exc}")
+        if hint:
+            print(f"Hint: {hint}")
+        raise
+
+    print("SUCCESS")
+    print(f"Response: {response.text}")
+
 
 if __name__ == "__main__":
-    asyncio.run(test_generate())
+    main()
