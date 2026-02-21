@@ -1,6 +1,7 @@
 
 from __future__ import annotations
 import asyncio
+import re
 import os
 import sys
 import uuid
@@ -156,6 +157,7 @@ AI_MOVE_TIMEOUT_CHOICES: list[tuple[int, str]] = [
 ]
 
 TILE_MIME = "application/x-scrabgpt-tile"
+_ATTEMPT_WORD_PATTERN = re.compile(r"[^\W\d_]{2,15}", flags=re.UNICODE)
 
 # Typ alias pre strany pri určovaní štartéra
 StarterSide = Literal["HUMAN", "AI"]
@@ -1618,6 +1620,10 @@ class MainWindow(QMainWindow):
         self._current_ai_model: str = "AI"
         self._current_ai_model_id: Optional[str] = None
         self._model_attempt_tracking: dict[str, dict[str, Any]] = {}
+        self._single_model_reasoning_buffer: str = ""
+        self._single_model_seen_attempt_words: set[str] = set()
+        self._single_model_attempt_eval_count: int = 0
+        self._single_model_attempt_eval_limit: int = 32
 
         # Repro mód nastavenia (iba runtime)
         # Pozn.: Nastavuje sa v dialógu Nastavenia a používa pri "Nová hra".
@@ -2143,7 +2149,10 @@ class MainWindow(QMainWindow):
 
     def _resolve_openai_model_label(self) -> str:
         """Resolve the OpenAI model name that will be used in single-model mode."""
-        env_model = os.getenv("OPENAI_MODEL")
+        env_model = (
+            os.getenv("OPENAI_MODEL")
+            or os.getenv("OPENAI_PLAYER_MODEL")
+        )
         if env_model:
             return env_model
         if self.ai_client is not None:
@@ -2153,7 +2162,7 @@ class MainWindow(QMainWindow):
                     return model_name
             except Exception:
                 pass
-        return "gpt-5-mini"
+        return "gpt-5.2"
 
     def _resolve_agent_display_name(self) -> str:
         """Resolve the human-readable name of the selected agent."""
@@ -2303,22 +2312,7 @@ class MainWindow(QMainWindow):
     def _update_mode_status_label(self) -> None:
         """Update mode status label to show current opponent mode and active model/team."""
         mode = self.opponent_mode
-        
-        if mode == OpponentMode.BEST_MODEL:
-            model_name = self._normalize_status_model_label(self._resolve_openai_model_label())
-            text = model_name or "OpenAI"
-        elif mode == OpponentMode.OPENROUTER:
-            labels = self._collect_openrouter_model_labels()
-            text = ", ".join(labels) if labels else "OpenRouter"
-        elif mode == OpponentMode.NOVITA:
-            labels = self._collect_novita_model_labels()
-            text = ", ".join(labels) if labels else "Novita AI"
-        elif mode == OpponentMode.GEMINI:
-            text = self._resolve_google_model_label()
-        elif mode == OpponentMode.AGENT:
-            text = self._resolve_agent_display_name()
-        else:
-            text = "Offline AI"
+        text = mode.display_name_sk if isinstance(mode, OpponentMode) else "Offline AI"
         
         if hasattr(self, 'lbl_mode_status') and self.lbl_mode_status is not None:
             self.lbl_mode_status.setText(text)
@@ -4067,6 +4061,7 @@ class MainWindow(QMainWindow):
             return
         self._ai_thinking = True
         self._reset_model_attempt_tracking()
+        self._reset_single_model_attempt_stream()
         self._disable_human_inputs()
         self._start_status_spinner("ai", "Hrá AI", wait_cursor=False)
         # reset flagu pre nový ťah
@@ -4446,6 +4441,20 @@ class MainWindow(QMainWindow):
                 self.chat_dialog.update_countdown(remaining)
             return
 
+        if self._should_drop_model_from_results_table(result):
+            drop_model_id = str(result.get("model") or "").strip()
+            if drop_model_id:
+                self.model_results_table.remove_model(drop_model_id)
+            if self.chat_dialog:
+                self.chat_dialog.add_agent_activity(
+                    f"⚠️ {model_name}: dočasne preťažený (429), vyraďujem z tabuľky.",
+                    section="final",
+                )
+            self.status.showMessage(
+                f"{model_name}: 429 RESOURCE_EXHAUSTED, model vyradený z tabuľky"
+            )
+            return
+
         if status == "tool_use":
             tool_data = result.get("tool_calls_data")
             if tool_data and self.chat_dialog:
@@ -4538,13 +4547,20 @@ class MainWindow(QMainWindow):
         log.info("Received multi-model results: %d models", len(results))
 
         merged_results = [self._merge_attempt_summary_into_result(r) for r in results]
+        visible_results = [
+            r for r in merged_results
+            if not self._should_drop_model_from_results_table(r)
+        ]
         
         # Update table immediately with results
-        self.model_results_table.set_results(merged_results)
+        if visible_results:
+            self.model_results_table.set_results(visible_results)
+        else:
+            self.model_results_table.clear_results()
 
         # Store the winning model name for status messages
         # Find the best valid result
-        valid_results = [r for r in merged_results if r.get("judge_valid")]
+        valid_results = [r for r in visible_results if r.get("judge_valid")]
         if valid_results:
             valid_results.sort(key=lambda r: int(r.get("score", -1)), reverse=True)
             winner = valid_results[0]
@@ -4562,7 +4578,7 @@ class MainWindow(QMainWindow):
             )
         else:
             # No valid results, find highest scoring attempt
-            all_sorted = sorted(merged_results, key=lambda r: int(r.get("score", -1)), reverse=True)
+            all_sorted = sorted(visible_results, key=lambda r: int(r.get("score", -1)), reverse=True)
             if all_sorted:
                 fallback = all_sorted[0]
                 self._current_ai_model = fallback.get("model_name", "AI")
@@ -4585,6 +4601,147 @@ class MainWindow(QMainWindow):
 
     def _reset_model_attempt_tracking(self) -> None:
         self._model_attempt_tracking = {}
+
+    @staticmethod
+    def _is_resource_exhausted_error(error_text: str) -> bool:
+        lowered = str(error_text or "").lower()
+        markers = (
+            "429",
+            "resource_exhausted",
+            "too many requests",
+            "rate limit",
+            "quota",
+        )
+        return any(marker in lowered for marker in markers)
+
+    def _should_drop_model_from_results_table(self, result: dict[str, Any]) -> bool:
+        status = str(result.get("status") or "").lower()
+        if status not in {"error", "timeout"}:
+            return False
+        return self._is_resource_exhausted_error(str(result.get("error") or ""))
+
+    def _reset_single_model_attempt_stream(self) -> None:
+        self._single_model_reasoning_buffer = ""
+        self._single_model_seen_attempt_words = set()
+        self._single_model_attempt_eval_count = 0
+
+    def _is_single_model_attempt_tracking_enabled(self) -> bool:
+        if self.opponent_mode != OpponentMode.BEST_MODEL:
+            return False
+        model_id = str(getattr(self, "_current_ai_model_id", "") or "").strip()
+        return bool(model_id)
+
+    def _extract_reasoning_attempt_words(self, text: str) -> list[str]:
+        if not text:
+            return []
+        words: list[str] = []
+        for token in _ATTEMPT_WORD_PATTERN.findall(text):
+            normalized = self._normalize_attempt_word(token)
+            if len(normalized) < 2 or len(normalized) > 15:
+                continue
+            if normalized in words:
+                continue
+            words.append(normalized)
+        return words
+
+    def _track_single_model_candidate_words(self, words: list[str], *, max_new: int = 6) -> None:
+        if not self._is_single_model_attempt_tracking_enabled():
+            return
+        model_id = str(self._current_ai_model_id or "").strip()
+        if not model_id:
+            return
+        if not words:
+            return
+        if self._single_model_attempt_eval_count >= self._single_model_attempt_eval_limit:
+            return
+
+        state = self._attempt_state_for_model(model_id)
+        validated_words = cast(set[str], state["validated_words"])
+        validation_order = cast(list[str], state["validation_order"])
+        validated_word_scores = cast(dict[str, int], state["validated_word_scores"])
+        validated_word_moves = cast(dict[str, dict[str, Any]], state["validated_word_moves"])
+        scored_candidates = cast(dict[str, dict[str, Any]], state["scored_candidates"])
+
+        updated = False
+        processed = 0
+        for raw_word in words:
+            if processed >= max_new:
+                break
+            if self._single_model_attempt_eval_count >= self._single_model_attempt_eval_limit:
+                break
+            word = self._normalize_attempt_word(raw_word)
+            if len(word) < 2:
+                continue
+            if word in self._single_model_seen_attempt_words:
+                continue
+            self._single_model_seen_attempt_words.add(word)
+            self._single_model_attempt_eval_count += 1
+
+            if not self._local_word_valid(word):
+                continue
+
+            score, move = self._find_best_local_move_for_word(word)
+            if score < 0 or move is None:
+                continue
+
+            if word not in validation_order:
+                validation_order.append(word)
+            validated_words.add(word)
+
+            prev_word_score = self._coerce_int(validated_word_scores.get(word))
+            if prev_word_score is None or score > prev_word_score:
+                validated_word_scores[word] = score
+
+            prev_word_move = validated_word_moves.get(word)
+            prev_move_score = self._coerce_int(prev_word_move.get("score")) if prev_word_move else None
+            if prev_move_score is None or score > prev_move_score:
+                validated_word_moves[word] = {
+                    "score": score,
+                    "move": dict(move),
+                    "order": validation_order.index(word),
+                }
+
+            signature = self._placements_signature(move.get("placements"))
+            if signature:
+                existing = scored_candidates.get(signature)
+                next_order = int(state.get("next_order", 0))
+                state["next_order"] = next_order + 1
+                existing_score = self._coerce_int(existing.get("score")) if existing else None
+                if existing_score is None or score > existing_score:
+                    scored_candidates[signature] = {
+                        "signature": signature,
+                        "words": [word],
+                        "score": score,
+                        "local_legal": True,
+                        "order": next_order,
+                        "move": dict(move),
+                    }
+
+            updated = True
+            processed += 1
+
+        if not updated:
+            return
+        update_payload = {
+            "model": model_id,
+            "model_name": self._current_ai_model,
+            "status": "pending" if self._ai_thinking else "ok",
+        }
+        self.model_results_table.update_result(
+            self._merge_attempt_summary_into_result(update_payload)
+        )
+
+    def _track_single_model_reasoning_delta(self, delta: str) -> None:
+        if not self._is_single_model_attempt_tracking_enabled():
+            return
+        chunk = str(delta or "").strip()
+        if not chunk:
+            return
+        self._single_model_reasoning_buffer = (
+            self._single_model_reasoning_buffer + " " + chunk
+        )[-2600:]
+        words = self._extract_reasoning_attempt_words(self._single_model_reasoning_buffer)
+        self._track_single_model_candidate_words(words, max_new=4)
 
     @staticmethod
     def _coerce_int(value: Any) -> int | None:
@@ -5420,6 +5577,7 @@ class MainWindow(QMainWindow):
         words_coords = [(wf.word, wf.letters) for wf in words_found]
         words = [wf.word for wf in words_found]
         log.info("AI slová na overenie: %s", words)
+        self._track_single_model_candidate_words(words, max_new=12)
         if self.chat_dialog and words:
             self.chat_dialog.add_agent_activity(
                 f"📤 AI navrhla slová na overenie: {', '.join(words)}",
@@ -5502,8 +5660,12 @@ class MainWindow(QMainWindow):
         # For retry success, show in table
         if self._ai_retry_used and hasattr(self, '_current_ai_model'):
             # Create a single-row result for the successful retry
+            retry_model_id = str(
+                self._current_ai_model_id
+                or f"openai:{self._resolve_openai_model_label()}"
+            )
             retry_result = {
-                "model": "gpt-5-mini",
+                "model": retry_model_id,
                 "model_name": self._current_ai_model,
                 "status": "ok",
                 "move": {"word": words[0] if words else ""},
@@ -5511,7 +5673,9 @@ class MainWindow(QMainWindow):
                 "words": words,
                 "judge_valid": None,  # Will be set after judge
             }
-            self.model_results_table.set_results([retry_result])
+            self.model_results_table.update_result(
+                self._merge_attempt_summary_into_result(retry_result)
+            )
         
         # Rozhodovanie (online)
         class JudgeWorker(QObject):
@@ -5660,7 +5824,9 @@ class MainWindow(QMainWindow):
                 "judge_valid": True,
                 "judge_reason": reason_text,
             }
-            self.model_results_table.update_result(update_payload)
+            self.model_results_table.update_result(
+                self._merge_attempt_summary_into_result(update_payload)
+            )
 
         self.ai_score += total
         if self.chat_dialog:
@@ -6161,6 +6327,10 @@ class MainWindow(QMainWindow):
             self.chat_dialog.update_streaming_ai_message(delta)
         except Exception:
             log.debug("Stream update skipped")
+        try:
+            self._track_single_model_reasoning_delta(delta)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("Single-model attempt tracking skipped: %s", exc)
 
     def _on_ai_stream_reasoning(self, delta: str) -> None:
         """Stream reasoning tokens into reasoning bubble."""
@@ -6168,6 +6338,10 @@ class MainWindow(QMainWindow):
             self.chat_dialog.update_reasoning_stream(delta)
         except Exception:
             log.debug("Stream reasoning skipped")
+        try:
+            self._track_single_model_reasoning_delta(delta)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("Single-model attempt tracking skipped: %s", exc)
 
     def _on_ai_debug_log(self, message: str) -> None:
         """Zobraz debug/profiling správy z AI klienta v chate."""

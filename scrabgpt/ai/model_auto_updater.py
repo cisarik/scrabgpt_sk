@@ -1,6 +1,6 @@
 """Automatic model updater for OpenAI best model.
 
-This module handles automatic updates of the OPENAI_PLAYER_MODEL setting
+This module handles automatic updates of the OPENAI_MODEL setting
 based on the model selector agent's recommendations.
 """
 
@@ -28,16 +28,20 @@ def is_auto_update_enabled() -> bool:
 
 
 def get_current_model() -> str:
-    """Get current OPENAI_PLAYER_MODEL from environment.
+    """Get current OpenAI model from environment.
     
     Returns:
-        Current model ID or "gpt-4o-mini" as default
+        Current model ID or "gpt-5.2" as default
     """
-    return os.getenv("OPENAI_PLAYER_MODEL", "gpt-4o-mini")
+    return (
+        os.getenv("OPENAI_MODEL")
+        or os.getenv("OPENAI_PLAYER_MODEL")
+        or "gpt-5.2"
+    )
 
 
 def update_env_file(model_id: str, env_path: Path | None = None) -> bool:
-    """Update OPENAI_PLAYER_MODEL in .env file.
+    """Update OPENAI_MODEL in .env file.
     
     Args:
         model_id: New model ID to set
@@ -61,26 +65,36 @@ def update_env_file(model_id: str, env_path: Path | None = None) -> bool:
         with open(env_path, "r", encoding="utf-8") as f:
             lines = f.readlines()
         
-        # Find and update OPENAI_PLAYER_MODEL line
-        updated = False
+        # Find and update OPENAI_MODEL line
+        updated_openai_model = False
+        updated_legacy_player_model = False
         for i, line in enumerate(lines):
-            if line.strip().startswith("OPENAI_PLAYER_MODEL="):
-                # Update this line
+            stripped = line.strip()
+            if stripped.startswith("OPENAI_MODEL="):
+                lines[i] = f"OPENAI_MODEL='{model_id}'\n"
+                updated_openai_model = True
+                log.info("Updated OPENAI_MODEL to '%s' in .env", model_id)
+                continue
+            if stripped.startswith("OPENAI_PLAYER_MODEL="):
                 lines[i] = f"OPENAI_PLAYER_MODEL='{model_id}'\n"
-                updated = True
+                updated_legacy_player_model = True
                 log.info("Updated OPENAI_PLAYER_MODEL to '%s' in .env", model_id)
-                break
-        
-        # If not found, append
-        if not updated:
-            lines.append(f"\nOPENAI_PLAYER_MODEL='{model_id}'\n")
-            log.info("Added OPENAI_PLAYER_MODEL='%s' to .env", model_id)
+
+        # If OPENAI_MODEL key not found, append it
+        if not updated_openai_model:
+            lines.append(f"\nOPENAI_MODEL='{model_id}'\n")
+            log.info("Added OPENAI_MODEL='%s' to .env", model_id)
+
+        # Keep legacy key in sync if present in file
+        if updated_legacy_player_model:
+            log.debug("Kept OPENAI_PLAYER_MODEL synchronized with OPENAI_MODEL")
         
         # Write back
         with open(env_path, "w", encoding="utf-8") as f:
             f.writelines(lines)
         
         # Update current environment (doesn't affect running process, only for next load)
+        os.environ["OPENAI_MODEL"] = model_id
         os.environ["OPENAI_PLAYER_MODEL"] = model_id
         
         return True

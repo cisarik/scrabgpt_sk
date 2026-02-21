@@ -14,6 +14,7 @@ from .fastdict import load_dictionary
 from .juls_online import is_word_in_juls
 
 log = logging.getLogger("scrabgpt.ai")
+DEFAULT_OPENAI_MODEL = "gpt-5.2"
 
 # Pozn.: Pouzivame Responses API s json_schema formatom (strict JSON vystup).
 
@@ -42,12 +43,13 @@ def _mask_key(k: str) -> str:
 
 class OpenAIClient:
     """Tenký klient s logovaním request/response a maskovaním API kluca."""
-    def __init__(self, model: str = "gpt-5-mini") -> None:
+    def __init__(self, model: str = DEFAULT_OPENAI_MODEL) -> None:
         load_dotenv()
         api_key = os.getenv("OPENAI_API_KEY", "")
         env_model = os.getenv("OPENAI_MODEL")
         if env_model:
             model = env_model
+        model = (model or DEFAULT_OPENAI_MODEL).strip() or DEFAULT_OPENAI_MODEL
 
         base_url = os.getenv("OPENAI_BASE_URL") or os.getenv("LLMSTUDIO_BASE_URL")
         client_kwargs: dict[str, Any] = {}

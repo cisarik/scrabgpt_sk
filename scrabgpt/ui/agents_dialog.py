@@ -35,7 +35,11 @@ log = logging.getLogger("scrabgpt.ui.agents")
 def load_env_llm_defaults() -> dict[str, object] | None:
     """Načítaj implicitné LLM nastavenie z .env (OpenAI/LLMStudio)."""
     base = os.getenv("OPENAI_BASE_URL") or os.getenv("LLMSTUDIO_BASE_URL")
-    model = os.getenv("OPENAI_MODEL") or os.getenv("LLMSTUDIO_MODEL")
+    model = (
+        os.getenv("OPENAI_MODEL")
+        or os.getenv("OPENAI_PLAYER_MODEL")
+        or os.getenv("LLMSTUDIO_MODEL")
+    )
     max_tokens_env = os.getenv("AI_MOVE_MAX_OUTPUT_TOKENS")
     timeout_env = os.getenv("AI_MOVE_TIMEOUT_SECONDS")
     
@@ -52,7 +56,7 @@ def load_env_llm_defaults() -> dict[str, object] | None:
     
     return {
         "base_url": base or "http://127.0.0.1:1234/v1",
-        "model": model or "gpt-5-mini",
+        "model": model or "gpt-5.2",
         "max_tokens": max(500, min(20000, _to_int(max_tokens_env) or 4000)),
         "timeout": max(5, min(120, _to_int(timeout_env) or 30)),
     }
@@ -473,7 +477,7 @@ class AgentActivityWidget(QWidget):
         form.addRow("Server URL:", url_edit)
         
         model_edit = QLineEdit(dialog)
-        model_edit.setPlaceholderText("gpt-4o-mini")
+        model_edit.setPlaceholderText("gpt-5.2")
         model_edit.setText(str(cfg_map.get("model", "")))
         form.addRow("Model:", model_edit)
         

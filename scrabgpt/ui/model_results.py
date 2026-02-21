@@ -224,6 +224,16 @@ class AIModelResultsTable(QWidget):
         self._results_by_model[model_id] = merged
         self._render_results()
 
+    def remove_model(self, model_id: str) -> None:
+        """Remove model row from table if present."""
+        key = str(model_id or "").strip()
+        if not key:
+            return
+        if key not in self._results_by_model:
+            return
+        self._results_by_model.pop(key, None)
+        self._render_results()
+
     @staticmethod
     def _coerce_int(value: Any) -> int | None:
         try:
@@ -331,12 +341,12 @@ class AIModelResultsTable(QWidget):
             text_color = QColor(144, 238, 144)
             font_bold = False
         elif status in {"parse_error", "exception"}:
-            bg_color = QColor(75, 35, 35)
-            text_color = QColor(255, 170, 130)
+            bg_color = QColor(48, 48, 48)
+            text_color = QColor(225, 225, 225)
             font_bold = False
         elif status in {"error", "timeout", "invalid"}:
-            bg_color = QColor(80, 20, 20)
-            text_color = QColor(255, 120, 120)
+            bg_color = QColor(48, 48, 48)
+            text_color = QColor(225, 225, 225)
             font_bold = False
         else:
             bg_color = QColor(50, 50, 50)

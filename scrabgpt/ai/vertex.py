@@ -9,6 +9,7 @@ import asyncio
 import json
 import logging
 import os
+import random
 import time
 import inspect
 from concurrent.futures import ThreadPoolExecutor
@@ -150,6 +151,18 @@ class VertexClient:
             self.location,
             model_id,
         )
+
+    @staticmethod
+    def _is_resource_exhausted_error(error_text: str) -> bool:
+        lowered = str(error_text or "").lower()
+        markers = (
+            "429",
+            "resource_exhausted",
+            "too many requests",
+            "rate limit",
+            "quota",
+        )
+        return any(marker in lowered for marker in markers)
     
     def _next_call_id(self, kind: str) -> str:
         """Return a unique identifier for logging scopes."""
@@ -296,10 +309,59 @@ class VertexClient:
                     if self._executor_closed:
                         raise RuntimeError("Vertex client executor is closed")
                     loop = asyncio.get_running_loop()
-                    response: Any = await loop.run_in_executor(
-                        self._executor,
-                        partial(self.client.models.generate_content, **request_kwargs),
-                    )
+                    max_retry_attempts = 4
+                    response: Any = None
+                    for attempt in range(1, max_retry_attempts + 1):
+                        try:
+                            response = await loop.run_in_executor(
+                                self._executor,
+                                partial(self.client.models.generate_content, **request_kwargs),
+                            )
+                            break
+                        except Exception as retry_exc:
+                            if (
+                                attempt >= max_retry_attempts
+                                or not self._is_resource_exhausted_error(str(retry_exc))
+                            ):
+                                raise
+
+                            backoff_seconds = min(
+                                12.0,
+                                (2 ** (attempt - 1)) + random.uniform(0.0, 0.9),
+                            )
+                            log.warning(
+                                "[%s] Vertex model %s throttled (attempt %d/%d): %s. Backoff %.2fs",
+                                trace_id,
+                                model_id,
+                                attempt,
+                                max_retry_attempts,
+                                retry_exc,
+                                backoff_seconds,
+                            )
+                            if progress_callback:
+                                try:
+                                    retry_payload = {
+                                        "status": "retry",
+                                        "model": model_id,
+                                        "model_name": model_id,
+                                        "error": (
+                                            "429 RESOURCE_EXHAUSTED. "
+                                            f"Retry {attempt}/{max_retry_attempts}"
+                                        ),
+                                        "attempt": attempt,
+                                        "max_attempts": max_retry_attempts,
+                                    }
+                                    maybe_retry = progress_callback(retry_payload)
+                                    if inspect.isawaitable(maybe_retry):
+                                        await maybe_retry
+                                except Exception:
+                                    log.warning(
+                                        "Progress callback failed for retry notification",
+                                        exc_info=True,
+                                    )
+                            await asyncio.sleep(backoff_seconds)
+                    if response is None:
+                        raise RuntimeError("Vertex response missing after retries")
                     
                     # Check for tool calls
                     tool_calls: list[tuple[str, dict[str, Any]]] = []

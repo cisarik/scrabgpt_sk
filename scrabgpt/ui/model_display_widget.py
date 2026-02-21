@@ -15,7 +15,7 @@ log = logging.getLogger("scrabgpt.ui.model_display")
 class ModelDisplayWidget(QWidget):
     """Widget that displays current OpenAI model with bold green styling.
     
-    Shows: "Current AI Model: <gpt-4o>" (in bold green)
+    Shows: "Current AI Model: <model>" (in bold green)
     
     Also provides a "Check for Best" button to manually trigger agent check.
     """
@@ -75,7 +75,11 @@ class ModelDisplayWidget(QWidget):
     
     def _update_display(self) -> None:
         """Update display with current model from environment."""
-        current_model = os.getenv("OPENAI_PLAYER_MODEL", "gpt-4o-mini")
+        current_model = (
+            os.getenv("OPENAI_MODEL")
+            or os.getenv("OPENAI_PLAYER_MODEL")
+            or "gpt-5.2"
+        )
         self.label_model.setText(current_model)
         
         # Update tooltip with details

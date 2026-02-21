@@ -534,7 +534,7 @@ class SettingsDialog(QDialog):
         form.addRow("Server URL:", base_url)
         
         model = QLineEdit(dialog)
-        model.setPlaceholderText("gpt-4o-mini")
+        model.setPlaceholderText("gpt-5.2")
         model.setText(os.getenv("OPENAI_MODEL") or os.getenv("LLMSTUDIO_MODEL") or "")
         form.addRow("Model:", model)
         
