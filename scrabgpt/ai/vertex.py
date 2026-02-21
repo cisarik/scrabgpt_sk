@@ -375,6 +375,7 @@ class VertexClient:
                                     "status": "tool_result",
                                     "model": model_id,
                                     "tool_name": tool_name,
+                                    "tool_args": tool_args,
                                     "result": result,
                                     "message": f"✅ Výsledok {tool_name}"
                                 })

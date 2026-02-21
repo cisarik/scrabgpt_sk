@@ -30,7 +30,8 @@ log = logging.getLogger("scrabgpt.ai.multi_model")
 
 _RETRY_JSON_CONTRACT = (
     "Return ONLY one JSON object. No markdown. No explanations. "
-    "No <thinking> tags. Use exactly keys: start, direction, placements, word. "
+    "No <thinking> tags. Use required keys: start, direction, placements, word. "
+    "Optional key: blanks when wildcard '?' is used. "
     "Example: "
     '{"start":{"row":7,"col":7},"direction":"ACROSS","placements":[{"row":7,"col":7,"letter":"A"}],"word":"..."}'
 )
@@ -39,6 +40,7 @@ _NON_SCORING_RETRY_FEEDBACK = (
     "You returned exchange/pass too early. "
     "Try to play ANY legal scoring word, even low points. "
     "Use dictionary validation tools (validate_word_slovak/validate_word_english) if uncertain. "
+    "If rack contains '?', evaluate wildcard-based moves as well. "
     "Only return exchange when you truly cannot form any legal word."
 )
 
@@ -49,8 +51,10 @@ _TOOL_WORKFLOW_INSTRUCTION = (
     "3) THEN evaluate multiple candidate words in a loop.\n"
     "4) For each candidate, use validate_move_legality + calculate_move_score.\n"
     "5) Validate candidate words with validate_word_slovak/validate_word_english.\n"
-    "6) Evaluate at least 5 candidates when possible.\n"
-    "7) Return ONLY the highest-scoring legal move from evaluated candidates.\n"
+    "6) If rack contains '?', you MUST evaluate candidates that consume '?'.\n"
+    "7) Evaluate at least 5 candidates when possible.\n"
+    "8) Return ONLY the highest-scoring legal move from evaluated candidates.\n"
+    "9) If '?' is consumed, include blanks mapping for wildcard placements.\n"
     "Do not finalize output before completing steps 1 and 2."
 )
 
@@ -183,6 +187,15 @@ async def propose_move_multi_model(
             board.cells[r][c].letter for r in range(15) for c in range(15)
         ),
     }
+
+    if "?" in tool_context.get("rack_letters", []):
+        prompt += (
+            "\n\nBLANK TILE MANDATE:\n"
+            "- Rack contains '?'. Treat it as wildcard joker.\n"
+            "- Evaluate several legal candidates that consume '?'.\n"
+            "- Choose highest-scoring legal move; on equal score prefer a move that consumes '?'.\n"
+            "- If wildcard is used, include blanks mapping in the final JSON."
+        )
     
     async def call_one_model(model_info: dict[str, Any]) -> dict[str, Any]:
         model_id = model_info["id"]

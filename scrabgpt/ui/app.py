@@ -1617,6 +1617,7 @@ class MainWindow(QMainWindow):
         self._active_word_index: int | None = None
         self._current_ai_model: str = "AI"
         self._current_ai_model_id: Optional[str] = None
+        self._model_attempt_tracking: dict[str, dict[str, Any]] = {}
 
         # Repro mód nastavenia (iba runtime)
         # Pozn.: Nastavuje sa v dialógu Nastavenia a používa pri "Nová hra".
@@ -2172,14 +2173,10 @@ class MainWindow(QMainWindow):
 
     def _resolve_google_model_label(self) -> str:
         """Resolve human-readable label for selected Google/Gemini model."""
-        models = self._build_gemini_model_candidates()
-        if not models:
-            return "Gemini 2.5 Pro"
-        first_id = models[0].get("id", "gemini-2.5-pro")
-        first_label = self._google_model_display_name(first_id)
-        if len(models) == 1:
-            return first_label
-        return f"{first_label} +{len(models) - 1}"
+        labels = self._collect_google_model_labels()
+        if labels:
+            return ", ".join(labels)
+        return "Gemini 2.5 Pro"
 
     @staticmethod
     def _parse_model_csv(raw: str) -> list[str]:
@@ -2224,26 +2221,102 @@ class MainWindow(QMainWindow):
             candidates.append({"id": model_id, "name": label})
         return candidates
 
+    def _normalize_status_model_label(self, value: Any) -> str:
+        raw = str(value or "").strip()
+        if not raw:
+            return ""
+
+        normalized = raw.replace("google/", "").strip()
+        if normalized.startswith("gemini-"):
+            return self._google_model_display_name(normalized)
+
+        if "/" in raw:
+            provider, _, remainder = raw.partition("/")
+            provider = provider.strip().lower()
+            remainder = remainder.strip()
+            if remainder and provider in {
+                "anthropic",
+                "cohere",
+                "deepseek",
+                "google",
+                "meta-llama",
+                "mistralai",
+                "moonshotai",
+                "novita",
+                "novitaai",
+                "nousresearch",
+                "openai",
+                "qwen",
+                "x-ai",
+                "z-ai",
+            }:
+                return remainder
+
+        return raw
+
+    def _append_status_model_label(self, labels: list[str], value: Any) -> None:
+        label = self._normalize_status_model_label(value)
+        if label and label not in labels:
+            labels.append(label)
+
+    def _collect_google_model_labels(self) -> list[str]:
+        labels: list[str] = []
+        for model in self._build_gemini_model_candidates():
+            self._append_status_model_label(
+                labels,
+                model.get("name") or model.get("id"),
+            )
+        return labels
+
+    def _collect_openrouter_model_labels(self) -> list[str]:
+        labels: list[str] = []
+        for model in self.selected_ai_models:
+            self._append_status_model_label(
+                labels,
+                model.get("name") or model.get("model") or model.get("id"),
+            )
+        if labels:
+            return labels
+
+        team = self.team_manager.load_active_team_config("openrouter")
+        if team is not None:
+            for model_id in team.model_ids:
+                self._append_status_model_label(labels, model_id)
+        return labels
+
+    def _collect_novita_model_labels(self) -> list[str]:
+        labels: list[str] = []
+        for model in self.selected_novita_models:
+            self._append_status_model_label(
+                labels,
+                model.get("name") or model.get("model") or model.get("id"),
+            )
+        if labels:
+            return labels
+
+        team = self.team_manager.load_active_team_config("novita")
+        if team is not None:
+            for model_id in team.model_ids:
+                self._append_status_model_label(labels, model_id)
+        return labels
+
     def _update_mode_status_label(self) -> None:
         """Update mode status label to show current opponent mode and active model/team."""
         mode = self.opponent_mode
         
         if mode == OpponentMode.BEST_MODEL:
-            model_name = self._resolve_openai_model_label()
-            text = f"OpenAI - {model_name}"
+            model_name = self._normalize_status_model_label(self._resolve_openai_model_label())
+            text = model_name or "OpenAI"
         elif mode == OpponentMode.OPENROUTER:
-            team = self.team_manager.load_active_team_config("openrouter")
-            team_name = team.name if team else "Žiadny team"
-            text = f"OpenRouter - {team_name}"
+            labels = self._collect_openrouter_model_labels()
+            text = ", ".join(labels) if labels else "OpenRouter"
         elif mode == OpponentMode.NOVITA:
-            team = self.team_manager.load_active_team_config("novita")
-            team_name = team.name if team else "Žiadny team"
-            text = f"Novita AI - {team_name}"
+            labels = self._collect_novita_model_labels()
+            text = ", ".join(labels) if labels else "Novita AI"
         elif mode == OpponentMode.GEMINI:
-            text = f"Google - {self._resolve_google_model_label()}"
+            text = self._resolve_google_model_label()
         elif mode == OpponentMode.AGENT:
-            agent_name = self._resolve_agent_display_name()
-            text = f"Agent - {agent_name}"
+            text = self._resolve_agent_display_name()
         else:
             text = "Offline AI"
         
@@ -2297,7 +2370,7 @@ class MainWindow(QMainWindow):
             for idx, model in enumerate(self._build_gemini_model_candidates()):
                 model_id = model.get("id", f"gemini-{idx}")
                 label = model.get("name", self._google_model_display_name(model_id))
-                entries.append(_entry(f"google:{model_id}", f"Google – {label}", idx))
+                entries.append(_entry(f"google:{model_id}", str(label), idx))
         elif mode == OpponentMode.AGENT:
             agent_name = self._resolve_agent_display_name()
             entries.append(
@@ -3288,6 +3361,56 @@ class MainWindow(QMainWindow):
             return blank_map, None
         return {}, "Blanks položky majú zlý formát."
 
+    def _resolve_blank_usage_for_placements(
+        self,
+        placements: list[Placement],
+        declared_blank_map: dict[tuple[int, int], str],
+    ) -> tuple[dict[tuple[int, int], str], Optional[str]]:
+        """Resolve blank usage against current AI rack.
+
+        Supports two styles:
+        - explicit `blanks` map from model
+        - implicit wildcard use: placement letter not in rack but '?' is available
+        """
+        placement_coords = {(p.row, p.col) for p in placements}
+        resolved_map: dict[tuple[int, int], str] = {}
+        for coord, value in declared_blank_map.items():
+            if coord not in placement_coords:
+                continue
+            letter = str(value).strip().upper()
+            if len(letter) != 1:
+                return {}, "Blanks mapovanie má neplatné písmeno."
+            resolved_map[coord] = letter
+
+        rack_copy = self.ai_rack.copy()
+        for placement in placements:
+            coord = (placement.row, placement.col)
+            placed_letter = placement.letter.strip().upper()
+            if len(placed_letter) != 1:
+                return {}, "AI placement obsahuje neplatné písmeno."
+
+            if coord in resolved_map:
+                if "?" in rack_copy:
+                    rack_copy.remove("?")
+                    continue
+                return {}, "AI použila blank v mapovaní, ale '?' nie je na racku."
+
+            if placed_letter == "?":
+                return {}, "AI použila '?' bez mapovania v 'blanks'."
+
+            if placed_letter in rack_copy:
+                rack_copy.remove(placed_letter)
+                continue
+
+            if "?" in rack_copy:
+                rack_copy.remove("?")
+                resolved_map[coord] = placed_letter
+                continue
+
+            return {}, "AI použila písmeno, ktoré nemá."
+
+        return resolved_map, None
+
     def _register_scoreless_turn(self, side: StarterSide) -> None:
         self._pass_streak[side] = self._pass_streak.get(side, 0) + 1
         self._consecutive_passes += 1
@@ -3393,8 +3516,20 @@ class MainWindow(QMainWindow):
         - Search single-tile hooks first, then two-tile hooks near existing letters.
         - On empty board, try short rack permutations crossing center.
         """
-        rack_letters = [ch for ch in self.ai_rack if isinstance(ch, str) and len(ch) == 1 and ch != "?"]
+        rack_letters = [ch for ch in self.ai_rack if isinstance(ch, str) and len(ch) == 1]
         if not rack_letters:
+            return None
+        blank_count = sum(1 for ch in rack_letters if ch == "?")
+        rack_non_blank = [ch for ch in rack_letters if ch != "?"]
+        candidate_letters_single: list[str] = sorted({ch for ch in rack_non_blank})
+        if blank_count > 0:
+            wildcard_letters = {
+                str(letter.letter).strip().upper()
+                for letter in self.variant_definition.letters
+                if len(str(letter.letter).strip()) == 1 and str(letter.letter).strip() != "?"
+            }
+            candidate_letters_single = sorted(set(candidate_letters_single) | wildcard_letters)
+        if not candidate_letters_single and blank_count <= 0:
             return None
 
         board_has_letters = self._has_any_letters()
@@ -3427,6 +3562,9 @@ class MainWindow(QMainWindow):
                     return
             elif not first_move_must_cover_center(placements):
                 return
+            fits_rack, blank_map = self._placements_fit_rack(placements)
+            if not fits_rack:
+                return
 
             board_snapshot = deepcopy(self.board)
             board_snapshot.place_letters(placements)
@@ -3442,16 +3580,21 @@ class MainWindow(QMainWindow):
             move = self._build_move_from_placements(placements, words_found)
             if move is None:
                 return
+            if blank_map:
+                move["blanks"] = [
+                    {"row": r, "col": c, "as": letter}
+                    for (r, c), letter in sorted(blank_map.items())
+                ]
 
             if score > best_score:
                 best_score = score
                 best_move = move
 
         if not board_has_letters:
-            max_len = min(5, len(rack_letters))
+            max_len = min(5, len(rack_non_blank))
             for length in range(2, max_len + 1):
                 seen_words: set[str] = set()
-                for perm in set(permutations(rack_letters, length)):
+                for perm in set(permutations(rack_non_blank, length)):
                     word = "".join(perm)
                     if word in seen_words:
                         continue
@@ -3492,14 +3635,14 @@ class MainWindow(QMainWindow):
                     anchor_empties.add((rr, cc))
 
         for rr, cc in anchor_empties:
-            for letter in rack_letters:
+            for letter in candidate_letters_single:
                 consider([Placement(row=rr, col=cc, letter=letter)])
                 if checked >= max_candidates:
                     break
             if checked >= max_candidates:
                 break
 
-        if len(rack_letters) >= 2 and checked < max_candidates:
+        if (len(rack_non_blank) >= 2 or (blank_count > 0 and len(candidate_letters_single) >= 2)) and checked < max_candidates:
             pair_segments: set[tuple[tuple[int, int], tuple[int, int]]] = set()
             for r, c in anchor_empties:
                 for dr, dc in [(0, 1), (1, 0)]:
@@ -3512,7 +3655,18 @@ class MainWindow(QMainWindow):
                         coords = tuple(sorted(((r, c), (r2, c2))))
                         pair_segments.add(cast(tuple[tuple[int, int], tuple[int, int]], coords))
 
-            pair_perms = set(permutations(rack_letters, 2))
+            pair_perms = set(permutations(rack_non_blank, 2))
+            if blank_count > 0:
+                for wildcard_letter in candidate_letters_single:
+                    for base in candidate_letters_single:
+                        if (
+                            wildcard_letter == base
+                            and blank_count < 2
+                            and base not in rack_non_blank
+                        ):
+                            continue
+                        pair_perms.add((wildcard_letter, base))
+                        pair_perms.add((base, wildcard_letter))
             for (r1, c1), (r2, c2) in pair_segments:
                 for l1, l2 in pair_perms:
                     consider(
@@ -3549,6 +3703,19 @@ class MainWindow(QMainWindow):
         self._ai_thinking = False
 
         if not self._ai_local_fallback_used:
+            tracked = self._best_tracked_move()
+            if tracked is not None:
+                tracked_score, tracked_move = tracked
+                self._ai_local_fallback_used = True
+                try:
+                    self.chat_dialog.add_agent_activity(
+                        f"AI použila najlepší vypočítaný fallback ťah ({tracked_score} b).",
+                        section="final",
+                    )
+                except Exception:
+                    pass
+                self._on_ai_proposal(tracked_move)
+                return
             fallback_move = self._try_local_low_score_move()
             if fallback_move is not None:
                 self._ai_local_fallback_used = True
@@ -3899,6 +4066,7 @@ class MainWindow(QMainWindow):
             log.debug("Skip AI turn start during shutdown")
             return
         self._ai_thinking = True
+        self._reset_model_attempt_tracking()
         self._disable_human_inputs()
         self._start_status_spinner("ai", "Hrá AI", wait_cursor=False)
         # reset flagu pre nový ťah
@@ -4293,10 +4461,11 @@ class MainWindow(QMainWindow):
                         section="planning",
                     )
             # Update table status too
-            self.model_results_table.update_result(result)
+            self.model_results_table.update_result(self._merge_attempt_summary_into_result(result))
             return
 
         if status == "tool_result":
+            self._update_attempt_tracking_from_tool_result(result)
             if self.chat_dialog:
                 tool_name = result.get("tool_name", "?")
                 res_data = result.get("result", {})
@@ -4307,6 +4476,7 @@ class MainWindow(QMainWindow):
                     is_error=is_error,
                     model_name=model_name,
                 )
+            self.model_results_table.update_result(self._merge_attempt_summary_into_result(result))
             return
 
         if status == "retry":
@@ -4321,7 +4491,7 @@ class MainWindow(QMainWindow):
                 )
             # Continue to update table
 
-        self.model_results_table.update_result(result)
+        self.model_results_table.update_result(self._merge_attempt_summary_into_result(result))
 
         if status == "ok":
             words = result.get("words") or []
@@ -4366,13 +4536,15 @@ class MainWindow(QMainWindow):
     def _on_multi_model_results(self, results: list[dict[str, Any]]) -> None:
         """Handle multi-model competition results and display in table."""
         log.info("Received multi-model results: %d models", len(results))
+
+        merged_results = [self._merge_attempt_summary_into_result(r) for r in results]
         
         # Update table immediately with results
-        self.model_results_table.set_results(results)
+        self.model_results_table.set_results(merged_results)
 
         # Store the winning model name for status messages
         # Find the best valid result
-        valid_results = [r for r in results if r.get("judge_valid")]
+        valid_results = [r for r in merged_results if r.get("judge_valid")]
         if valid_results:
             valid_results.sort(key=lambda r: int(r.get("score", -1)), reverse=True)
             winner = valid_results[0]
@@ -4390,7 +4562,7 @@ class MainWindow(QMainWindow):
             )
         else:
             # No valid results, find highest scoring attempt
-            all_sorted = sorted(results, key=lambda r: int(r.get("score", -1)), reverse=True)
+            all_sorted = sorted(merged_results, key=lambda r: int(r.get("score", -1)), reverse=True)
             if all_sorted:
                 fallback = all_sorted[0]
                 self._current_ai_model = fallback.get("model_name", "AI")
@@ -4410,6 +4582,642 @@ class MainWindow(QMainWindow):
                         section="final",
                     )
                 self.status.showMessage("⚠️ Žiadne platné návrhy od modelov")
+
+    def _reset_model_attempt_tracking(self) -> None:
+        self._model_attempt_tracking = {}
+
+    @staticmethod
+    def _coerce_int(value: Any) -> int | None:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _normalize_attempt_word(value: Any) -> str:
+        if not isinstance(value, str):
+            return ""
+        normalized = value.strip().upper()
+        return normalized
+
+    @staticmethod
+    def _placements_signature(placements_obj: Any) -> str:
+        if not isinstance(placements_obj, list):
+            return ""
+        normalized: list[tuple[int, int, str]] = []
+        for item in placements_obj:
+            if not isinstance(item, dict):
+                continue
+            row = MainWindow._coerce_int(item.get("row"))
+            col = MainWindow._coerce_int(item.get("col"))
+            letter_raw = item.get("letter")
+            if row is None or col is None:
+                continue
+            if not isinstance(letter_raw, str):
+                continue
+            letter = letter_raw.strip().upper()
+            if not letter:
+                continue
+            normalized.append((row, col, letter))
+        if not normalized:
+            return ""
+        normalized.sort()
+        return "|".join(f"{row}:{col}:{letter}" for row, col, letter in normalized)
+
+    @staticmethod
+    def _extract_words_from_tool_payload(words_obj: Any) -> list[str]:
+        words: list[str] = []
+        if not isinstance(words_obj, list):
+            return words
+        for item in words_obj:
+            raw_word: Any = None
+            if isinstance(item, dict):
+                raw_word = item.get("word")
+            elif isinstance(item, str):
+                raw_word = item
+            word = MainWindow._normalize_attempt_word(raw_word)
+            if word:
+                words.append(word)
+        return words
+
+    def _attempt_state_for_model(self, model_id: str) -> dict[str, Any]:
+        state = self._model_attempt_tracking.get(model_id)
+        if state is None:
+            state = {
+                "validated_words": set(),
+                "invalid_words": set(),
+                "validation_order": [],
+                "validated_word_scores": {},
+                "validated_word_moves": {},
+                "legality_by_signature": {},
+                "scored_candidates": {},
+                "next_order": 0,
+            }
+            self._model_attempt_tracking[model_id] = state
+        return state
+
+    @staticmethod
+    def _placements_from_tool_args(placements_obj: Any) -> list[Placement]:
+        if not isinstance(placements_obj, list):
+            return []
+        placements: list[Placement] = []
+        for item in placements_obj:
+            if not isinstance(item, dict):
+                continue
+            row = MainWindow._coerce_int(item.get("row"))
+            col = MainWindow._coerce_int(item.get("col"))
+            letter_raw = item.get("letter")
+            if row is None or col is None or not isinstance(letter_raw, str):
+                continue
+            letter = letter_raw.strip().upper()
+            if not letter:
+                continue
+            placements.append(Placement(row=row, col=col, letter=letter))
+        return placements
+
+    def _placements_fit_rack(
+        self,
+        placements: list[Placement],
+    ) -> tuple[bool, dict[tuple[int, int], str]]:
+        rack_copy = list(self.ai_rack)
+        blank_map: dict[tuple[int, int], str] = {}
+        for placement in placements:
+            if placement.letter in rack_copy:
+                rack_copy.remove(placement.letter)
+                continue
+            if "?" in rack_copy:
+                rack_copy.remove("?")
+                blank_map[(placement.row, placement.col)] = placement.letter
+                continue
+            return False, {}
+        return True, blank_map
+
+    def _build_move_from_tool_candidate(
+        self,
+        placements_obj: Any,
+        words_obj: Any,
+    ) -> dict[str, Any] | None:
+        placements = self._placements_from_tool_args(placements_obj)
+        if not placements:
+            return None
+        direction = placements_in_line(placements)
+        if direction is None:
+            return None
+
+        if direction.name == "ACROSS":
+            ordered = sorted(placements, key=lambda p: (p.row, p.col))
+        else:
+            ordered = sorted(placements, key=lambda p: (p.col, p.row))
+        if not ordered:
+            return None
+
+        start = {"row": ordered[0].row, "col": ordered[0].col}
+        payload_placements = [
+            {"row": p.row, "col": p.col, "letter": p.letter}
+            for p in ordered
+        ]
+
+        placements_set = {(p.row, p.col) for p in ordered}
+        main_word = ""
+        longest_word = ""
+        if isinstance(words_obj, list):
+            for item in words_obj:
+                if not isinstance(item, dict):
+                    continue
+                raw_word = item.get("word")
+                if not isinstance(raw_word, str):
+                    continue
+                word = raw_word.strip().upper()
+                if not word:
+                    continue
+                if len(word) > len(longest_word):
+                    longest_word = word
+                cells_obj = item.get("cells")
+                if not isinstance(cells_obj, list):
+                    continue
+                cells: set[tuple[int, int]] = set()
+                valid_cells = True
+                for cell in cells_obj:
+                    if not isinstance(cell, list) or len(cell) != 2:
+                        valid_cells = False
+                        break
+                    r = self._coerce_int(cell[0])
+                    c = self._coerce_int(cell[1])
+                    if r is None or c is None:
+                        valid_cells = False
+                        break
+                    cells.add((r, c))
+                if valid_cells and placements_set.issubset(cells):
+                    main_word = word
+                    break
+
+        if not main_word:
+            main_word = longest_word or "".join(p.letter for p in ordered)
+
+        move: dict[str, Any] = {
+            "start": start,
+            "direction": direction.name,
+            "placements": payload_placements,
+            "word": main_word,
+            "pass": False,
+            "exchange": [],
+            "reason": "tool_scored_candidate",
+        }
+        fits, blank_map = self._placements_fit_rack(ordered)
+        if fits and blank_map:
+            move["blanks"] = [
+                {"row": r, "col": c, "as": letter}
+                for (r, c), letter in sorted(blank_map.items())
+            ]
+        return move
+
+    def _score_move_payload(self, move: dict[str, Any]) -> int | None:
+        placements_obj = move.get("placements")
+        if not isinstance(placements_obj, list) or not placements_obj:
+            return None
+        try:
+            placements: list[Placement] = []
+            for item in placements_obj:
+                if not isinstance(item, dict):
+                    return None
+                row = self._coerce_int(item.get("row"))
+                col = self._coerce_int(item.get("col"))
+                letter_raw = item.get("letter")
+                if row is None or col is None or not isinstance(letter_raw, str):
+                    return None
+                letter = letter_raw.strip().upper()
+                if not letter:
+                    return None
+                placements.append(Placement(row=row, col=col, letter=letter))
+            if not placements:
+                return None
+            direction = placements_in_line(placements)
+            if direction is None:
+                return None
+            if not no_gaps_in_line(self.board, placements, direction):
+                return None
+            if self._has_any_letters():
+                if not connected_to_existing(self.board, placements):
+                    return None
+            elif not first_move_must_cover_center(placements):
+                return None
+            board_snapshot = deepcopy(self.board)
+            board_snapshot.place_letters(placements)
+            words_found = extract_all_words(board_snapshot, placements)
+            words_coords = [(wf.word, wf.letters) for wf in words_found]
+            if not words_coords:
+                return None
+            score, _ = score_words(board_snapshot, placements, words_coords)
+            if len(placements) == 7:
+                score += 50
+            return int(score)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _move_uses_blank(move: dict[str, Any]) -> bool:
+        blanks_obj = move.get("blanks")
+        if isinstance(blanks_obj, list) and len(blanks_obj) > 0:
+            return True
+        placements_obj = move.get("placements")
+        if isinstance(placements_obj, list):
+            for item in placements_obj:
+                if not isinstance(item, dict):
+                    continue
+                letter = item.get("letter")
+                if isinstance(letter, str) and letter.strip() == "?":
+                    return True
+        return False
+
+    def _find_best_local_move_for_word(self, word: str) -> tuple[int, dict[str, Any] | None]:
+        normalized = self._normalize_attempt_word(word)
+        if len(normalized) < 2:
+            return -1, None
+
+        board_has_letters = self._has_any_letters()
+        letters = list(normalized)
+        length = len(letters)
+        best_score = -1
+        best_move: dict[str, Any] | None = None
+        max_candidates = 4000
+        checked = 0
+
+        for direction in ("ACROSS", "DOWN"):
+            if direction == "ACROSS":
+                row_range = range(15)
+                col_range = range(0, 15 - length + 1)
+            else:
+                row_range = range(0, 15 - length + 1)
+                col_range = range(15)
+
+            for row in row_range:
+                for col in col_range:
+                    if checked >= max_candidates:
+                        break
+                    checked += 1
+
+                    placements: list[Placement] = []
+                    fits_pattern = True
+                    for idx, letter in enumerate(letters):
+                        r = row + (idx if direction == "DOWN" else 0)
+                        c = col + (idx if direction == "ACROSS" else 0)
+                        existing = self.board.cells[r][c].letter
+                        if existing:
+                            if str(existing).strip().upper() != letter:
+                                fits_pattern = False
+                                break
+                        else:
+                            placements.append(Placement(row=r, col=c, letter=letter))
+                    if not fits_pattern or not placements:
+                        continue
+
+                    if direction == "ACROSS":
+                        before = (row, col - 1)
+                        after = (row, col + length)
+                    else:
+                        before = (row - 1, col)
+                        after = (row + length, col)
+
+                    def _occupied(coord: tuple[int, int]) -> bool:
+                        rr, cc = coord
+                        if not (0 <= rr < 15 and 0 <= cc < 15):
+                            return False
+                        return bool(self.board.cells[rr][cc].letter)
+
+                    if _occupied(before) or _occupied(after):
+                        continue
+
+                    fits_rack, blank_map = self._placements_fit_rack(placements)
+                    if not fits_rack:
+                        continue
+
+                    dir_enum = placements_in_line(placements)
+                    if dir_enum is None:
+                        continue
+                    if not no_gaps_in_line(self.board, placements, dir_enum):
+                        continue
+                    if board_has_letters:
+                        if not connected_to_existing(self.board, placements):
+                            continue
+                    elif not first_move_must_cover_center(placements):
+                        continue
+
+                    board_snapshot = deepcopy(self.board)
+                    board_snapshot.place_letters(placements)
+                    words_found = extract_all_words(board_snapshot, placements)
+                    words = [wf.word for wf in words_found]
+                    if not words:
+                        continue
+                    if not self._all_words_locally_valid(words):
+                        continue
+
+                    words_coords = [(wf.word, wf.letters) for wf in words_found]
+                    score, _ = score_words(board_snapshot, placements, words_coords)
+                    if len(placements) == 7:
+                        score += 50
+                    if int(score) <= best_score:
+                        continue
+
+                    move = self._build_move_from_placements(placements, words_found)
+                    if move is None:
+                        continue
+                    move["reason"] = "tracked_best_local_word"
+                    if blank_map:
+                        move["blanks"] = [
+                            {"row": r, "col": c, "as": letter}
+                            for (r, c), letter in sorted(blank_map.items())
+                        ]
+                    best_score = int(score)
+                    best_move = move
+                if checked >= max_candidates:
+                    break
+            if checked >= max_candidates:
+                break
+
+        return best_score, best_move
+
+    def _best_tracked_move(self) -> tuple[int, dict[str, Any]] | None:
+        candidates: list[tuple[int, int, int, dict[str, Any]]] = []
+        order = 0
+        for state in self._model_attempt_tracking.values():
+            legality_by_signature = cast(dict[str, bool], state.get("legality_by_signature", {}))
+            scored_candidates = cast(dict[str, dict[str, Any]], state.get("scored_candidates", {}))
+            validated_word_moves = cast(dict[str, dict[str, Any]], state.get("validated_word_moves", {}))
+
+            for candidate in scored_candidates.values():
+                signature = str(candidate.get("signature") or "").strip()
+                if signature:
+                    explicit_legality = legality_by_signature.get(signature)
+                    if explicit_legality is False:
+                        continue
+                    if explicit_legality is None and not bool(candidate.get("local_legal", False)):
+                        continue
+
+                move = candidate.get("move")
+                score = self._coerce_int(candidate.get("score"))
+                if not isinstance(move, dict) or score is None or score < 0:
+                    continue
+                blank_priority = 1 if self._move_uses_blank(move) else 0
+                candidates.append((score, blank_priority, order, dict(move)))
+                order += 1
+
+            for word_data in validated_word_moves.values():
+                move = word_data.get("move")
+                score = self._coerce_int(word_data.get("score"))
+                if not isinstance(move, dict) or score is None or score < 0:
+                    continue
+                blank_priority = 1 if self._move_uses_blank(move) else 0
+                candidates.append((score, blank_priority, order, dict(move)))
+                order += 1
+
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: (-item[0], -item[1], item[2]))
+        best_score, _blank_priority, _order, best_move = candidates[0]
+        return best_score, best_move
+
+    def _prefer_best_tracked_move(self, proposal: dict[str, Any]) -> dict[str, Any]:
+        tracked = self._best_tracked_move()
+        if tracked is None:
+            return proposal
+        tracked_score, tracked_move = tracked
+
+        proposal_non_scoring = bool(proposal.get("pass", False)) or bool(proposal.get("exchange"))
+        proposal_score = self._score_move_payload(proposal)
+        tracked_uses_blank = self._move_uses_blank(tracked_move)
+        proposal_uses_blank = self._move_uses_blank(proposal)
+        if (
+            proposal_non_scoring
+            or proposal_score is None
+            or tracked_score > proposal_score
+            or (
+                tracked_score == proposal_score
+                and tracked_uses_blank
+                and not proposal_uses_blank
+            )
+        ):
+            replacement = dict(tracked_move)
+            if "_usage" in proposal:
+                replacement["_usage"] = proposal.get("_usage")
+            log.info(
+                "[AI] Replacing proposal with best tracked move (tracked=%s, proposal=%s)",
+                tracked_score,
+                proposal_score,
+            )
+            try:
+                if self.chat_dialog:
+                    self.chat_dialog.add_agent_activity(
+                        f"📈 Používam najlepší vypočítaný ťah ({tracked_score} b).",
+                        section="final",
+                    )
+            except Exception:
+                pass
+            return replacement
+        return proposal
+
+    def _infer_local_move_legality(self, placements_obj: Any) -> bool:
+        placements = self._placements_from_tool_args(placements_obj)
+        if not placements:
+            return False
+
+        seen_coords: set[tuple[int, int]] = set()
+        for placement in placements:
+            if not (0 <= placement.row < 15 and 0 <= placement.col < 15):
+                return False
+            coord = (placement.row, placement.col)
+            if coord in seen_coords:
+                return False
+            seen_coords.add(coord)
+            if self.board.cells[placement.row][placement.col].letter:
+                return False
+
+        direction = placements_in_line(placements)
+        if direction is None:
+            return False
+        if not no_gaps_in_line(self.board, placements, direction):
+            return False
+
+        has_any_letters = any(
+            self.board.cells[r][c].letter for r in range(15) for c in range(15)
+        )
+        if not has_any_letters:
+            return first_move_must_cover_center(placements)
+        return connected_to_existing(self.board, placements)
+
+    def _update_attempt_tracking_from_tool_result(self, result: dict[str, Any]) -> None:
+        model_id = str(result.get("model") or "").strip()
+        if not model_id:
+            return
+        tool_name = str(result.get("tool_name") or "").strip().lower()
+        tool_args_raw = result.get("tool_args")
+        tool_result_raw = result.get("result")
+        tool_args = tool_args_raw if isinstance(tool_args_raw, dict) else {}
+        tool_result = tool_result_raw if isinstance(tool_result_raw, dict) else {}
+
+        state = self._attempt_state_for_model(model_id)
+        validated_words = cast(set[str], state["validated_words"])
+        invalid_words = cast(set[str], state["invalid_words"])
+        validation_order = cast(list[str], state["validation_order"])
+        validated_word_scores = cast(dict[str, int], state["validated_word_scores"])
+        validated_word_moves = cast(dict[str, dict[str, Any]], state["validated_word_moves"])
+        legality_by_signature = cast(dict[str, bool], state["legality_by_signature"])
+        scored_candidates = cast(dict[str, dict[str, Any]], state["scored_candidates"])
+
+        if tool_name in {"validate_word_slovak", "validate_word_english"}:
+            word = self._normalize_attempt_word(tool_args.get("word"))
+            if word:
+                is_valid = bool(tool_result.get("valid"))
+                if is_valid:
+                    validated_words.add(word)
+                    invalid_words.discard(word)
+                    if word not in validation_order:
+                        validation_order.append(word)
+                    best_score, best_move = self._find_best_local_move_for_word(word)
+                    if best_score >= 0:
+                        validated_word_scores[word] = best_score
+                    if best_move is not None and best_score >= 0:
+                        validated_word_moves[word] = {
+                            "score": best_score,
+                            "move": best_move,
+                            "order": validation_order.index(word),
+                        }
+                else:
+                    invalid_words.add(word)
+                    validated_word_scores.pop(word, None)
+                    validated_word_moves.pop(word, None)
+            return
+
+        if tool_name == "validate_move_legality":
+            signature = self._placements_signature(tool_args.get("placements"))
+            if signature:
+                legality_by_signature[signature] = bool(tool_result.get("valid"))
+            return
+
+        if tool_name != "calculate_move_score":
+            return
+
+        total_score = self._coerce_int(tool_result.get("total_score"))
+        words = self._extract_words_from_tool_payload(tool_result.get("words"))
+        placements_obj = tool_args.get("placements")
+        signature = self._placements_signature(placements_obj)
+        if total_score is None or total_score < 0 or not words:
+            return
+        if not signature:
+            return
+
+        local_legal = self._infer_local_move_legality(placements_obj)
+        next_order = int(state.get("next_order", 0))
+        state["next_order"] = next_order + 1
+
+        existing = scored_candidates.get(signature)
+        candidate_move = self._build_move_from_tool_candidate(
+            placements_obj=placements_obj,
+            words_obj=tool_result.get("words"),
+        )
+        if existing is None or total_score > int(existing.get("score", -1)):
+            scored_candidates[signature] = {
+                "signature": signature,
+                "words": words,
+                "score": total_score,
+                "local_legal": local_legal,
+                "order": next_order,
+                "move": candidate_move,
+            }
+
+    def _build_attempt_summary(self, model_id: str) -> dict[str, Any]:
+        state = self._model_attempt_tracking.get(model_id)
+        if state is None:
+            return {}
+
+        validated_words = cast(set[str], state.get("validated_words", set()))
+        invalid_words = cast(set[str], state.get("invalid_words", set()))
+        validation_order = cast(list[str], state.get("validation_order", []))
+        validated_word_scores = cast(dict[str, int], state.get("validated_word_scores", {}))
+        legality_by_signature = cast(dict[str, bool], state.get("legality_by_signature", {}))
+        scored_candidates = cast(dict[str, dict[str, Any]], state.get("scored_candidates", {}))
+
+        best_by_words: dict[str, tuple[int, int]] = {}
+        for candidate in scored_candidates.values():
+            words = [
+                self._normalize_attempt_word(word)
+                for word in cast(list[Any], candidate.get("words", []))
+            ]
+            words = [word for word in words if word]
+            if not words:
+                continue
+
+            signature = str(candidate.get("signature") or "").strip()
+            if not signature:
+                continue
+
+            explicit_legality = legality_by_signature.get(signature)
+            if explicit_legality is False:
+                continue
+            if explicit_legality is None and not bool(candidate.get("local_legal", False)):
+                continue
+
+            if any(word in invalid_words for word in words):
+                continue
+            if validated_words and not any(word in validated_words for word in words):
+                continue
+
+            score = self._coerce_int(candidate.get("score"))
+            if score is None:
+                continue
+
+            order_value = self._coerce_int(candidate.get("order")) or 0
+            words_key = "+".join(words)
+            previous_best = best_by_words.get(words_key)
+            if previous_best is None or score > previous_best[0]:
+                best_by_words[words_key] = (score, order_value)
+
+        for order_idx, word in enumerate(validation_order):
+            if word in invalid_words or word not in validated_words:
+                continue
+            score = self._coerce_int(validated_word_scores.get(word))
+            if score is None:
+                continue
+            word_key = word
+            previous_best = best_by_words.get(word_key)
+            if previous_best is None or score > previous_best[0]:
+                best_by_words[word_key] = (score, order_idx)
+
+        if not best_by_words:
+            return {}
+
+        ordered = sorted(
+            best_by_words.items(),
+            key=lambda item: (-item[1][0], item[1][1], item[0]),
+        )
+        display_parts: list[str] = []
+        for words_key, (score, _order_value) in ordered:
+            human_words = "+".join(part.lower() for part in words_key.split("+"))
+            display_parts.append(f"{human_words} ({score})")
+        if not display_parts:
+            return {}
+
+        first_part = html.escape(display_parts[0])
+        other_parts = [html.escape(part) for part in display_parts[1:]]
+        attempts_html = f"<b>{first_part}</b>"
+        if other_parts:
+            attempts_html += ", " + ", ".join(other_parts)
+
+        return {
+            "attempts_display": ", ".join(display_parts),
+            "attempts_html": attempts_html,
+            "best_attempt_score": ordered[0][1][0],
+        }
+
+    def _merge_attempt_summary_into_result(self, result: dict[str, Any]) -> dict[str, Any]:
+        model_id = str(result.get("model") or result.get("id") or "").strip()
+        if not model_id:
+            return result
+        summary = self._build_attempt_summary(model_id)
+        if not summary:
+            return result
+        merged = dict(result)
+        merged.update(summary)
+        return merged
     
     def _update_table_for_judging(self, words: list[str]) -> None:
         """Update table to highlight which words are being judged."""
@@ -4473,27 +5281,13 @@ class MainWindow(QMainWindow):
         else:
             if not connected_to_existing(self.board, ps):
                 return "AI ťah nenadväzuje."
-        # skontroluj rack AI (pocet a pouzitie blankov)
-        # Pozn.: AI moze poslat v placements realne pismeno (napr. 'E')
-        # a zaroven v `blanks` uviesť, ze na daných súradniciach ide o blank
-        # mapovaný na 'E'. V takom prípade musíme spotrebovať '?' z racku,
-        # nie písmeno 'E'.
-        rack_copy = self.ai_rack.copy()
+        resolved_blank_map, blank_usage_err = self._resolve_blank_usage_for_placements(
+            ps, blank_map
+        )
+        if blank_usage_err is not None:
+            return blank_usage_err
         for placement in ps:
-            consume_as_blank = (placement.row, placement.col) in blank_map
-            if placement.letter == "?" or consume_as_blank:
-                if "?" in rack_copy:
-                    rack_copy.remove("?")
-                else:
-                    return "AI použila viac blankov než má."
-            else:
-                if placement.letter in rack_copy:
-                    rack_copy.remove(placement.letter)
-                else:
-                    return "AI použila písmeno, ktoré nemá."
-        # ak blanky, musia mat mapovanie
-        for placement in ps:
-            if placement.letter == "?" and (placement.row, placement.col) not in blank_map:
+            if placement.letter == "?" and (placement.row, placement.col) not in resolved_blank_map:
                 return "AI použila blank bez 'blanks' mapovania."
         return None
 
@@ -4507,6 +5301,7 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         log.info("AI navrhla: %s", proposal)
+        proposal = self._prefer_best_tracked_move(proposal)
         usage = proposal.get("_usage")
         if usage:
             try:
@@ -4589,17 +5384,32 @@ class MainWindow(QMainWindow):
             ps.append(Placement(r, c, letter))
             
         blanks = proposal.get("blanks")
-        blank_map, _ = self._parse_blank_map(blanks)
+        blank_map, blank_err = self._parse_blank_map(blanks)
+        if blank_err is not None:
+            self._apply_ai_exchange_turn(
+                reason=f"invalid_blanks_map:{blank_err}",
+                requested_exchange=None,
+                status_message="AI vrátila neplatné blank mapovanie, mení písmená",
+            )
+            return
+        resolved_blank_map, resolved_blank_err = self._resolve_blank_usage_for_placements(ps, blank_map)
+        if resolved_blank_err is not None:
+            self._apply_ai_exchange_turn(
+                reason=f"invalid_blank_usage:{resolved_blank_err}",
+                requested_exchange=None,
+                status_message=f"AI zle použila joker ({resolved_blank_err}), mení písmená",
+            )
+            return
         # nastav blank_as; ak AI oznacila v `blanks`, prekonvertuj na '?'
         ps2: list[Placement] = []
         for placement in ps:
-            if (placement.row, placement.col) in blank_map:
+            if (placement.row, placement.col) in resolved_blank_map:
                 ps2.append(
                     Placement(
                         placement.row,
                         placement.col,
                         "?",
-                        blank_as=blank_map[(placement.row, placement.col)],
+                        blank_as=resolved_blank_map[(placement.row, placement.col)],
                     )
                 )
             else:

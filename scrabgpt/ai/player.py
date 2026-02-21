@@ -378,13 +378,20 @@ def _load_prompt_template(use_chat_protocol: bool = True) -> str:
 $ = TL (×3 písmeno)
 ^ = DL (×2 písmeno)
 
+=== JOKER '?' (BLANK) ===
+- '?' je zástupný kameň a môže reprezentovať ľubovoľné písmeno.
+- Keď máš '?' na racku, POVINNE posúď aj ťahy, ktoré ho použijú.
+- Pri rovnakom skóre preferuj ťah, ktorý spotrebuje '?'.
+- Ak '?' použiješ, do `placements` daj výsledné písmeno a vyplň `blanks` mapovanie.
+
 === FORMÁT ODPOVEDE ===
 ```json
 {{
   "start": {{"row": 7, "col": 7}},
   "direction": "ACROSS",
   "placements": [{{"row": 7, "col": 7, "letter": "K"}}],
-  "word": "KOT"
+  "word": "KOT",
+  "blanks": [{{"row": 7, "col": 7, "as": "K"}}]
 }}
 ```
 
@@ -392,7 +399,7 @@ Ak nie je možný ťah: skús nájsť aspoň výmenu, ale NIKDY nepasuj. "pass":
 """
     else:
         # Embedded legacy fallback
-        return """You are an expert Scrabble player for the {language} language variant. Play to win and obey official Scrabble rules for that language. Do NOT overwrite existing board letters; place only on empty cells. Placements must form a single contiguous line with no gaps and must connect to existing letters after previous move. Use only letters from ai_rack; for '?' use chosen uppercase letter (respecting diacritics). Points you can get for each tile: {tile_summary}. Always evaluate moves that use all 7 rack tiles for the 50 point bingo bonus; play it when legal. Prefer the move that maximizes total points, spending high-value rack letters on premium squares. Do not glue your letters to adjacent existing letters unless the resulting main word is a valid {language} word. Use intersections/hooks properly; you may share letters with the board only at overlapping cells; do not extend an existing word into a non-word. The field 'word' must equal the final main word formed on the board (existing board letters plus your placements). All cross-words should plausibly be valid {language} words. Diacritics is very important so distinguishing between 'Ú' and 'U' for example and every letter with diacritic. NEVER GIVE UP. Always find a valid move. DO NOT PASS. "pass": true is FORBIDDEN. If board is empty, the first move must cross the center star at H8 (row=7,col=7). Coordinates are 0-based. No explanations — JSON only. Always return a JSON object with keys: start:{{row:int,col:int}}, direction:'ACROSS'|'DOWN', placements:[{{row,col,letter}}]. Empty premium squares in the grid already show their multiplier symbol (see legend). Prioritize TL/DL for high-value letters and aim to span DW/TW with the main word when possible; stacking letter multipliers that feed into word multipliers yields maximal score. Also value high-scoring cross-words created by your placements.
+        return """You are an expert Scrabble player for the {language} language variant. Play to win and obey official Scrabble rules for that language. Do NOT overwrite existing board letters; place only on empty cells. Placements must form a single contiguous line with no gaps and must connect to existing letters after previous move. Use only letters from ai_rack; for '?' use chosen uppercase letter (respecting diacritics). If your rack contains '?', you MUST evaluate candidate moves that consume it and prefer consuming '?' on score ties. Points you can get for each tile: {tile_summary}. Always evaluate moves that use all 7 rack tiles for the 50 point bingo bonus; play it when legal. Prefer the move that maximizes total points, spending high-value rack letters on premium squares. Do not glue your letters to adjacent existing letters unless the resulting main word is a valid {language} word. Use intersections/hooks properly; you may share letters with the board only at overlapping cells; do not extend an existing word into a non-word. The field 'word' must equal the final main word formed on the board (existing board letters plus your placements). All cross-words should plausibly be valid {language} words. Diacritics is very important so distinguishing between 'Ú' and 'U' for example and every letter with diacritic. NEVER GIVE UP. Always find a valid move. DO NOT PASS. "pass": true is FORBIDDEN. If board is empty, the first move must cross the center star at H8 (row=7,col=7). Coordinates are 0-based. No explanations — JSON only. Always return a JSON object with keys: start:{{row:int,col:int}}, direction:'ACROSS'|'DOWN', placements:[{{row,col,letter}}], optional blanks:[{{row,col,as}}] when wildcard is used. Empty premium squares in the grid already show their multiplier symbol (see legend). Prioritize TL/DL for high-value letters and aim to span DW/TW with the main word when possible; stacking letter multipliers that feed into word multipliers yields maximal score. Also value high-scoring cross-words created by your placements.
 
 Given this compact state, propose exactly one move with placements in a single line using only valid {language} words.
 
@@ -420,18 +427,23 @@ def _strict_output_contract(language: str) -> str:
     return (
         "=== STRICT OUTPUT CONTRACT ===\n"
         "- Final textual output must be exactly one JSON object.\n"
-        "- No markdown fences, no prose, no extra keys.\n"
+        "- No markdown fences, no prose.\n"
         "- No <thinking>, no <thinking_process>, no XML/HTML tags.\n"
         "- First character must be '{' and last character must be '}'.\n"
         f"- All created words must be valid in {language}.\n"
         "- Do NOT output pass=true.\n"
-        "- JSON must have exactly this structure:\n"
+        "- Required keys: start, direction, placements, word.\n"
+        "- Optional key: blanks (only if '?' wildcard is consumed).\n"
+        "- If you use wildcard '?', output actual placed letter in placements and map it in blanks.\n"
+        "- JSON shape:\n"
         "{\n"
         '  "start": {"row": 7, "col": 7},\n'
         '  "direction": "ACROSS",\n'
         '  "placements": [{"row": 7, "col": 7, "letter": "A"}],\n'
-        '  "word": "..."'
-        "\n}"
+        '  "word": "..."\n'
+        "}\n"
+        "Optional when wildcard is used:\n"
+        '{"blanks":[{"row":7,"col":7,"as":"A"}]}'
     )
 
 
@@ -527,8 +539,18 @@ def _build_prompt(compact_state: str, variant: VariantDefinition) -> str:
         rack=rack_str,
     )
 
+    blank_focus_block = ""
+    if "?" in rack_str:
+        blank_focus_block = (
+            "\n\n=== BLANK TILE PRIORITY ===\n"
+            "- Rack contains '?'. Treat it as a wildcard joker.\n"
+            "- Evaluate multiple high-scoring moves that consume '?'.\n"
+            "- Choose the highest-scoring legal move; on ties prefer the one that consumes '?'.\n"
+            "- When '?' is used, include `blanks` mapping for every wildcard placement.\n"
+        )
+
     # Always enforce strict JSON-only output even with custom prompt templates.
-    return f"{prompt}\n\n{_strict_output_contract(language)}"
+    return f"{prompt}{blank_focus_block}\n\n{_strict_output_contract(language)}"
 
 
 def propose_move(
