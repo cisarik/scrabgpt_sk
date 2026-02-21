@@ -46,6 +46,7 @@ class VertexClient:
         location: str | None = None,
         *,
         timeout_seconds: int | None = None,
+        allow_model_fallback: bool = True,
     ) -> None:
         configured_model = (
             os.getenv("GEMINI_MODEL")
@@ -72,6 +73,7 @@ class VertexClient:
             env_timeout_value = None
         resolved_timeout = timeout_seconds or env_timeout_value or 120
         self.timeout_seconds = max(5, resolved_timeout)
+        self.allow_model_fallback = allow_model_fallback
         
         self._call_counter = count(1)
         self.ai_move_max_output_tokens = self._resolve_ai_move_max_tokens()
@@ -174,6 +176,7 @@ class VertexClient:
         thinking_mode: bool = False,
         tools: list[Any] | None = None,
         tool_config: Any | None = None,
+        tool_context: dict[str, Any] | None = None,
         progress_callback: Callable[[dict[str, Any]], Any] | None = None,
         _fallback_depth: int = 0,
     ) -> dict[str, Any]:
@@ -285,6 +288,7 @@ class VertexClient:
                 
                 # --- Tool Execution Loop ---
                 from .tool_adapter import execute_tool
+                tool_calls_executed: list[str] = []
                 
                 while True:
                     # Run blocking call via dedicated executor.
@@ -361,7 +365,8 @@ class VertexClient:
                     tool_outputs: list[Any] = []
                     for tool_name, tool_args in tool_calls:
                         log.info("[%s] Executing tool: %s", trace_id, tool_name)
-                        result = execute_tool(tool_name, tool_args)
+                        result = execute_tool(tool_name, tool_args, context=tool_context)
+                        tool_calls_executed.append(tool_name)
                         
                         # Report result via progress callback
                         if progress_callback:
@@ -418,6 +423,7 @@ class VertexClient:
                     "prompt_tokens": prompt_tokens,
                     "completion_tokens": completion_tokens,
                     "status": "ok",
+                    "tool_calls_executed": tool_calls_executed,
                     "trace_id": trace_id,
                     "call_id": call_id,
                     "elapsed": elapsed,
@@ -426,7 +432,7 @@ class VertexClient:
                 
             except Exception as e:
                 fallback_model = None
-                if _fallback_depth < 2:
+                if self.allow_model_fallback and _fallback_depth < 2:
                     fallback_model = self._fallback_model_for_error(model_id, str(e))
                 if fallback_model and fallback_model != model_id:
                     log.warning(
@@ -444,6 +450,7 @@ class VertexClient:
                         thinking_mode=thinking_mode,
                         tools=tools,
                         tool_config=tool_config,
+                        tool_context=tool_context,
                         progress_callback=progress_callback,
                         _fallback_depth=_fallback_depth + 1,
                     )
@@ -473,6 +480,7 @@ class VertexClient:
                     "content": "",
                     "error": error_message,
                     "status": "error",
+                    "tool_calls_executed": [],
                     "trace_id": trace_id,
                     "call_id": call_id,
                     "elapsed": elapsed,

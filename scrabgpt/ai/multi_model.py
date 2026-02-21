@@ -42,6 +42,18 @@ _NON_SCORING_RETRY_FEEDBACK = (
     "Only return exchange when you truly cannot form any legal word."
 )
 
+_TOOL_WORKFLOW_INSTRUCTION = (
+    "\n\nMANDATORY TOOL WORKFLOW:\n"
+    "1) FIRST call get_board_state.\n"
+    "2) SECOND call get_premium_squares.\n"
+    "3) THEN evaluate multiple candidate words in a loop.\n"
+    "4) For each candidate, use validate_move_legality + calculate_move_score.\n"
+    "5) Validate candidate words with validate_word_slovak/validate_word_english.\n"
+    "6) Evaluate at least 5 candidates when possible.\n"
+    "7) Return ONLY the highest-scoring legal move from evaluated candidates.\n"
+    "Do not finalize output before completing steps 1 and 2."
+)
+
 
 def _timeout_fallback_model(model_id: str) -> str | None:
     normalized = model_id.replace("google/", "").strip().lower()
@@ -73,6 +85,62 @@ def _extract_rack_letters(compact_state: str) -> list[str]:
     return [token for token in tokens if len(token) == 1]
 
 
+def _serialize_board_grid(board: Board) -> list[str]:
+    grid: list[str] = []
+    for r in range(15):
+        row = []
+        for c in range(15):
+            row.append(board.cells[r][c].letter or ".")
+        grid.append("".join(row))
+    return grid
+
+
+def _serialize_blanks(board: Board) -> list[dict[str, int]]:
+    blanks: list[dict[str, int]] = []
+    for r in range(15):
+        for c in range(15):
+            if board.cells[r][c].is_blank:
+                blanks.append({"row": r, "col": c})
+    return blanks
+
+
+def _serialize_premium_grid(board: Board) -> list[list[dict[str, Any] | None]]:
+    grid: list[list[dict[str, Any] | None]] = []
+    for r in range(15):
+        row: list[dict[str, Any] | None] = []
+        for c in range(15):
+            cell = board.cells[r][c]
+            if cell.premium is None:
+                row.append(None)
+                continue
+            row.append(
+                {
+                    "type": cell.premium.name,
+                    "used": bool(cell.premium_used),
+                }
+            )
+        grid.append(row)
+    return grid
+
+
+def _serialize_premium_squares(board: Board) -> list[dict[str, Any]]:
+    premiums: list[dict[str, Any]] = []
+    for r in range(15):
+        for c in range(15):
+            cell = board.cells[r][c]
+            if cell.premium is None:
+                continue
+            premiums.append(
+                {
+                    "row": r,
+                    "col": c,
+                    "type": cell.premium.name,
+                    "used": bool(cell.premium_used),
+                }
+            )
+    return premiums
+
+
 async def propose_move_multi_model(
     client: OpenRouterClient,
     models: list[dict[str, Any]],
@@ -84,6 +152,8 @@ async def propose_move_multi_model(
     timeout_seconds: int = 60,
     thinking_mode: bool = False,
     tools: list[Any] | None = None,
+    allow_model_fallback: bool = True,
+    enforce_tool_workflow: bool = False,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """Call multiple models concurrently and return best move + all results.
     
@@ -100,6 +170,19 @@ async def propose_move_multi_model(
             "Exchange is allowed only when no legal word can be formed. "
             "Pass is last resort only."
         )
+        if enforce_tool_workflow:
+            prompt += _TOOL_WORKFLOW_INSTRUCTION
+
+    tool_context = {
+        "board_grid": _serialize_board_grid(board),
+        "blanks": _serialize_blanks(board),
+        "premium_grid": _serialize_premium_grid(board),
+        "premium_squares": _serialize_premium_squares(board),
+        "rack_letters": _extract_rack_letters(compact_state),
+        "is_first_move": not any(
+            board.cells[r][c].letter for r in range(15) for c in range(15)
+        ),
+    }
     
     async def call_one_model(model_info: dict[str, Any]) -> dict[str, Any]:
         model_id = model_info["id"]
@@ -151,6 +234,8 @@ async def propose_move_multi_model(
                 kwargs["thinking_mode"] = thinking_mode
             if "tools" in sig.parameters:
                 kwargs["tools"] = tools
+            if "tool_context" in sig.parameters:
+                kwargs["tool_context"] = tool_context
             if "messages" in sig.parameters and conversation_history:
                 kwargs["messages"] = conversation_history
             if "progress_callback" in sig.parameters:
@@ -171,7 +256,12 @@ async def propose_move_multi_model(
                 )
             except asyncio.TimeoutError:
                 timeout_fallback = _timeout_fallback_model(active_model_id)
-                if timeout_fallback and timeout_fallback != active_model_id and attempt_count < max_attempts:
+                if (
+                    allow_model_fallback
+                    and timeout_fallback
+                    and timeout_fallback != active_model_id
+                    and attempt_count < max_attempts
+                ):
                     previous = active_model_id
                     active_model_id = timeout_fallback
                     active_model_name = timeout_fallback
@@ -232,6 +322,27 @@ async def propose_move_multi_model(
 
             call_status = result.get("status")
             fallback_from = result.get("fallback_from")
+            executed_tools_raw = result.get("tool_calls_executed")
+            executed_tools_list = [
+                str(name).strip()
+                for name in (executed_tools_raw if isinstance(executed_tools_raw, list) else [])
+                if isinstance(name, str) and str(name).strip()
+            ]
+            executed_tools = {
+                name for name in executed_tools_list
+            }
+            missing_workflow_tools: list[str] = []
+            if enforce_tool_workflow and tools:
+                for required in ("get_board_state", "get_premium_squares"):
+                    if required not in executed_tools:
+                        missing_workflow_tools.append(required)
+                if not missing_workflow_tools:
+                    board_idx = executed_tools_list.index("get_board_state")
+                    premium_idx = executed_tools_list.index("get_premium_squares")
+                    if premium_idx < board_idx:
+                        missing_workflow_tools.append(
+                            "tool_order(get_board_state -> get_premium_squares)"
+                        )
             if isinstance(call_status, str) and call_status != "ok" and not raw_content.strip():
                 error_msg = str(result.get("error") or "Model call failed")
                 log.warning(
@@ -385,6 +496,18 @@ async def propose_move_multi_model(
 
             # Force retries for non-scoring decisions before giving up.
             if not parse_error and move:
+                if missing_workflow_tools:
+                    parse_error = (
+                        "Required tool workflow missing. Call tools first: "
+                        + ", ".join(missing_workflow_tools)
+                    )
+                    log.info(
+                        "Model %s skipped required tools (%s) on attempt %d/%d; retrying",
+                        active_model_id,
+                        ", ".join(missing_workflow_tools),
+                        attempt_count,
+                        max_attempts,
+                    )
                 has_exchange = bool(move.get("exchange"))
                 wants_pass = bool(move.get("pass"))
                 if (has_exchange or wants_pass) and attempt_count < max_attempts:

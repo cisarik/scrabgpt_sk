@@ -2004,11 +2004,26 @@ class MainWindow(QMainWindow):
         self._starter_side: StarterSide | None = None
         self._starter_decided: bool = False
         
-        # Default preferovaný model pre Google/Gemini mód.
-        # Ak používateľ explicitne vyberie model, probe ho neprepíše.
-        env_google_model = (os.getenv("GEMINI_MODEL") or os.getenv("GOOGLE_GEMINI_MODEL") or "").strip()
-        self._preferred_gemini_model = env_google_model or "gemini-2.5-pro"
-        self._google_model_user_selected = bool(env_google_model)
+        # Default preferované modely pre Google/Gemini mód.
+        # Ak používateľ explicitne vyberie model(y), probe ich neprepíše.
+        env_google_models_raw = (
+            os.getenv("GEMINI_MODELS")
+            or os.getenv("GOOGLE_GEMINI_MODELS")
+            or ""
+        ).strip()
+        env_google_models = self._parse_model_csv(env_google_models_raw)
+        env_google_model = (
+            os.getenv("GEMINI_MODEL")
+            or os.getenv("GOOGLE_GEMINI_MODEL")
+            or ""
+        ).strip()
+        if not env_google_models and env_google_model:
+            env_google_models = [env_google_model]
+        if not env_google_models:
+            env_google_models = ["gemini-2.5-pro"]
+        self._preferred_gemini_models = env_google_models
+        self._preferred_gemini_model = env_google_models[0]
+        self._google_model_user_selected = bool(env_google_model or env_google_models_raw)
         
         # Spustiť detekciu Gemini 3.0 na pozadí
         self._start_gemini_probe()
@@ -2038,9 +2053,10 @@ class MainWindow(QMainWindow):
 
         if available:
             log.info("Gemini 3.1 Pro detected! Switching preferred model.")
+            self._preferred_gemini_models = ["gemini-3.1-pro-preview"]
             self._preferred_gemini_model = "gemini-3.1-pro-preview"
-            # Update UI if Gemini mode is active? Only if we need to refresh labels/tables.
-            # But _start_ai_turn uses self._preferred_gemini_model dynamically.
+            self._refresh_model_results_table()
+            self._update_mode_status_label()
         else:
             log.info("Gemini 3.1 Pro not available, staying with 2.5 Pro.")
 
@@ -2156,18 +2172,24 @@ class MainWindow(QMainWindow):
 
     def _resolve_google_model_label(self) -> str:
         """Resolve human-readable label for selected Google/Gemini model."""
-        model_id = (getattr(self, "_preferred_gemini_model", "") or "").strip()
-        if not model_id:
-            model_id = "gemini-2.5-pro"
-        if "3.1-pro" in model_id:
-            return "Gemini 3.1 Pro"
-        if "3-pro" in model_id:
-            return "Gemini 3 Pro"
-        if "2.5-flash" in model_id:
-            return "Gemini 2.5 Flash"
-        if "2.5-pro" in model_id:
+        models = self._build_gemini_model_candidates()
+        if not models:
             return "Gemini 2.5 Pro"
-        return model_id
+        first_id = models[0].get("id", "gemini-2.5-pro")
+        first_label = self._google_model_display_name(first_id)
+        if len(models) == 1:
+            return first_label
+        return f"{first_label} +{len(models) - 1}"
+
+    @staticmethod
+    def _parse_model_csv(raw: str) -> list[str]:
+        models: list[str] = []
+        for item in raw.split(","):
+            model_id = item.strip()
+            if not model_id or model_id in models:
+                continue
+            models.append(model_id)
+        return models
 
     @staticmethod
     def _google_model_display_name(model_id: str) -> str:
@@ -2183,23 +2205,11 @@ class MainWindow(QMainWindow):
         return normalized or "Gemini"
 
     def _build_gemini_model_candidates(self) -> list[dict[str, str]]:
-        """Return ordered Google model list with automatic fallback candidates."""
-        primary = (getattr(self, "_preferred_gemini_model", "") or "").strip() or "gemini-2.5-pro"
-        chain: list[str] = [primary]
-
-        # Always keep a robust Google fallback chain. This protects against
-        # unavailable preview models and intermittent timeouts.
-        if "3.1-pro" in primary:
-            chain.extend(["gemini-3-pro-preview", "gemini-2.5-pro", "gemini-2.5-flash"])
-        elif "3-pro" in primary:
-            chain.extend(["gemini-2.5-pro", "gemini-2.5-flash"])
-        elif "2.5-pro" in primary:
-            chain.append("gemini-2.5-flash")
-        elif "2.5-flash" in primary:
-            chain.append("gemini-2.5-pro")
-        else:
-            # Unknown/experimental ID -> still keep stable fallbacks.
-            chain.extend(["gemini-2.5-pro", "gemini-2.5-flash"])
+        """Return ordered Google model list selected by user."""
+        chain = list(getattr(self, "_preferred_gemini_models", []))
+        if not chain:
+            primary = (getattr(self, "_preferred_gemini_model", "") or "").strip()
+            chain = [primary or "gemini-2.5-pro"]
 
         unique_chain: list[str] = []
         for model_id in chain:
@@ -2209,10 +2219,8 @@ class MainWindow(QMainWindow):
             unique_chain.append(normalized)
 
         candidates: list[dict[str, str]] = []
-        for idx, model_id in enumerate(unique_chain):
+        for model_id in unique_chain:
             label = self._google_model_display_name(model_id)
-            if idx > 0:
-                label = f"{label} (fallback)"
             candidates.append({"id": model_id, "name": label})
         return candidates
 
@@ -3992,7 +4000,10 @@ class MainWindow(QMainWindow):
                             return
 
                         if self.provider_type == "vertex":
-                            vertex_client = VertexClient(timeout_seconds=self.timeout_seconds)
+                            vertex_client = VertexClient(
+                                timeout_seconds=self.timeout_seconds,
+                                allow_model_fallback=False,
+                            )
                             
                             async def run_vertex_multi() -> tuple[dict[str, Any], list[dict[str, Any]]]:
                                 def on_partial(res: dict[str, Any]) -> None:
@@ -4030,7 +4041,9 @@ class MainWindow(QMainWindow):
                                         progress_callback=on_partial,
                                         timeout_seconds=self.timeout_seconds,
                                         thinking_mode=use_thinking,
-                                        tools=tools # Pass tools
+                                        tools=tools, # Pass tools
+                                        allow_model_fallback=False,
+                                        enforce_tool_workflow=True,
                                     )
                                 finally:
                                     await vertex_client.close()
@@ -4357,40 +4370,6 @@ class MainWindow(QMainWindow):
         # Update table immediately with results
         self.model_results_table.set_results(results)
 
-        if self.opponent_mode == OpponentMode.GEMINI:
-            for entry in results:
-                if entry.get("status") != "ok":
-                    continue
-                fallback_from = entry.get("fallback_from")
-                fallback_to = entry.get("model")
-                if not isinstance(fallback_from, str) or not fallback_from.strip():
-                    continue
-                if not isinstance(fallback_to, str) or not fallback_to.strip():
-                    continue
-                fallback_to = fallback_to.strip()
-                if fallback_to == self._preferred_gemini_model:
-                    continue
-                self._preferred_gemini_model = fallback_to
-                self._google_model_user_selected = True
-                self._update_env_value("GEMINI_MODEL", fallback_to)
-                self._update_env_value("GOOGLE_GEMINI_MODEL", fallback_to)
-                self._update_mode_status_label()
-                log.warning(
-                    "Persisting Google fallback model due to unavailable %s -> %s",
-                    fallback_from,
-                    fallback_to,
-                )
-                self.status.showMessage(
-                    f"Google model {fallback_from} nie je dostupný, prepínam na {fallback_to}",
-                    5000,
-                )
-                if self.chat_dialog:
-                    self.chat_dialog.add_agent_activity(
-                        f"🔁 Google fallback: {fallback_from} -> {fallback_to}",
-                        section="final",
-                    )
-                break
-        
         # Store the winning model name for status messages
         # Find the best valid result
         valid_results = [r for r in results if r.get("judge_valid")]
@@ -5006,7 +4985,7 @@ class MainWindow(QMainWindow):
             # Get and save opponent mode
             new_mode = dlg.get_selected_mode()
             new_agent = dlg.get_selected_agent_name()
-            new_google_model = dlg.get_selected_google_model()
+            new_google_models = dlg.get_selected_google_models()
             
             if new_mode != self.opponent_mode or new_agent != self.selected_agent_name:
                 self.opponent_mode = new_mode
@@ -5023,14 +5002,19 @@ class MainWindow(QMainWindow):
                 else:
                     self.status.showMessage(f"AI Režim: {mode_name}", 3000)
 
-            if isinstance(new_google_model, str) and new_google_model.strip():
-                model_value = new_google_model.strip()
-                if model_value != self._preferred_gemini_model:
-                    log.info("Updated Google model to %s", model_value)
-                self._preferred_gemini_model = model_value
+            if new_google_models:
+                model_values = [m.strip() for m in new_google_models if isinstance(m, str) and m.strip()]
+                if model_values and model_values != self._preferred_gemini_models:
+                    log.info("Updated Google models to %s", model_values)
+                if model_values:
+                    self._preferred_gemini_models = model_values
+                    self._preferred_gemini_model = model_values[0]
                 self._google_model_user_selected = True
-                self._update_env_value("GEMINI_MODEL", model_value)
-                self._update_env_value("GOOGLE_GEMINI_MODEL", model_value)
+                self._update_env_value("GEMINI_MODEL", self._preferred_gemini_model)
+                self._update_env_value("GOOGLE_GEMINI_MODEL", self._preferred_gemini_model)
+                models_csv = ",".join(self._preferred_gemini_models)
+                self._update_env_value("GEMINI_MODELS", models_csv)
+                self._update_env_value("GOOGLE_GEMINI_MODELS", models_csv)
             
             new_ai_tokens, from_env = self._load_ai_move_max_tokens()
             self.ai_move_max_tokens = new_ai_tokens
@@ -5432,7 +5416,7 @@ class MainWindow(QMainWindow):
         def on_opponent_settings_accepted() -> None:
             new_mode = dialog.get_selected_mode()
             new_agent = dialog.get_selected_agent_name()
-            new_google_model = dialog.get_selected_google_model()
+            new_google_models = dialog.get_selected_google_models()
             
             log.info("=== Settings Accepted: mode=%s, agent=%s ===", new_mode.value, new_agent)
             
@@ -5444,14 +5428,19 @@ class MainWindow(QMainWindow):
             self.team_manager.save_opponent_mode(new_mode.value)
             log.info("Saved opponent mode to config: %s", new_mode.value)
 
-            if isinstance(new_google_model, str) and new_google_model.strip():
-                model_value = new_google_model.strip()
-                if model_value != self._preferred_gemini_model:
-                    log.info("Updated Google model to %s", model_value)
-                self._preferred_gemini_model = model_value
+            if new_google_models:
+                model_values = [m.strip() for m in new_google_models if isinstance(m, str) and m.strip()]
+                if model_values and model_values != self._preferred_gemini_models:
+                    log.info("Updated Google models to %s", model_values)
+                if model_values:
+                    self._preferred_gemini_models = model_values
+                    self._preferred_gemini_model = model_values[0]
                 self._google_model_user_selected = True
-                self._update_env_value("GEMINI_MODEL", model_value)
-                self._update_env_value("GOOGLE_GEMINI_MODEL", model_value)
+                self._update_env_value("GEMINI_MODEL", self._preferred_gemini_model)
+                self._update_env_value("GOOGLE_GEMINI_MODEL", self._preferred_gemini_model)
+                models_csv = ",".join(self._preferred_gemini_models)
+                self._update_env_value("GEMINI_MODELS", models_csv)
+                self._update_env_value("GOOGLE_GEMINI_MODELS", models_csv)
             
             # Check if any models were configured
             openrouter_models = dialog.get_selected_openrouter_models()

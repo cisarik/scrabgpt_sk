@@ -113,11 +113,9 @@ class SettingsDialog(QDialog):
         self.selected_novita_models: list[dict[str, Any]] = []
         self.novita_tokens: int = ai_move_max_tokens
         
-        # Store Google model selection for GEMINI mode
-        self.selected_google_model: str = (
-            os.getenv("GEMINI_MODEL")
-            or os.getenv("GOOGLE_GEMINI_MODEL", "gemini-2.5-pro")
-        ).strip() or "gemini-2.5-pro"
+        # Store Google model selection(s) for GEMINI mode
+        self.selected_google_models = self._load_google_models_from_env()
+        self.selected_google_model: str = self.selected_google_models[0]
         
         # API settings state
         self.selected_variant_slug = get_active_variant_slug()
@@ -349,30 +347,77 @@ class SettingsDialog(QDialog):
     
     def get_selected_google_model(self) -> str:
         """Get selected Google Gemini model for GEMINI mode."""
+        if self.selected_google_models:
+            return self.selected_google_models[0]
         return self.selected_google_model
+
+    def get_selected_google_models(self) -> list[str]:
+        """Get selected Google Gemini models for GEMINI mode."""
+        return list(self.selected_google_models)
+
+    @staticmethod
+    def _parse_google_models(raw: str) -> list[str]:
+        parsed: list[str] = []
+        for item in raw.split(","):
+            model = item.strip()
+            if not model or model in parsed:
+                continue
+            parsed.append(model)
+        return parsed
+
+    def _load_google_models_from_env(self) -> list[str]:
+        raw_models = (
+            os.getenv("GEMINI_MODELS")
+            or os.getenv("GOOGLE_GEMINI_MODELS")
+            or ""
+        ).strip()
+        parsed = self._parse_google_models(raw_models)
+        if parsed:
+            return parsed
+
+        fallback = (
+            os.getenv("GEMINI_MODEL")
+            or os.getenv("GOOGLE_GEMINI_MODEL")
+            or "gemini-2.5-pro"
+        ).strip()
+        return [fallback or "gemini-2.5-pro"]
     
     def _configure_google(self) -> None:
-        """Open Google Gemini model configuration dialog."""
+        """Open Google Gemini model configuration dialog (multi-select)."""
         dialog = QDialog(self)
-        dialog.setWindowTitle("Google Model")
+        dialog.setWindowTitle("Google Modely")
         form = QFormLayout(dialog)
-        form.setContentsMargins(12, 12, 12, 12)
+        form.setContentsMargins(14, 14, 14, 14)
         form.setSpacing(10)
 
-        model_combo = QComboBox(dialog)
-        model_combo.addItem("Gemini 3.1 Pro (preview)", "gemini-3.1-pro-preview")
-        model_combo.addItem("Gemini 3 Pro", "gemini-3-pro-preview")
-        model_combo.addItem("Gemini 3 Flash (preview)", "gemini-3-flash-preview")
-        model_combo.addItem("Gemini 2.5 Pro", "gemini-2.5-pro")
-        model_combo.addItem("Gemini 2.5 Flash", "gemini-2.5-flash")
-        index = model_combo.findData(self.selected_google_model)
-        if index >= 0:
-            model_combo.setCurrentIndex(index)
-        form.addRow("Model:", model_combo)
+        known_models: list[tuple[str, str]] = [
+            ("Gemini 3.1 Pro (preview)", "gemini-3.1-pro-preview"),
+            ("Gemini 3 Pro (preview)", "gemini-3-pro-preview"),
+            ("Gemini 3 Flash (preview)", "gemini-3-flash-preview"),
+            ("Gemini 2.5 Pro", "gemini-2.5-pro"),
+            ("Gemini 2.5 Flash", "gemini-2.5-flash"),
+        ]
+
+        checks_container = QWidget(dialog)
+        checks_layout = QVBoxLayout(checks_container)
+        checks_layout.setContentsMargins(0, 0, 0, 0)
+        checks_layout.setSpacing(8)
+
+        model_checks: list[tuple[str, QCheckBox]] = []
+        selected_set = set(self.selected_google_models)
+        for label, model_id in known_models:
+            check = QCheckBox(label, checks_container)
+            check.setProperty("model_id", model_id)
+            check.setChecked(model_id in selected_set)
+            check.setToolTip(model_id)
+            checks_layout.addWidget(check)
+            model_checks.append((model_id, check))
+
+        form.addRow("Modely:", checks_container)
 
         info = QLabel(
-            "Vyber model pre Google režim. Ak je model nedostupný pre tvoje Vertex konto,\n"
-            "hra sa pokúsi použiť fallback model."
+            "Môžeš vybrať viac modelov. Vybrané modely sa volajú paralelne a použije sa\n"
+            "najlepší legálny ťah podľa skóre."
         )
         info.setWordWrap(True)
         info.setStyleSheet("color: #b6e0bd; font-size: 11px;")
@@ -387,10 +432,22 @@ class SettingsDialog(QDialog):
         buttons.rejected.connect(dialog.reject)
 
         if dialog.exec() == QDialog.DialogCode.Accepted:
-            selected = model_combo.currentData()
-            if isinstance(selected, str) and selected.strip():
-                self.selected_google_model = selected.strip()
-                log.info("Google model configured: %s", self.selected_google_model)
+            selected = [
+                model_id
+                for model_id, check in model_checks
+                if check.isChecked()
+            ]
+            if not selected:
+                QMessageBox.warning(
+                    self,
+                    "Google modely",
+                    "Vyber aspoň jeden Google/Gemini model.",
+                )
+                return
+
+            self.selected_google_models = selected
+            self.selected_google_model = selected[0]
+            log.info("Google models configured: %s", selected)
     
     def _configure_openrouter(self) -> None:
         """Open OpenRouter model configuration dialog."""

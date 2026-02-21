@@ -7,7 +7,7 @@ from typing import Optional
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QRadioButton,
+    QWidget, QVBoxLayout, QHBoxLayout, QCheckBox,
     QButtonGroup, QLabel, QFrame, QComboBox, QPushButton,
 )
 
@@ -18,7 +18,7 @@ log = logging.getLogger("scrabgpt.ui")
 
 
 class OpponentModeSelector(QWidget):
-    """Widget for selecting AI opponent mode with radio buttons."""
+    """Widget for selecting AI opponent mode with checkbox indicators."""
     
     mode_changed = Signal(OpponentMode)
     agent_changed = Signal(str)  # Agent name
@@ -68,11 +68,11 @@ class OpponentModeSelector(QWidget):
         )
         layout.addWidget(title)
         
-        # Button group for radio buttons
+        # Button group for mode toggles
         self.button_group = QButtonGroup(self)
-        self.button_group.buttonClicked.connect(self._on_mode_changed)
+        self.button_group.setExclusive(False)
         
-        # Radio buttons for each mode - include Google/Gemini
+        # Mode checkboxes - include Google/Gemini
         mode_order = [
             OpponentMode.GEMINI,
             OpponentMode.BEST_MODEL,
@@ -93,7 +93,7 @@ class OpponentModeSelector(QWidget):
         layout.addStretch()
     
     def _create_mode_option(self, mode: OpponentMode) -> QWidget:
-        """Create a mode option with radio button and description.
+        """Create a mode option with checkbox and description.
         
         Args:
             mode: Opponent mode
@@ -115,33 +115,35 @@ class OpponentModeSelector(QWidget):
         layout.setSpacing(6)
         layout.setContentsMargins(8, 8, 8, 8)
         
-        # Radio button with mode name
-        radio = QRadioButton(mode.display_name_sk)
-        radio.setProperty("mode", mode)
-        radio.setCursor(Qt.CursorShape.PointingHandCursor)
-        radio.setStyleSheet(
-            "QRadioButton { "
+        # Checkbox with mode name
+        checkbox = QCheckBox(mode.display_name_sk)
+        checkbox.setProperty("mode", mode)
+        checkbox.setCursor(Qt.CursorShape.PointingHandCursor)
+        checkbox.setStyleSheet(
+            "QCheckBox { "
             "font-size: 13px; font-weight: bold; color: #e8f5e9; "
             "spacing: 8px; "
             "} "
-            "QRadioButton::indicator { width: 18px; height: 18px; } "
-            "QRadioButton::indicator:unchecked { "
-            "border: 2px solid #4caf50; border-radius: 9px; background: #132418; "
+            "QCheckBox::indicator { width: 18px; height: 18px; } "
+            "QCheckBox::indicator:unchecked { "
+            "border: 2px solid #4caf50; border-radius: 4px; background: #132418; "
             "} "
-            "QRadioButton::indicator:checked { "
-            "border: 2px solid #4caf50; border-radius: 9px; "
-            "background: qradialgradient(cx:0.5, cy:0.5, radius:0.5, fx:0.5, fy:0.5, "
-            "stop:0 #4caf50, stop:0.4 #4caf50, stop:0.5 #132418, stop:1 #132418); "
+            "QCheckBox::indicator:checked { "
+            "border: 2px solid #4caf50; border-radius: 4px; "
+            "background: #4caf50; "
             "}"
         )
-        radio.setToolTip(mode.description_sk)
+        checkbox.setToolTip(mode.description_sk)
         
         # Set default selection
         if mode == self.current_mode:
-            radio.setChecked(True)
-        
-        self.button_group.addButton(radio)
-        layout.addWidget(radio)
+            checkbox.setChecked(True)
+
+        self.button_group.addButton(checkbox)
+        checkbox.toggled.connect(
+            lambda checked, btn=checkbox: self._on_mode_toggled(btn, checked)
+        )
+        layout.addWidget(checkbox)
         
         # Description with optional button for OpenRouter, Novita, or Agent
         if mode in (OpponentMode.OPENROUTER, OpponentMode.NOVITA, OpponentMode.AGENT, OpponentMode.GEMINI):
@@ -302,24 +304,35 @@ class OpponentModeSelector(QWidget):
             if index >= 0:
                 self.agent_combo.setCurrentIndex(index)
     
-    def _on_mode_changed(self, button: QRadioButton) -> None:
-        """Handle mode change.
-        
-        Args:
-            button: Clicked radio button
-        """
+    def _on_mode_toggled(self, button: QCheckBox, checked: bool) -> None:
+        """Handle mode checkbox changes while keeping a single active mode."""
         mode = button.property("mode")
         if mode is None:
             return
-        
+
+        if not checked:
+            if self.current_mode == mode:
+                button.blockSignals(True)
+                button.setChecked(True)
+                button.blockSignals(False)
+            return
+
+        for other in self.button_group.buttons():
+            if other is button:
+                continue
+            if other.isChecked():
+                other.blockSignals(True)
+                other.setChecked(False)
+                other.blockSignals(False)
+
         self.current_mode = mode
-        
+
         # Update agent selector visibility
         self._update_agent_selector_visibility()
-        
+
         # Emit signal
         self.mode_changed.emit(mode)
-        
+
         log.info("Opponent mode changed to: %s", mode.value)
     
     def get_selected_mode(self) -> OpponentMode:
@@ -414,12 +427,11 @@ class OpponentModeSelector(QWidget):
             mode: Mode to set
         """
         for button in self.button_group.buttons():
-            button_mode = button.property("mode")
-            if button_mode == mode:
-                button.setChecked(True)
-                self.current_mode = mode
-                self._update_agent_selector_visibility()
-                break
+            button.blockSignals(True)
+            button.setChecked(button.property("mode") == mode)
+            button.blockSignals(False)
+        self.current_mode = mode
+        self._update_agent_selector_visibility()
     
 
     

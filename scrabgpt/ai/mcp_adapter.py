@@ -68,7 +68,52 @@ def get_gemini_tools() -> list[types.Tool]:
     return [types.Tool(function_declarations=function_declarations)]
 
 
-def execute_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
+def _enrich_args_with_context(
+    name: str,
+    args: dict[str, Any],
+    context: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Inject live game context for tools that need board/rack/premium data."""
+    if not context:
+        return dict(args)
+
+    enriched = dict(args)
+    board_grid = context.get("board_grid")
+    premium_grid = context.get("premium_grid")
+    rack_letters = context.get("rack_letters")
+    is_first_move = context.get("is_first_move")
+
+    if name == "get_rack_letters" and "rack" not in enriched and isinstance(rack_letters, list):
+        enriched["rack"] = rack_letters
+
+    if name in {
+        "rules_connected_to_existing",
+        "rules_no_gaps_in_line",
+        "rules_extract_all_words",
+        "validate_move_legality",
+        "calculate_move_score",
+        "scoring_score_words",
+    }:
+        if "board_grid" not in enriched and isinstance(board_grid, list):
+            enriched["board_grid"] = board_grid
+
+    if name in {"calculate_move_score", "scoring_score_words"}:
+        if "premium_grid" not in enriched and isinstance(premium_grid, list):
+            enriched["premium_grid"] = premium_grid
+
+    if name == "validate_move_legality":
+        if "is_first_move" not in enriched and isinstance(is_first_move, bool):
+            enriched["is_first_move"] = is_first_move
+
+    return enriched
+
+
+def execute_tool(
+    name: str,
+    args: dict[str, Any],
+    *,
+    context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Execute a tool by name with arguments.
     
     Args:
@@ -81,6 +126,25 @@ def execute_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
     try:
         log.info("Executing tool: %s with args: %s", name, args)
         
+        # Fast path: return live state for read-only context tools.
+        if name == "get_board_state" and context is not None:
+            board_grid = context.get("board_grid")
+            blanks = context.get("blanks")
+            if isinstance(board_grid, list):
+                return {
+                    "grid": board_grid,
+                    "blanks": blanks if isinstance(blanks, list) else [],
+                    "source": "live_game_state",
+                }
+
+        if name == "get_premium_squares" and context is not None:
+            premium_squares = context.get("premium_squares")
+            if isinstance(premium_squares, list):
+                return {
+                    "premiums": premium_squares,
+                    "source": "live_game_state",
+                }
+
         # Case-insensitive lookup
         try:
             tool_func = tool_registry.get_tool_function(name)
@@ -96,7 +160,8 @@ def execute_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
             else:
                 raise
 
-        result = tool_func(**args)
+        enriched_args = _enrich_args_with_context(name, args, context)
+        result = tool_func(**enriched_args)
         if isinstance(result, dict):
             return cast(dict[str, Any], result)
         return {"result": result}
