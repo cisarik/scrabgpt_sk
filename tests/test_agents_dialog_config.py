@@ -20,7 +20,7 @@ def test_normalize_llm_config_requires_fields() -> None:
 
 def test_load_env_llm_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("OPENAI_BASE_URL", "http://127.0.0.1:1234/v1")
-    monkeypatch.setenv("OPENAI_MODEL", "qwen3")
+    monkeypatch.setenv("OPENAI_MODELS", "qwen3,qwen3-vl")
     monkeypatch.setenv("AI_MOVE_MAX_OUTPUT_TOKENS", "30000")
     monkeypatch.setenv("AI_MOVE_TIMEOUT_SECONDS", "2")
     

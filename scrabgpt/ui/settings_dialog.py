@@ -112,6 +112,9 @@ class SettingsDialog(QDialog):
         # Store Novita config from nested dialog
         self.selected_novita_models: list[dict[str, Any]] = []
         self.novita_tokens: int = ai_move_max_tokens
+
+        # Store OpenAI model selection(s) for OpenAI mode
+        self.selected_openai_models = self._load_openai_models_from_env()
         
         # Store Google model selection(s) for GEMINI mode
         self.selected_google_models = self._load_google_models_from_env()
@@ -277,10 +280,12 @@ class SettingsDialog(QDialog):
         
         # Connect configuration signals
         self.mode_selector.configure_google_requested.connect(self._configure_google)
+        self.mode_selector.configure_openai_requested.connect(self._configure_openai)
         self.mode_selector.configure_openrouter_requested.connect(self._configure_openrouter)
         self.mode_selector.configure_novita_requested.connect(self._configure_novita)
         self.mode_selector.configure_agent_requested.connect(self._configure_agent)
         self.mode_selector.configure_offline_requested.connect(self._configure_offline)
+        self.mode_selector.set_openai_models_preview(self.selected_openai_models)
         
         layout.addWidget(self.mode_selector)
         
@@ -302,6 +307,13 @@ class SettingsDialog(QDialog):
                     "Prosím vyberte agenta pre Agent mód.",
                 )
                 return
+        if selected_mode == OpponentMode.BEST_MODEL and not self.selected_openai_models:
+            QMessageBox.warning(
+                self,
+                "Chyba",
+                "Prosím vyberte aspoň jeden OpenAI model.",
+            )
+            return
         # Accept dialog
         self.accept()
     
@@ -332,6 +344,10 @@ class SettingsDialog(QDialog):
     def get_selected_novita_models(self) -> list[dict[str, Any]]:
         """Get selected Novita models (if configured)."""
         return self.selected_novita_models
+
+    def get_selected_openai_models(self) -> list[str]:
+        """Get selected OpenAI models for OpenAI mode."""
+        return list(self.selected_openai_models)
 
     def get_openrouter_tokens(self) -> int:
         """Get OpenRouter token limit (if configured).
@@ -381,6 +397,23 @@ class SettingsDialog(QDialog):
             or "gemini-2.5-pro"
         ).strip()
         return [fallback or "gemini-2.5-pro"]
+
+    @staticmethod
+    def _parse_openai_models(raw: str) -> list[str]:
+        parsed: list[str] = []
+        for item in raw.split(","):
+            model = item.strip()
+            if not model or model in parsed:
+                continue
+            parsed.append(model)
+        return parsed
+
+    def _load_openai_models_from_env(self) -> list[str]:
+        raw_models = (os.getenv("OPENAI_MODELS") or "").strip()
+        parsed = self._parse_openai_models(raw_models)
+        if parsed:
+            return parsed
+        return ["gpt-5.2"]
     
     def _configure_google(self) -> None:
         """Open Google Gemini model configuration dialog (multi-select)."""
@@ -448,6 +481,72 @@ class SettingsDialog(QDialog):
             self.selected_google_models = selected
             self.selected_google_model = selected[0]
             log.info("Google models configured: %s", selected)
+
+    def _configure_openai(self) -> None:
+        """Open OpenAI model configuration dialog (multi-select)."""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("OpenAI Modely")
+        form = QFormLayout(dialog)
+        form.setContentsMargins(14, 14, 14, 14)
+        form.setSpacing(10)
+
+        known_models: list[tuple[str, str]] = [
+            ("gpt-5.2", "gpt-5.2"),
+            ("gpt-5-mini", "gpt-5-mini"),
+            ("gpt-4.1", "gpt-4.1"),
+        ]
+
+        checks_container = QWidget(dialog)
+        checks_layout = QVBoxLayout(checks_container)
+        checks_layout.setContentsMargins(0, 0, 0, 0)
+        checks_layout.setSpacing(8)
+
+        model_checks: list[tuple[str, QCheckBox]] = []
+        selected_set = set(self.selected_openai_models)
+        for label, model_id in known_models:
+            check = QCheckBox(label, checks_container)
+            check.setProperty("model_id", model_id)
+            check.setChecked(model_id in selected_set)
+            check.setToolTip(model_id)
+            checks_layout.addWidget(check)
+            model_checks.append((model_id, check))
+
+        form.addRow("Modely:", checks_container)
+
+        info = QLabel(
+            "Môžeš vybrať viac modelov. Vybrané modely sa volajú paralelne a použije sa\n"
+            "najlepší legálny ťah podľa skóre."
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet("color: #b6e0bd; font-size: 11px;")
+        form.addRow("", info)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
+            parent=dialog,
+        )
+        form.addRow(buttons)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            selected = [
+                model_id
+                for model_id, check in model_checks
+                if check.isChecked()
+            ]
+            if not selected:
+                QMessageBox.warning(
+                    self,
+                    "OpenAI modely",
+                    "Vyber aspoň jeden OpenAI model.",
+                )
+                return
+
+            self.selected_openai_models = selected
+            if hasattr(self, "mode_selector") and self.mode_selector:
+                self.mode_selector.set_openai_models_preview(selected)
+            log.info("OpenAI models configured: %s", selected)
     
     def _configure_openrouter(self) -> None:
         """Open OpenRouter model configuration dialog."""
@@ -535,7 +634,8 @@ class SettingsDialog(QDialog):
         
         model = QLineEdit(dialog)
         model.setPlaceholderText("gpt-5.2")
-        model.setText(os.getenv("OPENAI_MODEL") or os.getenv("LLMSTUDIO_MODEL") or "")
+        openai_models = self._parse_openai_models(os.getenv("OPENAI_MODELS", ""))
+        model.setText((os.getenv("LLMSTUDIO_MODEL") or (openai_models[0] if openai_models else "")).strip())
         form.addRow("Model:", model)
         
         tokens = QSpinBox(dialog)
@@ -566,14 +666,14 @@ class SettingsDialog(QDialog):
             timeout_val = str(timeout.value())
             
             os.environ["OPENAI_BASE_URL"] = url_val
-            os.environ["OPENAI_MODEL"] = model_val
+            os.environ["LLMSTUDIO_MODEL"] = model_val
             os.environ["AI_MOVE_MAX_OUTPUT_TOKENS"] = tokens_val
             os.environ["AI_MOVE_TIMEOUT_SECONDS"] = timeout_val
             
             try:
                 from dotenv import set_key as _set_key
                 _set_key(ENV_PATH, "OPENAI_BASE_URL", url_val)
-                _set_key(ENV_PATH, "OPENAI_MODEL", model_val)
+                _set_key(ENV_PATH, "LLMSTUDIO_MODEL", model_val)
                 _set_key(ENV_PATH, "AI_MOVE_MAX_OUTPUT_TOKENS", tokens_val)
                 _set_key(ENV_PATH, "AI_MOVE_TIMEOUT_SECONDS", timeout_val)
             except Exception:
@@ -1791,6 +1891,22 @@ Premium legend: {premium_legend}
             from dotenv import set_key as _set_key2
             _set_key2(ENV_PATH, "AI_MOVE_MAX_OUTPUT_TOKENS", ai_tokens)
             _set_key2(ENV_PATH, "JUDGE_MAX_OUTPUT_TOKENS", judge_tokens)
+        except Exception:
+            pass
+
+        # Save OpenAI parallel model list
+        openai_models = [
+            model.strip()
+            for model in self.selected_openai_models
+            if isinstance(model, str) and model.strip()
+        ]
+        if not openai_models:
+            openai_models = ["gpt-5.2"]
+        openai_models_csv = ",".join(openai_models)
+        os.environ["OPENAI_MODELS"] = openai_models_csv
+        try:
+            from dotenv import set_key as _set_key_models
+            _set_key_models(ENV_PATH, "OPENAI_MODELS", openai_models_csv)
         except Exception:
             pass
         

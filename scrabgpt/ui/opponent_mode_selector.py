@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Optional
 
 from PySide6.QtCore import Qt, Signal
@@ -23,6 +24,7 @@ class OpponentModeSelector(QWidget):
     mode_changed = Signal(OpponentMode)
     agent_changed = Signal(str)  # Agent name
     configure_google_requested = Signal()  # Request to configure Google model
+    configure_openai_requested = Signal()  # Request to configure OpenAI models
     configure_openrouter_requested = Signal()  # Request to configure OpenRouter models
     configure_novita_requested = Signal()  # Request to configure Novita models
     configure_agent_requested = Signal()  # Request to configure AI agent
@@ -48,6 +50,8 @@ class OpponentModeSelector(QWidget):
         self.team_manager = get_team_manager()
         self.novita_desc_label: QLabel | None = None
         self.openrouter_desc_label: QLabel | None = None
+        self.openai_desc_label: QLabel | None = None
+        self._openai_models_preview: list[str] | None = None
         
         self._setup_ui()
         
@@ -146,7 +150,13 @@ class OpponentModeSelector(QWidget):
         layout.addWidget(checkbox)
         
         # Description with optional button for OpenRouter, Novita, or Agent
-        if mode in (OpponentMode.OPENROUTER, OpponentMode.NOVITA, OpponentMode.AGENT, OpponentMode.GEMINI):
+        if mode in (
+            OpponentMode.OPENROUTER,
+            OpponentMode.NOVITA,
+            OpponentMode.AGENT,
+            OpponentMode.GEMINI,
+            OpponentMode.BEST_MODEL,
+        ):
             desc_layout = QHBoxLayout()
             desc_layout.setSpacing(8)
             desc_layout.setContentsMargins(26, 0, 0, 0)
@@ -168,6 +178,14 @@ class OpponentModeSelector(QWidget):
                 desc.setMinimumHeight(60)
                 self.openrouter_desc_label = desc  # Store reference for updates
                 self._update_openrouter_description()  # Set initial text
+            elif mode == OpponentMode.BEST_MODEL:
+                desc = QLabel()
+                desc.setWordWrap(True)
+                desc.setTextFormat(Qt.TextFormat.RichText)
+                desc.setStyleSheet("font-size: 12px; color: #b6e0bd;")
+                desc.setMinimumHeight(60)
+                self.openai_desc_label = desc
+                self._update_openai_description()
             else:
                 desc = QLabel(mode.description_sk)
                 desc.setWordWrap(True)
@@ -194,6 +212,8 @@ class OpponentModeSelector(QWidget):
                 config_btn.clicked.connect(lambda: self.configure_novita_requested.emit())
             elif mode == OpponentMode.AGENT:
                 config_btn.clicked.connect(lambda: self.configure_agent_requested.emit())
+            elif mode == OpponentMode.BEST_MODEL:
+                config_btn.clicked.connect(lambda: self.configure_openai_requested.emit())
             else:  # GEMINI/Google
                 config_btn.clicked.connect(lambda: self.configure_google_requested.emit())
             
@@ -419,6 +439,57 @@ class OpponentModeSelector(QWidget):
     def refresh_openrouter_team_info(self) -> None:
         """Refresh OpenRouter team info (call after team changes)."""
         self._update_openrouter_description()
+
+    @staticmethod
+    def _parse_openai_models(raw: str) -> list[str]:
+        models: list[str] = []
+        for item in raw.split(","):
+            model_id = item.strip()
+            if not model_id or model_id in models:
+                continue
+            models.append(model_id)
+        return models
+
+    def _update_openai_description(self) -> None:
+        """Update OpenAI description to show selected parallel models."""
+        if self.openai_desc_label is None:
+            return
+
+        model_ids = list(self._openai_models_preview or [])
+        if not model_ids:
+            model_ids = self._parse_openai_models(os.getenv("OPENAI_MODELS", ""))
+
+        if model_ids:
+            header_html = (
+                '<span style="font-size: 14px; font-weight: bold; color: #ffffff;">'
+                'Vybrané OpenAI modely</span>'
+            )
+            models_html = "<br/>".join(
+                f'<span style="font-size: 11px; color: #9ad0a2;">• {model_id}</span>'
+                for model_id in model_ids
+            )
+            self.openai_desc_label.setText(f"{header_html}<br/>{models_html}")
+            return
+
+        self.openai_desc_label.setText(
+            '<span style="color: #b6e0bd;">Žiadne OpenAI modely nie sú nakonfigurované. '
+            'Klikni na "Nastaviť" pre výber modelov.</span>'
+        )
+
+    def set_openai_models_preview(self, models: list[str]) -> None:
+        """Set in-dialog OpenAI model preview without persisting."""
+        normalized = [
+            model.strip()
+            for model in models
+            if isinstance(model, str) and model.strip()
+        ]
+        self._openai_models_preview = normalized or None
+        self._update_openai_description()
+
+    def refresh_openai_models_info(self) -> None:
+        """Refresh OpenAI models section from environment."""
+        self._openai_models_preview = None
+        self._update_openai_description()
     
     def set_mode(self, mode: OpponentMode) -> None:
         """Set opponent mode programmatically.

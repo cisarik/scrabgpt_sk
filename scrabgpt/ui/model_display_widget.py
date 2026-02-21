@@ -75,16 +75,21 @@ class ModelDisplayWidget(QWidget):
     
     def _update_display(self) -> None:
         """Update display with current model from environment."""
-        current_model = (
-            os.getenv("OPENAI_MODEL")
-            or os.getenv("OPENAI_PLAYER_MODEL")
-            or "gpt-5.2"
-        )
-        self.label_model.setText(current_model)
+        selected_models = [
+            model.strip()
+            for model in os.getenv("OPENAI_MODELS", "").split(",")
+            if model.strip()
+        ]
+        if not selected_models:
+            selected_models = ["gpt-5.2"]
+
+        primary = selected_models[0]
+        suffix = f" (+{len(selected_models) - 1})" if len(selected_models) > 1 else ""
+        self.label_model.setText(f"{primary}{suffix}")
         
         # Update tooltip with details
         auto_update = os.getenv("OPENAI_BEST_MODEL_AUTO_UPDATE", "false")
-        tooltip = f"Aktuálny model: {current_model}\n"
+        tooltip = f"Aktuálne OpenAI modely: {', '.join(selected_models)}\n"
         tooltip += f"Auto-update: {auto_update}"
         self.label_model.setToolTip(tooltip)
     

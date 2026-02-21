@@ -83,6 +83,7 @@ from ..ai.player import (
     get_context_transcript,
 )
 from ..ai.openrouter import OpenRouterClient
+from ..ai.openai_tools_client import OpenAIToolClient
 from ..ai.vertex import VertexClient
 from ..ai.vertex_genai_client import build_client as build_vertex_genai_client
 from ..ai.multi_model import propose_move_multi_model
@@ -2148,32 +2149,27 @@ class MainWindow(QMainWindow):
 
 
     def _resolve_openai_model_label(self) -> str:
-        """Resolve the OpenAI model name that will be used in single-model mode."""
-        env_model = (
-            os.getenv("OPENAI_MODEL")
-            or os.getenv("OPENAI_PLAYER_MODEL")
-        )
-        if env_model:
-            return env_model
-        if self.ai_client is not None:
-            try:
-                model_name = getattr(self.ai_client, "model", None)
-                if isinstance(model_name, str) and model_name:
-                    return model_name
-            except Exception:
-                pass
+        """Resolve the primary OpenAI model name used by BEST_MODEL mode."""
+        candidates = self._build_openai_model_candidates()
+        if candidates:
+            model_id = str(candidates[0].get("id") or "").strip()
+            if model_id:
+                return model_id
         return "gpt-5.2"
 
     def _resolve_agent_display_name(self) -> str:
         """Resolve the human-readable name of the selected agent."""
         if self.selected_agent_name:
             return self.selected_agent_name
-        env_model = os.getenv("OPENAI_MODEL") or os.getenv("LLMSTUDIO_MODEL")
-        if env_model:
-            return f"LMStudio – {env_model}"
         env_base = os.getenv("OPENAI_BASE_URL") or os.getenv("LLMSTUDIO_BASE_URL")
+        lmstudio_model = (os.getenv("LLMSTUDIO_MODEL") or "").strip()
+        if env_base and lmstudio_model:
+            return f"LMStudio – {lmstudio_model}"
         if env_base:
             return "LMStudio agent"
+        openai_models = self._parse_model_csv(os.getenv("OPENAI_MODELS", ""))
+        if openai_models:
+            return f"OpenAI – {openai_models[0]}"
         for agent in self.available_agents:
             name = agent.get("name")
             if isinstance(name, str) and name.strip():
@@ -2196,6 +2192,36 @@ class MainWindow(QMainWindow):
                 continue
             models.append(model_id)
         return models
+
+    def _build_openai_model_candidates(self) -> list[dict[str, str]]:
+        """Return ordered OpenAI model list for BEST_MODEL mode.
+
+        Priority:
+        1. `OPENAI_MODELS` (comma-separated)
+        2. Runtime client model
+        3. Default `gpt-5.2`
+        """
+        raw_models = os.getenv("OPENAI_MODELS", "")
+        chain = self._parse_model_csv(raw_models)
+
+        if not chain and self.ai_client is not None:
+            try:
+                runtime_model = getattr(self.ai_client, "model", None)
+                if isinstance(runtime_model, str) and runtime_model.strip():
+                    chain = [runtime_model.strip()]
+            except Exception:
+                pass
+
+        if not chain:
+            chain = ["gpt-5.2"]
+
+        unique_chain: list[str] = []
+        for model_id in chain:
+            normalized = model_id.strip()
+            if not normalized or normalized in unique_chain:
+                continue
+            unique_chain.append(normalized)
+        return [{"id": model_id, "name": model_id} for model_id in unique_chain]
 
     @staticmethod
     def _google_model_display_name(model_id: str) -> str:
@@ -2271,6 +2297,15 @@ class MainWindow(QMainWindow):
     def _collect_google_model_labels(self) -> list[str]:
         labels: list[str] = []
         for model in self._build_gemini_model_candidates():
+            self._append_status_model_label(
+                labels,
+                model.get("name") or model.get("id"),
+            )
+        return labels
+
+    def _collect_openai_model_labels(self) -> list[str]:
+        labels: list[str] = []
+        for model in self._build_openai_model_candidates():
             self._append_status_model_label(
                 labels,
                 model.get("name") or model.get("id"),
@@ -2356,10 +2391,12 @@ class MainWindow(QMainWindow):
                 label = str(model.get("name") or model.get("model") or model_id)
                 entries.append(_entry(model_id, label, idx))
         elif mode == OpponentMode.BEST_MODEL:
-            model_name = self._resolve_openai_model_label()
-            entries.append(
-                _entry(f"openai:{model_name}", f"OpenAI API – {model_name}", 0)
-            )
+            for idx, model in enumerate(self._build_openai_model_candidates()):
+                model_id = str(model.get("id") or f"openai-{idx}")
+                label = str(model.get("name") or model_id)
+                entries.append(
+                    _entry(f"openai:{model_id}", f"OpenAI API – {label}", idx)
+                )
         elif mode == OpponentMode.GEMINI:
             for idx, model in enumerate(self._build_gemini_model_candidates()):
                 model_id = model.get("id", f"gemini-{idx}")
@@ -4131,6 +4168,48 @@ class MainWindow(QMainWindow):
                 try:
                     TRACE_ID_VAR.set(self.trace_id)
                     if self.use_multi_model and self.selected_models:
+                        if self.provider_type == "openai_tools":
+                            openai_tool_client = OpenAIToolClient(
+                                timeout_seconds=self.timeout_seconds
+                            )
+
+                            async def run_openai_multi() -> tuple[dict[str, Any], list[dict[str, Any]]]:
+                                def on_partial(res: dict[str, Any]) -> None:
+                                    try:
+                                        self.partial_result.emit(res)
+                                    except RuntimeError:
+                                        # Worker/object can be deleted during shutdown.
+                                        pass
+
+                                enforce_tool_workflow = (
+                                    os.getenv("OPENAI_ENFORCE_TOOL_WORKFLOW", "true").strip().lower()
+                                    in {"1", "true", "yes", "on"}
+                                )
+                                try:
+                                    from ..ai.tool_adapter import get_openai_tools
+
+                                    move, results = await propose_move_multi_model(
+                                        openai_tool_client,  # type: ignore[arg-type]
+                                        self.selected_models,
+                                        self.state_str,
+                                        self.variant,
+                                        self.board,
+                                        self.client,
+                                        progress_callback=on_partial,
+                                        timeout_seconds=self.timeout_seconds,
+                                        tools=get_openai_tools(),
+                                        allow_model_fallback=False,
+                                        enforce_tool_workflow=enforce_tool_workflow,
+                                    )
+                                finally:
+                                    await openai_tool_client.close()
+                                return move, results
+
+                            resp, results = asyncio.run(run_openai_multi())
+                            self.multi_model_results.emit(results)
+                            self.finished.emit(resp)
+                            return
+
                         if self.provider_type == "novita":
                             api_key = os.getenv("NOVITA_API_KEY", "")
                             novita_client = NovitaClient(api_key, timeout_seconds=self.timeout_seconds)
@@ -4327,6 +4406,16 @@ class MainWindow(QMainWindow):
             timeout_seconds = self.ai_move_timeout_seconds
             use_multi = True
             log.info("Using Novita with %d models", len(selected_models))
+        elif self.opponent_mode == OpponentMode.BEST_MODEL:
+            provider_type = "openai_tools"
+            selected_models = [dict(m) for m in self._build_openai_model_candidates()]
+            timeout_seconds = self.ai_move_timeout_seconds
+            use_multi = bool(selected_models)
+            log.info(
+                "Using OpenAI agentic workflow with %d model(s): %s",
+                len(selected_models),
+                [m.get("id") for m in selected_models],
+            )
         else:
             log.info("Using single-model mode (opponent_mode=%s)", self.opponent_mode)
             # Priprav chat na streaming výstupu
@@ -4338,7 +4427,14 @@ class MainWindow(QMainWindow):
 
         if self.chat_dialog and use_multi and selected_models:
             model_chain = " -> ".join(str(m.get("name") or m.get("id") or "?") for m in selected_models)
-            provider_label = "Google" if provider_type == "vertex" else ("Novita" if provider_type == "novita" else "OpenRouter")
+            if provider_type == "vertex":
+                provider_label = "Google"
+            elif provider_type == "novita":
+                provider_label = "Novita"
+            elif provider_type == "openai_tools":
+                provider_label = "OpenAI"
+            else:
+                provider_label = "OpenRouter"
             self.chat_dialog.add_agent_activity(
                 f"🧠 {provider_label} model chain: {model_chain}",
                 section="planning",
@@ -4419,6 +4515,8 @@ class MainWindow(QMainWindow):
                 provider_name = "Novita"
             elif provider_type == "vertex":
                 provider_name = "Google"
+            elif provider_type == "openai_tools":
+                provider_name = "OpenAI"
             else:
                 provider_name = "OpenRouter"
             model_names = ", ".join(
@@ -4832,6 +4930,37 @@ class MainWindow(QMainWindow):
             placements.append(Placement(row=row, col=col, letter=letter))
         return placements
 
+    def _normalize_new_placements(
+        self,
+        placements: list[Placement],
+    ) -> tuple[list[Placement], str | None]:
+        normalized: list[Placement] = []
+        seen_coords: set[tuple[int, int]] = set()
+        for placement in placements:
+            row = int(placement.row)
+            col = int(placement.col)
+            if not (0 <= row < 15 and 0 <= col < 15):
+                return [], "out_of_bounds"
+
+            coord = (row, col)
+            if coord in seen_coords:
+                return [], "duplicate"
+            seen_coords.add(coord)
+
+            existing = self.board.cells[row][col].letter
+            if existing:
+                existing_letter = str(existing).strip().upper()
+                incoming_letter = str(placement.letter).strip().upper()
+                if existing_letter == incoming_letter:
+                    continue
+                return [], "occupied"
+
+            normalized.append(placement)
+
+        if not normalized:
+            return [], "no_new_tiles"
+        return normalized, None
+
     def _placements_fit_rack(
         self,
         placements: list[Placement],
@@ -4856,6 +4985,9 @@ class MainWindow(QMainWindow):
     ) -> dict[str, Any] | None:
         placements = self._placements_from_tool_args(placements_obj)
         if not placements:
+            return None
+        placements, normalize_err = self._normalize_new_placements(placements)
+        if normalize_err is not None:
             return None
         direction = placements_in_line(placements)
         if direction is None:
@@ -4933,6 +5065,11 @@ class MainWindow(QMainWindow):
         if not isinstance(placements_obj, list) or not placements_obj:
             return None
         try:
+            blanks_obj = move.get("blanks")
+            declared_blank_map, blank_err = self._parse_blank_map(blanks_obj)
+            if blank_err is not None:
+                return None
+
             placements: list[Placement] = []
             for item in placements_obj:
                 if not isinstance(item, dict):
@@ -4942,11 +5079,20 @@ class MainWindow(QMainWindow):
                 letter_raw = item.get("letter")
                 if row is None or col is None or not isinstance(letter_raw, str):
                     return None
+                if not (0 <= row < 15 and 0 <= col < 15):
+                    return None
                 letter = letter_raw.strip().upper()
                 if not letter:
                     return None
-                placements.append(Placement(row=row, col=col, letter=letter))
+                mapped_blank = declared_blank_map.get((row, col))
+                if mapped_blank:
+                    placements.append(Placement(row=row, col=col, letter="?", blank_as=mapped_blank))
+                else:
+                    placements.append(Placement(row=row, col=col, letter=letter))
             if not placements:
+                return None
+            placements, normalize_err = self._normalize_new_placements(placements)
+            if normalize_err is not None:
                 return None
             direction = placements_in_line(placements)
             if direction is None:
@@ -5107,7 +5253,7 @@ class MainWindow(QMainWindow):
                     explicit_legality = legality_by_signature.get(signature)
                     if explicit_legality is False:
                         continue
-                    if explicit_legality is None and not bool(candidate.get("local_legal", False)):
+                    if not bool(candidate.get("local_legal", False)):
                         continue
 
                 move = candidate.get("move")
@@ -5176,17 +5322,9 @@ class MainWindow(QMainWindow):
         placements = self._placements_from_tool_args(placements_obj)
         if not placements:
             return False
-
-        seen_coords: set[tuple[int, int]] = set()
-        for placement in placements:
-            if not (0 <= placement.row < 15 and 0 <= placement.col < 15):
-                return False
-            coord = (placement.row, placement.col)
-            if coord in seen_coords:
-                return False
-            seen_coords.add(coord)
-            if self.board.cells[placement.row][placement.col].letter:
-                return False
+        placements, normalize_err = self._normalize_new_placements(placements)
+        if normalize_err is not None:
+            return False
 
         direction = placements_in_line(placements)
         if direction is None:
@@ -5250,14 +5388,17 @@ class MainWindow(QMainWindow):
                 legality_by_signature[signature] = bool(tool_result.get("valid"))
             return
 
-        if tool_name != "calculate_move_score":
+        if tool_name not in {"calculate_move_score", "scoring_score_words"}:
             return
 
         total_score = self._coerce_int(tool_result.get("total_score"))
-        words = self._extract_words_from_tool_payload(tool_result.get("words"))
+        words_payload = tool_result.get("words")
+        if not isinstance(words_payload, list):
+            words_payload = tool_args.get("words")
+        words = self._extract_words_from_tool_payload(words_payload)
         placements_obj = tool_args.get("placements")
         signature = self._placements_signature(placements_obj)
-        if total_score is None or total_score < 0 or not words:
+        if not words:
             return
         if not signature:
             return
@@ -5269,13 +5410,38 @@ class MainWindow(QMainWindow):
         existing = scored_candidates.get(signature)
         candidate_move = self._build_move_from_tool_candidate(
             placements_obj=placements_obj,
-            words_obj=tool_result.get("words"),
+            words_obj=words_payload,
         )
-        if existing is None or total_score > int(existing.get("score", -1)):
+        local_score = self._score_move_payload(candidate_move) if candidate_move else None
+        best_score = (
+            local_score
+            if local_score is not None
+            else (total_score if total_score is not None and total_score >= 0 else None)
+        )
+        if best_score is None:
+            return
+
+        if (
+            local_score is not None
+            and total_score is not None
+            and total_score >= 0
+            and local_score != total_score
+        ):
+            log.debug(
+                "Attempt score mismatch model=%s signature=%s tool=%s local=%s",
+                model_id,
+                signature,
+                total_score,
+                local_score,
+            )
+
+        if existing is None or best_score > int(existing.get("score", -1)):
             scored_candidates[signature] = {
                 "signature": signature,
                 "words": words,
-                "score": total_score,
+                "score": int(best_score),
+                "tool_score": total_score,
+                "score_source": "local" if local_score is not None else "tool",
                 "local_legal": local_legal,
                 "order": next_order,
                 "move": candidate_move,
@@ -5310,7 +5476,7 @@ class MainWindow(QMainWindow):
             explicit_legality = legality_by_signature.get(signature)
             if explicit_legality is False:
                 continue
-            if explicit_legality is None and not bool(candidate.get("local_legal", False)):
+            if not bool(candidate.get("local_legal", False)):
                 continue
 
             if any(word in invalid_words for word in words):
@@ -5416,11 +5582,18 @@ class MainWindow(QMainWindow):
                 )
         except (KeyError, ValueError, TypeError) as e:
             return f"Placements nemajú správny tvar: {e}"
-        # nesmie prepisovať existujúce písmená
-        for placement in ps:
-            if self.board.cells[placement.row][placement.col].letter:
-                return "AI sa pokúsila položiť na obsadené pole."
-        dir_ = placements_in_line(ps)
+        normalized_ps, normalize_err = self._normalize_new_placements(ps)
+        if normalize_err == "occupied":
+            return "AI sa pokúsila položiť na obsadené pole."
+        if normalize_err == "duplicate":
+            return "AI ťah obsahuje duplicitné placements."
+        if normalize_err == "out_of_bounds":
+            return "AI ťah je mimo hernej dosky."
+        if normalize_err == "no_new_tiles":
+            return "AI neumiestnila žiadne nové písmená."
+        if normalize_err is not None:
+            return "AI ťah je neplatný."
+        dir_ = placements_in_line(normalized_ps)
         if dir_ is None:
             return "AI ťah nie je v jednej línii."
         # dopln blank_as z response ak je
@@ -5429,21 +5602,21 @@ class MainWindow(QMainWindow):
         if blank_err is not None:
             return blank_err
         # skontroluj diery s ohladom na existujuce pismena
-        if not no_gaps_in_line(self.board, ps, dir_):
+        if not no_gaps_in_line(self.board, normalized_ps, dir_):
             return "AI ťah má diery."
         # po prvom tahu over spojitost
         if not self._has_any_letters():
-            if not first_move_must_cover_center(ps):
+            if not first_move_must_cover_center(normalized_ps):
                 return "AI prvý ťah nejde cez stred."
         else:
-            if not connected_to_existing(self.board, ps):
+            if not connected_to_existing(self.board, normalized_ps):
                 return "AI ťah nenadväzuje."
         resolved_blank_map, blank_usage_err = self._resolve_blank_usage_for_placements(
-            ps, blank_map
+            normalized_ps, blank_map
         )
         if blank_usage_err is not None:
             return blank_usage_err
-        for placement in ps:
+        for placement in normalized_ps:
             if placement.letter == "?" and (placement.row, placement.col) not in resolved_blank_map:
                 return "AI použila blank bez 'blanks' mapovania."
         return None
@@ -5962,6 +6135,7 @@ class MainWindow(QMainWindow):
             new_mode = dlg.get_selected_mode()
             new_agent = dlg.get_selected_agent_name()
             new_google_models = dlg.get_selected_google_models()
+            new_openai_models = dlg.get_selected_openai_models()
             
             if new_mode != self.opponent_mode or new_agent != self.selected_agent_name:
                 self.opponent_mode = new_mode
@@ -5991,6 +6165,17 @@ class MainWindow(QMainWindow):
                 models_csv = ",".join(self._preferred_gemini_models)
                 self._update_env_value("GEMINI_MODELS", models_csv)
                 self._update_env_value("GOOGLE_GEMINI_MODELS", models_csv)
+
+            if new_openai_models:
+                openai_values = [
+                    model.strip()
+                    for model in new_openai_models
+                    if isinstance(model, str) and model.strip()
+                ]
+                if openai_values:
+                    models_csv = ",".join(openai_values)
+                    log.info("Updated OpenAI models to %s", openai_values)
+                    self._update_env_value("OPENAI_MODELS", models_csv)
             
             new_ai_tokens, from_env = self._load_ai_move_max_tokens()
             self.ai_move_max_tokens = new_ai_tokens
@@ -6401,6 +6586,7 @@ class MainWindow(QMainWindow):
             new_mode = dialog.get_selected_mode()
             new_agent = dialog.get_selected_agent_name()
             new_google_models = dialog.get_selected_google_models()
+            new_openai_models = dialog.get_selected_openai_models()
             
             log.info("=== Settings Accepted: mode=%s, agent=%s ===", new_mode.value, new_agent)
             
@@ -6425,6 +6611,17 @@ class MainWindow(QMainWindow):
                 models_csv = ",".join(self._preferred_gemini_models)
                 self._update_env_value("GEMINI_MODELS", models_csv)
                 self._update_env_value("GOOGLE_GEMINI_MODELS", models_csv)
+
+            if new_openai_models:
+                openai_values = [
+                    model.strip()
+                    for model in new_openai_models
+                    if isinstance(model, str) and model.strip()
+                ]
+                if openai_values:
+                    models_csv = ",".join(openai_values)
+                    log.info("Updated OpenAI models to %s", openai_values)
+                    self._update_env_value("OPENAI_MODELS", models_csv)
             
             # Check if any models were configured
             openrouter_models = dialog.get_selected_openrouter_models()

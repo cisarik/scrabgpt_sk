@@ -503,6 +503,29 @@ class TestHighLevelTools:
         assert result["valid"] is False
         assert result["checks"]["covers_center"] is False
 
+    def test_validate_move_legality_rejects_occupied_square(self) -> None:
+        """Given: Placement on an already occupied board cell.
+        When: Tool validates move legality.
+        Then: Validation fails before geometry checks.
+        """
+        from scrabgpt.ai.mcp_tools import tool_validate_move_legality
+
+        grid = ["." * 15 for _ in range(15)]
+        grid[7] = grid[7][:7] + "K" + grid[7][8:]
+        placements = [
+            {"row": 7, "col": 7, "letter": "K"},
+            {"row": 7, "col": 8, "letter": "A"},
+        ]
+
+        result = tool_validate_move_legality(
+            board_grid=grid,
+            placements=placements,
+            is_first_move=False,
+        )
+
+        assert result["valid"] is False
+        assert "occupied" in str(result["reason"]).lower()
+
     def test_calculate_move_score_returns_total_with_breakdown(self) -> None:
         """Given: Valid move with placements
         When: Tool calculates score

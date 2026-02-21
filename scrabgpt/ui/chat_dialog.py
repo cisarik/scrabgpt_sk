@@ -842,7 +842,14 @@ class ChatDialog(QDialog):
 
     def _render_context_info(self) -> None:
         """Zobraz info o context window pre celú konverzáciu."""
-        model_key = os.getenv("OPENAI_MODEL") or os.getenv("LLMSTUDIO_MODEL")
+        model_key = ""
+        for item in os.getenv("OPENAI_MODELS", "").split(","):
+            candidate = item.strip()
+            if candidate:
+                model_key = candidate
+                break
+        if not model_key:
+            model_key = os.getenv("LLMSTUDIO_MODEL") or ""
         aggregate_history = list(self.chat_history)
         if self.streaming_text:
             aggregate_history.append(self.streaming_text)

@@ -135,7 +135,18 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                 "board_grid": {"type": "array", "items": {"type": "string"}},
                 "premium_grid": {
                     "type": "array",
-                    "items": {"type": "array"},
+                    "items": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "type": {"type": "string"},
+                                "used": {"type": "boolean"},
+                            },
+                            "required": ["type", "used"],
+                            "additionalProperties": False,
+                        },
+                    },
                     "description": "15x15 grid of premium info or null",
                 },
                 "placements": {"type": "array", "items": {"type": "object"}},
@@ -145,7 +156,15 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                         "type": "object",
                         "properties": {
                             "word": {"type": "string"},
-                            "cells": {"type": "array", "items": {"type": "array"}},
+                            "cells": {
+                                "type": "array",
+                                "items": {
+                                    "type": "array",
+                                    "items": {"type": "integer"},
+                                    "minItems": 2,
+                                    "maxItems": 2,
+                                },
+                            },
                         },
                     },
                 },
@@ -275,7 +294,21 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "type": "object",
             "properties": {
                 "board_grid": {"type": "array", "items": {"type": "string"}},
-                "premium_grid": {"type": "array", "items": {"type": "array"}},
+                "premium_grid": {
+                    "type": "array",
+                    "items": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "type": {"type": "string"},
+                                "used": {"type": "boolean"},
+                            },
+                            "required": ["type", "used"],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
                 "placements": {"type": "array", "items": {"type": "object"}},
             },
             "required": ["board_grid", "premium_grid", "placements"],

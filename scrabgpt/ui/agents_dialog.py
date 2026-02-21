@@ -35,11 +35,14 @@ log = logging.getLogger("scrabgpt.ui.agents")
 def load_env_llm_defaults() -> dict[str, object] | None:
     """Načítaj implicitné LLM nastavenie z .env (OpenAI/LLMStudio)."""
     base = os.getenv("OPENAI_BASE_URL") or os.getenv("LLMSTUDIO_BASE_URL")
-    model = (
-        os.getenv("OPENAI_MODEL")
-        or os.getenv("OPENAI_PLAYER_MODEL")
-        or os.getenv("LLMSTUDIO_MODEL")
-    )
+    model = ""
+    for item in os.getenv("OPENAI_MODELS", "").split(","):
+        candidate = item.strip()
+        if candidate:
+            model = candidate
+            break
+    if not model:
+        model = (os.getenv("LLMSTUDIO_MODEL") or "").strip()
     max_tokens_env = os.getenv("AI_MOVE_MAX_OUTPUT_TOKENS")
     timeout_env = os.getenv("AI_MOVE_TIMEOUT_SECONDS")
     

@@ -68,6 +68,55 @@ def get_gemini_tools() -> list[types.Tool]:
     return [types.Tool(function_declarations=function_declarations)]
 
 
+def get_openai_tools() -> list[dict[str, Any]]:
+    """Convert internal tool schemas to OpenAI chat-completions tool format."""
+
+    def _sanitize_schema(value: Any) -> Any:
+        if isinstance(value, dict):
+            cleaned: dict[str, Any] = {}
+            for key, item in value.items():
+                if key == "type" and isinstance(item, list):
+                    preferred = next(
+                        (
+                            option
+                            for option in item
+                            if isinstance(option, str) and option.lower() != "null"
+                        ),
+                        "string",
+                    )
+                    cleaned[key] = preferred.lower()
+                    continue
+                cleaned[key] = _sanitize_schema(item)
+
+            schema_type = cleaned.get("type")
+            if schema_type == "array" and "items" not in cleaned:
+                # OpenAI function schemas require `items` on every array node.
+                cleaned["items"] = {"type": "string"}
+            if schema_type == "object":
+                # Be explicit to avoid provider-side "object schema missing properties".
+                cleaned.setdefault("properties", {})
+                cleaned.setdefault("additionalProperties", True)
+            return cleaned
+        if isinstance(value, list):
+            return [_sanitize_schema(item) for item in value]
+        return value
+
+    tools: list[dict[str, Any]] = []
+    for schema in TOOL_SCHEMAS.values():
+        parameters = _sanitize_schema(schema.get("inputSchema", {}))
+        tools.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": schema["name"],
+                    "description": schema["description"],
+                    "parameters": parameters,
+                },
+            }
+        )
+    return tools
+
+
 def _enrich_args_with_context(
     name: str,
     args: dict[str, Any],

@@ -45,20 +45,20 @@ class TestAutoUpdateConfig:
         assert is_auto_update_enabled() is False
     
     def test_get_current_model_from_env(self, monkeypatch):
-        """Given: OPENAI_PLAYER_MODEL set in environment
+        """Given: OPENAI_MODELS set in environment
         When: Getting current model
-        Then: Returns model from environment
+        Then: Returns first model from environment
         """
-        monkeypatch.setenv("OPENAI_PLAYER_MODEL", "gpt-4o")
+        monkeypatch.setenv("OPENAI_MODELS", "gpt-4o,gpt-4.1")
         assert get_current_model() == "gpt-4o"
     
     def test_get_current_model_default(self, monkeypatch):
-        """Given: OPENAI_PLAYER_MODEL not set
+        """Given: OPENAI_MODELS not set
         When: Getting current model
         Then: Returns default model
         """
-        monkeypatch.delenv("OPENAI_PLAYER_MODEL", raising=False)
-        assert get_current_model() == "gpt-4o-mini"
+        monkeypatch.delenv("OPENAI_MODELS", raising=False)
+        assert get_current_model() == "gpt-5.2"
 
 
 class TestEnvFileUpdate:
@@ -71,7 +71,7 @@ class TestEnvFileUpdate:
         """
         with NamedTemporaryFile(mode="w", suffix=".env", delete=False) as f:
             f.write("OPENAI_API_KEY='test-key'\n")
-            f.write("OPENAI_PLAYER_MODEL='gpt-3.5-turbo'\n")
+            f.write("OPENAI_MODELS='gpt-3.5-turbo,gpt-4.1'\n")
             env_path = Path(f.name)
         
         try:
@@ -81,13 +81,13 @@ class TestEnvFileUpdate:
             
             # Verify content
             content = env_path.read_text()
-            assert "OPENAI_PLAYER_MODEL='gpt-4o'" in content
+            assert "OPENAI_MODELS='gpt-4o'" in content
             assert "gpt-3.5-turbo" not in content
         finally:
             env_path.unlink()
     
     def test_update_env_file_appends_if_not_present(self):
-        """Given: .env file without OPENAI_PLAYER_MODEL
+        """Given: .env file without OPENAI_MODELS
         When: Updating model
         Then: Line is appended
         """
@@ -102,7 +102,7 @@ class TestEnvFileUpdate:
             
             # Verify content
             content = env_path.read_text()
-            assert "OPENAI_PLAYER_MODEL='gpt-4o'" in content
+            assert "OPENAI_MODELS='gpt-4o'" in content
         finally:
             env_path.unlink()
     
@@ -128,7 +128,7 @@ class TestAutoUpdateWorkflow:
             pytest.skip("OPENAI_API_KEY not set")
         
         monkeypatch.setenv("OPENAI_BEST_MODEL_AUTO_UPDATE", "false")
-        monkeypatch.setenv("OPENAI_PLAYER_MODEL", "gpt-3.5-turbo")
+        monkeypatch.setenv("OPENAI_MODELS", "gpt-3.5-turbo")
         
         result = check_and_update_model(openai_api_key)
         
@@ -146,7 +146,7 @@ class TestAutoUpdateWorkflow:
             pytest.skip("OPENAI_API_KEY not set")
         
         monkeypatch.setenv("OPENAI_BEST_MODEL_AUTO_UPDATE", "false")
-        monkeypatch.setenv("OPENAI_PLAYER_MODEL", "gpt-3.5-turbo")
+        monkeypatch.setenv("OPENAI_MODELS", "gpt-3.5-turbo")
         
         result = check_and_update_model(
             api_key=openai_api_key,
@@ -174,12 +174,12 @@ class TestAutoUpdateWorkflow:
         # Create temporary .env file
         with NamedTemporaryFile(mode="w", suffix=".env", delete=False) as f:
             f.write("OPENAI_API_KEY='test-key'\n")
-            f.write("OPENAI_PLAYER_MODEL='gpt-3.5-turbo'\n")
+            f.write("OPENAI_MODELS='gpt-3.5-turbo'\n")
             f.write("OPENAI_BEST_MODEL_AUTO_UPDATE='true'\n")
             env_path = Path(f.name)
         
         try:
-            monkeypatch.setenv("OPENAI_PLAYER_MODEL", "gpt-3.5-turbo")
+            monkeypatch.setenv("OPENAI_MODELS", "gpt-3.5-turbo")
             monkeypatch.setenv("OPENAI_BEST_MODEL_AUTO_UPDATE", "true")
             
             # Run full workflow

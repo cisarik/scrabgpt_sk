@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import os
 import re
 from copy import deepcopy
 from dataclasses import asdict
@@ -204,7 +205,7 @@ async def propose_move_multi_model(
         fallback_origin: str | None = None
         # Use provided timeout or default, but ensure we have a deadline
         deadline = asyncio.get_event_loop().time() + (timeout_seconds or 60)
-        max_attempts = 3
+        max_attempts = 6 if enforce_tool_workflow and tools else 3
         attempt_count = 0
         
         # History for retries
@@ -253,6 +254,42 @@ async def propose_move_multi_model(
                 kwargs["messages"] = conversation_history
             if "progress_callback" in sig.parameters:
                 kwargs["progress_callback"] = _notify
+            if "request_timeout_seconds" in sig.parameters:
+                kwargs["request_timeout_seconds"] = max(5, int(remaining_time))
+            if "round_timeout_seconds" in sig.parameters:
+                round_timeout_env = os.getenv("OPENAI_TOOL_ROUND_TIMEOUT_SECONDS")
+                try:
+                    round_timeout_value = (
+                        int(round_timeout_env)
+                        if round_timeout_env is not None
+                        else min(20, timeout_seconds or 60)
+                    )
+                except ValueError:
+                    round_timeout_value = min(20, timeout_seconds or 60)
+                kwargs["round_timeout_seconds"] = max(5, round_timeout_value)
+            if "min_word_validations" in sig.parameters:
+                min_validations_env = os.getenv("OPENAI_MIN_WORD_VALIDATIONS")
+                try:
+                    min_validations = (
+                        int(min_validations_env)
+                        if min_validations_env is not None
+                        else (12 if enforce_tool_workflow else 0)
+                    )
+                except ValueError:
+                    min_validations = 12 if enforce_tool_workflow else 0
+                kwargs["min_word_validations"] = max(0, min_validations)
+            if "min_scored_candidates" in sig.parameters:
+                min_scored_env = os.getenv("OPENAI_MIN_SCORED_CANDIDATES")
+                try:
+                    if min_scored_env is not None:
+                        min_scored_candidates = int(min_scored_env)
+                    elif "min_word_validations" in kwargs:
+                        min_scored_candidates = int(kwargs["min_word_validations"])
+                    else:
+                        min_scored_candidates = 12 if enforce_tool_workflow else 0
+                except (TypeError, ValueError):
+                    min_scored_candidates = 12 if enforce_tool_workflow else 0
+                kwargs["min_scored_candidates"] = max(0, min_scored_candidates)
 
             # Call model
             try:
@@ -335,6 +372,7 @@ async def propose_move_multi_model(
 
             call_status = result.get("status")
             fallback_from = result.get("fallback_from")
+            tools_unsupported = bool(result.get("tools_unsupported"))
             executed_tools_raw = result.get("tool_calls_executed")
             executed_tools_list = [
                 str(name).strip()
@@ -345,7 +383,7 @@ async def propose_move_multi_model(
                 name for name in executed_tools_list
             }
             missing_workflow_tools: list[str] = []
-            if enforce_tool_workflow and tools:
+            if enforce_tool_workflow and tools and not tools_unsupported:
                 for required in ("get_board_state", "get_premium_squares"):
                     if required not in executed_tools:
                         missing_workflow_tools.append(required)
@@ -364,6 +402,34 @@ async def propose_move_multi_model(
                     call_status,
                     error_msg,
                 )
+                should_retry_timeout = (
+                    call_status in {"timeout"}
+                    or (call_status == "error" and "timeout" in error_msg.lower())
+                )
+                if (
+                    should_retry_timeout
+                    and attempt_count < max_attempts
+                    and remaining_time > 10
+                ):
+                    feedback = (
+                        "Previous attempt timed out. Continue exploring more legal words, "
+                        "re-use tools, and return the best scored JSON move."
+                    )
+                    conversation_history.append({"role": "user", "content": feedback})
+                    await _notify(
+                        {
+                            "status": "retry",
+                            "model": active_model_id,
+                            "model_name": active_model_name,
+                            "error": (
+                                f"{error_msg} | retrying {attempt_count}/{max_attempts}"
+                            ),
+                            "remaining": int(max(0, remaining_time)),
+                            "attempt": attempt_count,
+                            "max_attempts": max_attempts,
+                        }
+                    )
+                    continue
                 payload = {
                     "model": active_model_id,
                     "model_name": active_model_name,

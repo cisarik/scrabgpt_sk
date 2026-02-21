@@ -10,7 +10,7 @@ class OpponentMode(Enum):
     
     Determines how the AI opponent generates moves:
     - AGENT: Uses configurable local agent with Scrabble tools
-    - BEST_MODEL: Uses OpenAI's best available model (auto-fetched)
+    - BEST_MODEL: Parallel OpenAI model competition (from OPENAI_MODELS)
     - OPENROUTER: Multi-model competition via OpenRouter
     - NOVITA: Multi-model competition via Novita (reasoning models)
     - GEMINI: Google Gemini model via Vertex AI (streaming + reasoning)
@@ -42,7 +42,10 @@ class OpponentMode(Enum):
                 "Hrať proti agentovi s lokálnymi Scrabble nástrojmi a vybraným LLM "
                 "napojeným cez .env/LMStudio."
             ),
-            OpponentMode.BEST_MODEL: "Hrať oproti najlepšiemu <GPT5> modelu",
+            OpponentMode.BEST_MODEL: (
+                "Paralelné volanie vybraných OpenAI modelov. "
+                "Použije sa najlepší legálny ťah podľa skóre."
+            ),
             OpponentMode.OPENROUTER: "Paralelné volanie modelov ktoré vybraté na hru.",
             OpponentMode.NOVITA: "Paralelné volanie reasoning modelov (DeepSeek, Qwen, GLM, LLaMA).",
             OpponentMode.GEMINI: "Gemini model cez Google Vertex AI (reasoning + stream).",

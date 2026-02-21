@@ -976,6 +976,55 @@ def tool_validate_move_legality(
     """
     try:
         checks = {}
+        if not placements:
+            return {
+                "valid": False,
+                "checks": checks,
+                "reason": "No placements provided",
+            }
+
+        # Pre-check: coordinates must be unique, in bounds, and target empty cells.
+        seen_coords: set[tuple[int, int]] = set()
+        for placement in placements:
+            try:
+                row = int(placement["row"])
+                col = int(placement["col"])
+            except Exception:
+                return {
+                    "valid": False,
+                    "checks": checks,
+                    "reason": "Invalid placement coordinates",
+                }
+
+            if not (0 <= row < BOARD_SIZE and 0 <= col < BOARD_SIZE):
+                checks["in_bounds"] = False
+                return {
+                    "valid": False,
+                    "checks": checks,
+                    "reason": "Placement out of board bounds",
+                }
+            checks["in_bounds"] = True
+
+            coord = (row, col)
+            if coord in seen_coords:
+                checks["unique_cells"] = False
+                return {
+                    "valid": False,
+                    "checks": checks,
+                    "reason": "Duplicate placement coordinates",
+                }
+            seen_coords.add(coord)
+            checks["unique_cells"] = True
+
+            existing = board_grid[row][col]
+            if existing != ".":
+                checks["empty_cells"] = False
+                return {
+                    "valid": False,
+                    "checks": checks,
+                    "reason": "Cannot place letter on occupied square",
+                }
+            checks["empty_cells"] = True
         
         # Check 1: Placements in line
         line_result = tool_rules_placements_in_line(placements)

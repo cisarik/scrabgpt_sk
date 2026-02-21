@@ -20,7 +20,12 @@ else:
 
 def _default_model_key() -> str | None:
     """Pick model key from env if present."""
-    return os.getenv("OPENAI_MODEL") or os.getenv("LLMSTUDIO_MODEL")
+    openai_models_raw = os.getenv("OPENAI_MODELS", "")
+    for item in openai_models_raw.split(","):
+        model_id = item.strip()
+        if model_id:
+            return model_id
+    return os.getenv("LLMSTUDIO_MODEL")
 
 
 @lru_cache(maxsize=2)

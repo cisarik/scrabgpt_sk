@@ -46,25 +46,35 @@ class OpenAIClient:
     def __init__(self, model: str = DEFAULT_OPENAI_MODEL) -> None:
         load_dotenv()
         api_key = os.getenv("OPENAI_API_KEY", "")
-        env_model = os.getenv("OPENAI_MODEL")
-        if env_model:
-            model = env_model
-        model = (model or DEFAULT_OPENAI_MODEL).strip() or DEFAULT_OPENAI_MODEL
-
         base_url = os.getenv("OPENAI_BASE_URL") or os.getenv("LLMSTUDIO_BASE_URL")
+        raw_models = os.getenv("OPENAI_MODELS", "")
+        openai_models = [item.strip() for item in raw_models.split(",") if item.strip()]
+        lmstudio_model = (os.getenv("LLMSTUDIO_MODEL") or "").strip()
+        resolved_model = (model or "").strip()
+
+        # In local/base_url mode prefer dedicated LMStudio model id if provided.
+        if base_url and lmstudio_model:
+            resolved_model = lmstudio_model
+        elif openai_models:
+            resolved_model = openai_models[0]
+        elif lmstudio_model and not resolved_model:
+            resolved_model = lmstudio_model
+
+        resolved_model = resolved_model or DEFAULT_OPENAI_MODEL
+
         client_kwargs: dict[str, Any] = {}
         if base_url:
             client_kwargs["base_url"] = base_url.rstrip("/")
             log.info("OpenAI client base_url override: %s", client_kwargs["base_url"])
 
         self.client = OpenAI(api_key=api_key if api_key else None, **client_kwargs)
-        self.model = model
+        self.model = resolved_model
         # LMStudio/localhost: vypneme Responses endpoint úplne (pády/500)
         if base_url:
             self._use_responses_endpoint = False
         else:
             self._use_responses_endpoint = True
-        log.info("OpenAI client init (model=%s, key=%s)", model, _mask_key(api_key))
+        log.info("OpenAI client init (model=%s, key=%s)", resolved_model, _mask_key(api_key))
         # Bezpecnost: nikdy neloguj obsah .env ani plny kluc.
 
         # Limity vystupu (ochrana rozpoctu). Možno upraviť v .env
