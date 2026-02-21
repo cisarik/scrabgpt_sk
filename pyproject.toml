@@ -21,7 +21,7 @@ parsel = "^1.10.0"
 h2 = "^4.3.0"
 #lmstudio = "^0.1.1"
 google-generativeai = "^0.8.4"
-google-genai = "^1.52.0"
+google-genai = ">=1.51.0"
 
 
 [tool.poetry.group.dev.dependencies]
