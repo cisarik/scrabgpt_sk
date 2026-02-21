@@ -115,8 +115,9 @@ class SettingsDialog(QDialog):
         
         # Store Google model selection for GEMINI mode
         self.selected_google_model: str = (
-            os.getenv("GOOGLE_GEMINI_MODEL", "gemini-2.5-pro").strip() or "gemini-2.5-pro"
-        )
+            os.getenv("GEMINI_MODEL")
+            or os.getenv("GOOGLE_GEMINI_MODEL", "gemini-2.5-pro")
+        ).strip() or "gemini-2.5-pro"
         
         # API settings state
         self.selected_variant_slug = get_active_variant_slug()
@@ -359,7 +360,9 @@ class SettingsDialog(QDialog):
         form.setSpacing(10)
 
         model_combo = QComboBox(dialog)
+        model_combo.addItem("Gemini 3.1 Pro (preview)", "gemini-3.1-pro-preview")
         model_combo.addItem("Gemini 3 Pro", "gemini-3-pro-preview")
+        model_combo.addItem("Gemini 3 Flash (preview)", "gemini-3-flash-preview")
         model_combo.addItem("Gemini 2.5 Pro", "gemini-2.5-pro")
         model_combo.addItem("Gemini 2.5 Flash", "gemini-2.5-flash")
         index = model_combo.findData(self.selected_google_model)

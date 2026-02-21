@@ -46,8 +46,10 @@ _NON_SCORING_RETRY_FEEDBACK = (
 def _timeout_fallback_model(model_id: str) -> str | None:
     normalized = model_id.replace("google/", "").strip().lower()
     chain = {
+        "gemini-3.1-pro-preview": "gemini-2.5-pro",
         "gemini-3-pro": "gemini-2.5-pro",
         "gemini-3-pro-preview": "gemini-2.5-pro",
+        "gemini-3-flash-preview": "gemini-2.5-flash",
         "gemini-2.5-pro": "gemini-2.5-flash",
     }
     return chain.get(normalized)

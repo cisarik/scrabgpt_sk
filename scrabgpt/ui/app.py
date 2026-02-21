@@ -83,6 +83,7 @@ from ..ai.player import (
 )
 from ..ai.openrouter import OpenRouterClient
 from ..ai.vertex import VertexClient
+from ..ai.vertex_genai_client import build_client as build_vertex_genai_client
 from ..ai.multi_model import propose_move_multi_model
 from ..ai.novita import NovitaClient
 from ..ai.novita_multi_model import propose_move_novita_multi_model
@@ -116,25 +117,25 @@ from .model_results import AIModelResultsTable
 
 
 class GeminiProbeWorker(QObject):
-    """Background worker to check if Gemini 3.0 Pro is available."""
+    """Background worker to check if Gemini 3.1 Pro preview is available."""
 
     finished = Signal(bool)
 
     def run(self) -> None:
         try:
-            # Use default credentials/location from environment or VertexClient defaults
-            client = VertexClient(timeout_seconds=10)
-            # Try minimal generation to probe availability
-            # We use the underlying google-genai client directly to be sync/fast
-            client.client.models.generate_content(
-                model="gemini-3-pro-preview",
+            probe_model = (
+                os.getenv("GEMINI_PROBE_MODEL", "gemini-3.1-pro-preview").strip()
+                or "gemini-3.1-pro-preview"
+            )
+            client, _ = build_vertex_genai_client(model=probe_model, verbose=True)
+            client.models.generate_content(
+                model=probe_model,
                 contents="Hi",
                 config=vertex_types.GenerateContentConfig(max_output_tokens=1),
             )
-            # If we get here without exception, it exists and we have access
             self.finished.emit(True)
         except Exception as e:
-            log.info("Gemini 3 Pro probe failed: %s", e)
+            log.info("Gemini 3.1 Pro probe failed: %s", e)
             self.finished.emit(False)
 
 
@@ -2005,7 +2006,7 @@ class MainWindow(QMainWindow):
         
         # Default preferovaný model pre Google/Gemini mód.
         # Ak používateľ explicitne vyberie model, probe ho neprepíše.
-        env_google_model = (os.getenv("GOOGLE_GEMINI_MODEL") or "").strip()
+        env_google_model = (os.getenv("GEMINI_MODEL") or os.getenv("GOOGLE_GEMINI_MODEL") or "").strip()
         self._preferred_gemini_model = env_google_model or "gemini-2.5-pro"
         self._google_model_user_selected = bool(env_google_model)
         
@@ -2036,12 +2037,12 @@ class MainWindow(QMainWindow):
             return
 
         if available:
-            log.info("Gemini 3.0 Pro detected! Switching preferred model.")
-            self._preferred_gemini_model = "gemini-3-pro-preview"
+            log.info("Gemini 3.1 Pro detected! Switching preferred model.")
+            self._preferred_gemini_model = "gemini-3.1-pro-preview"
             # Update UI if Gemini mode is active? Only if we need to refresh labels/tables.
             # But _start_ai_turn uses self._preferred_gemini_model dynamically.
         else:
-            log.info("Gemini 3.0 Pro not available, staying with 2.5 Pro.")
+            log.info("Gemini 3.1 Pro not available, staying with 2.5 Pro.")
 
     def _load_ai_move_timeout(self) -> int:
         raw = (
@@ -2158,6 +2159,8 @@ class MainWindow(QMainWindow):
         model_id = (getattr(self, "_preferred_gemini_model", "") or "").strip()
         if not model_id:
             model_id = "gemini-2.5-pro"
+        if "3.1-pro" in model_id:
+            return "Gemini 3.1 Pro"
         if "3-pro" in model_id:
             return "Gemini 3 Pro"
         if "2.5-flash" in model_id:
@@ -2169,6 +2172,8 @@ class MainWindow(QMainWindow):
     @staticmethod
     def _google_model_display_name(model_id: str) -> str:
         normalized = model_id.replace("google/", "").strip()
+        if "3.1-pro" in normalized:
+            return "Gemini 3.1 Pro"
         if "3-pro" in normalized:
             return "Gemini 3 Pro"
         if "2.5-flash" in normalized:
@@ -2184,7 +2189,9 @@ class MainWindow(QMainWindow):
 
         # Always keep a robust Google fallback chain. This protects against
         # unavailable preview models and intermittent timeouts.
-        if "3-pro" in primary:
+        if "3.1-pro" in primary:
+            chain.extend(["gemini-3-pro-preview", "gemini-2.5-pro", "gemini-2.5-flash"])
+        elif "3-pro" in primary:
             chain.extend(["gemini-2.5-pro", "gemini-2.5-flash"])
         elif "2.5-pro" in primary:
             chain.append("gemini-2.5-flash")
@@ -4067,7 +4074,7 @@ class MainWindow(QMainWindow):
                         try:
                             all_failed = all(r.get("status") != "ok" for r in results)
                             has_gemini = any(
-                                m.get("id") == "google/gemini-3-pro-preview"
+                                str(m.get("id", "")).startswith("google/gemini-3")
                                 for m in (self.selected_models or [])
                             )
                             google_key = os.getenv("GOOGLE_API_KEY", "")
@@ -4365,6 +4372,7 @@ class MainWindow(QMainWindow):
                     continue
                 self._preferred_gemini_model = fallback_to
                 self._google_model_user_selected = True
+                self._update_env_value("GEMINI_MODEL", fallback_to)
                 self._update_env_value("GOOGLE_GEMINI_MODEL", fallback_to)
                 self._update_mode_status_label()
                 log.warning(
@@ -5021,6 +5029,7 @@ class MainWindow(QMainWindow):
                     log.info("Updated Google model to %s", model_value)
                 self._preferred_gemini_model = model_value
                 self._google_model_user_selected = True
+                self._update_env_value("GEMINI_MODEL", model_value)
                 self._update_env_value("GOOGLE_GEMINI_MODEL", model_value)
             
             new_ai_tokens, from_env = self._load_ai_move_max_tokens()
@@ -5441,6 +5450,7 @@ class MainWindow(QMainWindow):
                     log.info("Updated Google model to %s", model_value)
                 self._preferred_gemini_model = model_value
                 self._google_model_user_selected = True
+                self._update_env_value("GEMINI_MODEL", model_value)
                 self._update_env_value("GOOGLE_GEMINI_MODEL", model_value)
             
             # Check if any models were configured

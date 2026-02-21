@@ -17,10 +17,14 @@ from functools import partial
 from itertools import count
 from typing import Any, Callable, Iterator
 
-from google import genai
 from google.genai import types
 
 from ..logging_setup import TRACE_ID_VAR
+from .vertex_genai_client import (
+    build_client,
+    is_gemini_3_preview_model,
+    vertex_error_hint,
+)
 
 log = logging.getLogger("scrabgpt.ai.vertex")
 
@@ -35,7 +39,7 @@ def _format_json(data: Any) -> str:
 
 class VertexClient:
     """Client for Google Vertex AI via google-genai library."""
-    
+
     def __init__(
         self,
         project_id: str | None = None,
@@ -43,29 +47,21 @@ class VertexClient:
         *,
         timeout_seconds: int | None = None,
     ) -> None:
-        # Load credentials and project_id from file if present
-        creds_path = os.path.abspath("vertexaccount.json")
-        loaded_project_id = None
-        
-        if os.path.exists(creds_path):
-            os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = creds_path
-            try:
-                with open(creds_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    loaded_project_id = data.get("project_id")
-            except Exception as e:
-                log.warning("Failed to parse project_id from %s: %s", creds_path, e)
-
-        self.project_id = project_id or loaded_project_id or "vertexaccount"
-        # Prefer argument, then env var, then default
-        self.location = location or os.getenv("VERTEX_LOCATION") or "us-central1"
-            
-        self.client = genai.Client(
-            vertexai=True,
-            project=self.project_id,
-            location=self.location
+        configured_model = (
+            os.getenv("GEMINI_MODEL")
+            or os.getenv("GOOGLE_GEMINI_MODEL")
+            or "gemini-2.5-pro"
         )
-        
+        self.client, client_config = build_client(
+            project_id=project_id,
+            location=location,
+            model=configured_model,
+            verbose=True,
+        )
+        self.project_id = client_config.project_id
+        self.location = client_config.location
+        self.default_model = client_config.model
+
         env_timeout = (
             os.getenv("AI_MOVE_TIMEOUT_SECONDS")
             or os.getenv("VERTEX_TIMEOUT_SECONDS")
@@ -122,11 +118,36 @@ class VertexClient:
             return None
         normalized = model_id.replace("google/", "").strip().lower()
         chain = {
+            "gemini-3.1-pro-preview": "gemini-2.5-pro",
             "gemini-3-pro": "gemini-2.5-pro",
             "gemini-3-pro-preview": "gemini-2.5-pro",
+            "gemini-3-flash-preview": "gemini-2.5-flash",
+            "gemini-3-pro-image-preview": "gemini-2.5-pro",
             "gemini-2.5-pro": "gemini-2.5-flash",
         }
         return chain.get(normalized)
+
+    def _ensure_client_location_for_model(self, model_id: str) -> None:
+        """Rebuild client on global endpoint when Gemini 3.x preview is requested."""
+        if not is_gemini_3_preview_model(model_id):
+            return
+        if self.location == "global":
+            return
+
+        previous_location = self.location
+        self.client, client_config = build_client(
+            project_id=self.project_id,
+            location="global",
+            model=model_id,
+            verbose=True,
+        )
+        self.location = client_config.location
+        log.warning(
+            "Switched Vertex client location %s -> %s for model %s",
+            previous_location,
+            self.location,
+            model_id,
+        )
     
     def _next_call_id(self, kind: str) -> str:
         """Return a unique identifier for logging scopes."""
@@ -178,6 +199,8 @@ class VertexClient:
         # If it contains "google/", strip it as Vertex client uses bare IDs or full paths
         if model_id.startswith("google/"):
             model_id = model_id.replace("google/", "")
+
+        self._ensure_client_location_for_model(model_id)
             
         resolved_max_tokens = (
             max_tokens
@@ -437,10 +460,18 @@ class VertexClient:
                     e,
                 )
                 log.debug("[%s] Exception detail", trace_id, exc_info=True)
+                hint = vertex_error_hint(
+                    str(e),
+                    model_id=model_id,
+                    location=self.location,
+                )
+                if hint:
+                    log.error("[%s] Vertex troubleshooting hint: %s", trace_id, hint)
+                error_message = str(e) if not hint else f"{e} | Hint: {hint}"
                 return {
                     "model": model_id,
                     "content": "",
-                    "error": str(e),
+                    "error": error_message,
                     "status": "error",
                     "trace_id": trace_id,
                     "call_id": call_id,
