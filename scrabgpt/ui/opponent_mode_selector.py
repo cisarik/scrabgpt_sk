@@ -161,7 +161,7 @@ class OpponentModeSelector(QWidget):
             desc_layout.setSpacing(8)
             desc_layout.setContentsMargins(26, 0, 0, 0)
             
-            # For Novita and OpenRouter, show dynamic team info; for others, show static description
+            # For Novita and OpenRouter, show dynamic model selection info.
             if mode == OpponentMode.NOVITA:
                 desc = QLabel()
                 desc.setWordWrap(True)
@@ -379,65 +379,59 @@ class OpponentModeSelector(QWidget):
         return None
     
     def _update_novita_description(self) -> None:
-        """Update Novita description to show active team info."""
+        """Update Novita description to show selected models."""
         if self.novita_desc_label is None:
             return
-        
-        # Load active team
-        team = self.team_manager.load_active_team_config("novita")
-        
-        if team and team.model_ids:
-            # Show team name in bold white, larger font
-            team_name_html = f'<span style="font-size: 14px; font-weight: bold; color: #ffffff;">{team.name}</span>'
-            
-            # Show model IDs below in smaller gray text
-            models_html = '<br/>'.join([
+
+        selection = self.team_manager.load_provider_selection("novita")
+        model_ids = selection[0] if selection else []
+
+        if model_ids:
+            header_html = (
+                '<span style="font-size: 14px; font-weight: bold; color: #ffffff;">'
+                "Vybrané Novita modely</span>"
+            )
+            models_html = "<br/>".join(
                 f'<span style="font-size: 11px; color: #9ad0a2;">• {model_id}</span>'
-                for model_id in team.model_ids
-            ])
-            
-            full_html = f'{team_name_html}<br/>{models_html}'
-            self.novita_desc_label.setText(full_html)
+                for model_id in model_ids
+            )
+            self.novita_desc_label.setText(f"{header_html}<br/>{models_html}")
         else:
-            # No team configured - show default message
             self.novita_desc_label.setText(
-                '<span style="color: #b6e0bd;">Žiadny team nie je nakonfigurovaný. '
+                '<span style="color: #b6e0bd;">Žiadne Novita modely nie sú nakonfigurované. '
                 'Klikni na "Nastaviť" pre výber modelov.</span>'
             )
     
     def refresh_novita_team_info(self) -> None:
-        """Refresh Novita team info (call after team changes)."""
+        """Refresh Novita model info (called after configuration changes)."""
         self._update_novita_description()
     
     def _update_openrouter_description(self) -> None:
-        """Update OpenRouter description to show active team info."""
+        """Update OpenRouter description to show selected models."""
         if self.openrouter_desc_label is None:
             return
-        
-        # Load active team
-        team = self.team_manager.load_active_team_config("openrouter")
-        
-        if team and team.model_ids:
-            # Show team name in bold white, larger font
-            team_name_html = f'<span style="font-size: 14px; font-weight: bold; color: #ffffff;">{team.name}</span>'
-            
-            # Show model IDs below in smaller gray text
-            models_html = '<br/>'.join([
+
+        selection = self.team_manager.load_provider_selection("openrouter")
+        model_ids = selection[0] if selection else []
+
+        if model_ids:
+            header_html = (
+                '<span style="font-size: 14px; font-weight: bold; color: #ffffff;">'
+                "Vybrané OpenRouter modely</span>"
+            )
+            models_html = "<br/>".join(
                 f'<span style="font-size: 11px; color: #9ad0a2;">• {model_id}</span>'
-                for model_id in team.model_ids
-            ])
-            
-            full_html = f'{team_name_html}<br/>{models_html}'
-            self.openrouter_desc_label.setText(full_html)
+                for model_id in model_ids
+            )
+            self.openrouter_desc_label.setText(f"{header_html}<br/>{models_html}")
         else:
-            # No team configured - show default message
             self.openrouter_desc_label.setText(
-                '<span style="color: #b6e0bd;">Žiadny team nie je nakonfigurovaný. '
+                '<span style="color: #b6e0bd;">Žiadne OpenRouter modely nie sú nakonfigurované. '
                 'Klikni na "Nastaviť" pre výber modelov.</span>'
             )
     
     def refresh_openrouter_team_info(self) -> None:
-        """Refresh OpenRouter team info (call after team changes)."""
+        """Refresh OpenRouter model info (called after configuration changes)."""
         self._update_openrouter_description()
 
     @staticmethod

@@ -77,6 +77,122 @@ class TeamManager:
         self.config_file = config_file or DEFAULT_CONFIG_FILE
         self.config_file.parent.mkdir(parents=True, exist_ok=True)
         log.info("Team manager initialized: %s", self.teams_dir)
+
+    def _load_config(self) -> dict[str, Any]:
+        """Load JSON config or return empty structure on failure."""
+
+        if not self.config_file.exists():
+            return {}
+        try:
+            with self.config_file.open("r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            return loaded if isinstance(loaded, dict) else {}
+        except Exception as e:
+            log.warning("Failed to load config file %s: %s", self.config_file, e)
+            return {}
+
+    def _save_config(self, config: dict[str, Any]) -> None:
+        """Persist JSON config to disk."""
+
+        with self.config_file.open("w", encoding="utf-8") as f:
+            json.dump(config, f, indent=2, ensure_ascii=False)
+
+    @staticmethod
+    def _sanitize_model_ids(model_ids: list[Any]) -> list[str]:
+        """Normalize and deduplicate model IDs while preserving order."""
+
+        normalized: list[str] = []
+        for raw in model_ids:
+            model_id = str(raw or "").strip()
+            if not model_id or model_id in normalized:
+                continue
+            normalized.append(model_id)
+        return normalized
+
+    def save_provider_selection(
+        self,
+        provider: str,
+        model_ids: list[str],
+        timeout_seconds: int = 120,
+    ) -> None:
+        """Save selected model IDs for provider without team semantics.
+
+        Stored in config.json under:
+        {
+          "provider_models": {
+            "<provider>": {"model_ids": [...], "timeout_seconds": 120}
+          }
+        }
+        """
+
+        safe_provider = str(provider or "").strip().lower()
+        if not safe_provider:
+            raise ValueError("provider must be non-empty")
+
+        config = self._load_config()
+        provider_models = config.get("provider_models")
+        if not isinstance(provider_models, dict):
+            provider_models = {}
+            config["provider_models"] = provider_models
+
+        provider_models[safe_provider] = {
+            "model_ids": self._sanitize_model_ids(model_ids),
+            "timeout_seconds": max(5, int(timeout_seconds)),
+            "updated_at": datetime.now().isoformat(),
+        }
+
+        self._save_config(config)
+        log.info(
+            "Saved provider selection for %s (%d models, timeout=%ss)",
+            safe_provider,
+            len(provider_models[safe_provider]["model_ids"]),
+            provider_models[safe_provider]["timeout_seconds"],
+        )
+
+    def load_provider_selection(self, provider: str) -> tuple[list[str], int] | None:
+        """Load selected model IDs for provider without team semantics.
+
+        Falls back to legacy team files and migrates them into config.json.
+        """
+
+        safe_provider = str(provider or "").strip().lower()
+        if not safe_provider:
+            return None
+
+        config = self._load_config()
+        provider_models = config.get("provider_models")
+        if isinstance(provider_models, dict):
+            raw = provider_models.get(safe_provider)
+            if isinstance(raw, dict):
+                raw_ids = raw.get("model_ids")
+                model_ids = self._sanitize_model_ids(raw_ids if isinstance(raw_ids, list) else [])
+                try:
+                    timeout_seconds = int(raw.get("timeout_seconds", 120))
+                except (TypeError, ValueError):
+                    timeout_seconds = 120
+                timeout_seconds = max(5, timeout_seconds)
+                return model_ids, timeout_seconds
+
+        # Legacy fallback: active team or default team config.
+        legacy = self.load_active_team_config(safe_provider) or self.load_team(safe_provider)
+        if legacy is None:
+            return None
+
+        migrated_ids = self._sanitize_model_ids(legacy.model_ids)
+        timeout_seconds = max(5, int(legacy.timeout_seconds))
+        try:
+            self.save_provider_selection(safe_provider, migrated_ids, timeout_seconds)
+            log.info(
+                "Migrated legacy team config to provider selection for %s",
+                safe_provider,
+            )
+        except Exception as e:
+            log.warning(
+                "Failed to persist migrated provider selection for %s: %s",
+                safe_provider,
+                e,
+            )
+        return migrated_ids, timeout_seconds
     
     def get_team_path(self, provider: str, team_name: str | None = None) -> Path:
         """Get path to team config file for a provider.
@@ -216,6 +332,10 @@ class TeamManager:
         """
         # Extract model IDs from full model objects
         model_ids = [m.get("id", "") for m in models if m.get("id")]
+        model_ids = self._sanitize_model_ids(model_ids)
+
+        # Persist provider-level selection (team-less mode).
+        self.save_provider_selection(provider, model_ids, timeout_seconds)
         
         # Try to load existing team to preserve name and created_at
         existing = self.load_team(provider)
@@ -252,11 +372,13 @@ class TeamManager:
         Returns:
             Tuple of (model_ids list, timeout_seconds) if exists, None otherwise
         """
+        selection = self.load_provider_selection(provider)
+        if selection is not None:
+            return selection
+
         team = self.load_team(provider)
-        
         if team:
-            return (team.model_ids, team.timeout_seconds)
-        
+            return (self._sanitize_model_ids(team.model_ids), max(5, int(team.timeout_seconds)))
         return None
     
     def save_opponent_mode(self, mode: str) -> None:
@@ -267,17 +389,13 @@ class TeamManager:
         """
         try:
             # Load existing config or create new
-            config = {}
-            if self.config_file.exists():
-                with self.config_file.open("r", encoding="utf-8") as f:
-                    config = json.load(f)
+            config = self._load_config()
             
             # Update opponent mode
             config["opponent_mode"] = mode
             
             # Save back
-            with self.config_file.open("w", encoding="utf-8") as f:
-                json.dump(config, f, indent=2, ensure_ascii=False)
+            self._save_config(config)
             
             log.info("Saved opponent mode: %s", mode)
         except Exception as e:
@@ -293,14 +411,11 @@ class TeamManager:
         """
         try:
             # Try config.json first (highest priority)
-            if self.config_file.exists():
-                with self.config_file.open("r", encoding="utf-8") as f:
-                    config = json.load(f)
-                
-                mode = config.get("opponent_mode")
-                if mode:
-                    log.info("Loaded opponent mode from config.json: %s", mode)
-                    return str(mode)
+            config = self._load_config()
+            mode = config.get("opponent_mode")
+            if mode:
+                log.info("Loaded opponent mode from config.json: %s", mode)
+                return str(mode)
             
             # Fallback to .env
             mode = os.getenv("OPPONENT_MODE")
@@ -321,18 +436,14 @@ class TeamManager:
             team_name: Team name to set as active
         """
         try:
-            config = {}
-            if self.config_file.exists():
-                with self.config_file.open("r", encoding="utf-8") as f:
-                    config = json.load(f)
+            config = self._load_config()
             
             if "active_teams" not in config:
                 config["active_teams"] = {}
             
             config["active_teams"][provider] = team_name
             
-            with self.config_file.open("w", encoding="utf-8") as f:
-                json.dump(config, f, indent=2, ensure_ascii=False)
+            self._save_config(config)
             
             log.info("Saved active team for %s: %s", provider, team_name)
         except Exception as e:
@@ -351,13 +462,10 @@ class TeamManager:
         """
         try:
             # Try config.json first (highest priority)
-            if self.config_file.exists():
-                with self.config_file.open("r", encoding="utf-8") as f:
-                    config = json.load(f)
-                
-                active_teams = config.get("active_teams", {})
+            config = self._load_config()
+            active_teams = config.get("active_teams", {})
+            if isinstance(active_teams, dict):
                 team_name = active_teams.get(provider)
-                
                 if team_name:
                     log.info("Loaded active team for %s from config.json: %s", provider, team_name)
                     return str(team_name)

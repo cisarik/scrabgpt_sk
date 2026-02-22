@@ -567,7 +567,7 @@ class SettingsDialog(QDialog):
             self.ai_tokens_edit.setText(str(self.openrouter_tokens))
             log.info("OpenRouter models configured: %d models", len(self.selected_openrouter_models))
             
-            # Refresh team info display in mode selector
+            # Refresh model info display in mode selector
             if hasattr(self, 'mode_selector') and self.mode_selector:
                 self.mode_selector.refresh_openrouter_team_info()
     
@@ -590,7 +590,7 @@ class SettingsDialog(QDialog):
             self.ai_tokens_edit.setText(str(self.novita_tokens))
             log.info("Novita models configured: %d models", len(self.selected_novita_models))
             
-            # Refresh team info display in mode selector
+            # Refresh model info display in mode selector
             if hasattr(self, 'mode_selector') and self.mode_selector:
                 self.mode_selector.refresh_novita_team_info()
     
@@ -1937,7 +1937,7 @@ Premium legend: {premium_legend}
         # Update environment variable for prompt
         os.environ["AI_PROMPT_FILE"] = self.current_prompt_file
         
-        # Reload teams and refresh UI in main window after saving settings
+        # Reload provider model selections and refresh UI in main window after saving settings
         if hasattr(self, 'parent') and self.parent():
             main_window = self.parent()
             if hasattr(main_window, '_load_saved_teams'):

@@ -87,8 +87,6 @@ from ..ai.openai_tools_client import OpenAIToolClient
 from ..ai.vertex import VertexClient
 from ..ai.vertex_genai_client import build_client as build_vertex_genai_client
 from ..ai.multi_model import propose_move_multi_model
-from ..ai.novita import NovitaClient
-from ..ai.novita_multi_model import propose_move_novita_multi_model
 from ..ai.mcp_tools import tool_validate_word_english, tool_validate_word_slovak
 from .agents_dialog import AgentsDialog, AsyncAgentWorker
 from .agent_status_widget import AgentStatusWidget
@@ -106,7 +104,7 @@ from ..core.variant_store import (
     set_active_variant_slug,
 )
 from ..core.opponent_mode import OpponentMode
-from ..core.team_config import get_team_manager, TeamConfig
+from ..core.team_config import get_team_manager
 from ..ai.variants import (
     LanguageInfo,
     fetch_supported_languages,
@@ -1625,6 +1623,10 @@ class MainWindow(QMainWindow):
         self._single_model_seen_attempt_words: set[str] = set()
         self._single_model_attempt_eval_count: int = 0
         self._single_model_attempt_eval_limit: int = 32
+        self._ai_waiting_worker: bool = False
+        self._ai_turn_timeout_seconds: int = 0
+        self._active_turn_models: list[dict[str, str]] = []
+        self._ai_ignore_worker_updates: bool = False
 
         # Repro mód nastavenia (iba runtime)
         # Pozn.: Nastavuje sa v dialógu Nastavenia a používa pri "Nová hra".
@@ -1647,7 +1649,7 @@ class MainWindow(QMainWindow):
         # OpenRouter klient (pre chat protokol)
         self.openrouter_client: Optional[OpenRouterClient] = None
         
-        # Team manager for persisting model configurations
+        # Persist provider model configurations
         self.team_manager = get_team_manager()
         
         # OpenRouter multi-model configuration
@@ -1661,7 +1663,7 @@ class MainWindow(QMainWindow):
         # Unified AI move timeout configuration
         self.ai_move_timeout_seconds: int = self._load_ai_move_timeout()
         
-        # Load saved teams on startup
+        # Load saved provider selections on startup
         self._load_saved_teams()
         self.ai_move_max_tokens, self._ai_tokens_from_env = self._load_ai_move_max_tokens()
         self._user_defined_ai_tokens: bool = False
@@ -2083,39 +2085,39 @@ class MainWindow(QMainWindow):
         return value
     
     def _load_saved_teams(self) -> None:
-        """Load saved team configurations from disk."""
-        # Load ACTIVE OpenRouter team (not default team!)
-        openrouter_team = self.team_manager.load_active_team_config("openrouter")
-        if openrouter_team is None:
-            # Create default OpenRouter team with Gemini 3 Pro if none exists
-            default_timeout = self._load_ai_move_timeout()
-            openrouter_team = TeamConfig(
-                name="Gemini3Pro",
-                provider="openrouter",
-                model_ids=["google/gemini-3-pro-preview"],
-                timeout_seconds=default_timeout,
+        """Load saved provider model selections from disk."""
+        runtime_timeout = max(5, int(self._load_ai_move_timeout()))
+        self.ai_move_timeout_seconds = runtime_timeout
+
+        openrouter_selection = self.team_manager.load_provider_selection("openrouter")
+        if openrouter_selection is None:
+            default_model_ids = ["google/gemini-3-pro-preview"]
+            self.team_manager.save_provider_selection(
+                "openrouter",
+                default_model_ids,
+                timeout_seconds=runtime_timeout,
             )
-            self.team_manager.save_team(openrouter_team)
-            self.team_manager.save_active_team("openrouter", openrouter_team.name)
-            log.info("Created default OpenRouter team with Gemini 3 Pro (timeout=%ss)", default_timeout)
-        if openrouter_team:
-            # Convert IDs to minimal model objects needed for runtime
-            self.selected_ai_models = [{"id": mid, "name": mid} for mid in openrouter_team.model_ids]
-            self.use_multi_model = len(openrouter_team.model_ids) > 1  # 1 model => stream single path
-            self.ai_move_timeout_seconds = openrouter_team.timeout_seconds
-            log.info("Loaded ACTIVE OpenRouter team '%s': %d models", openrouter_team.name, len(openrouter_team.model_ids))
-        
-        # Load ACTIVE Novita team (not default team!)
-        novita_team = self.team_manager.load_active_team_config("novita")
-        if novita_team:
-            # Convert IDs to minimal model objects needed for runtime
-            self.selected_novita_models = [{"id": mid, "name": mid} for mid in novita_team.model_ids]
-            self.use_novita = len(novita_team.model_ids) > 0
-            self.ai_move_timeout_seconds = max(
-                self.ai_move_timeout_seconds,
-                novita_team.timeout_seconds,
+            openrouter_model_ids = default_model_ids
+            log.info(
+                "Created default OpenRouter model selection with Gemini 3 Pro (timeout=%ss)",
+                runtime_timeout,
             )
-            log.info("Loaded ACTIVE Novita team '%s': %d models", novita_team.name, len(novita_team.model_ids))
+        else:
+            openrouter_model_ids, _openrouter_timeout = openrouter_selection
+
+        self.selected_ai_models = [{"id": mid, "name": mid} for mid in openrouter_model_ids]
+        self.use_multi_model = len(openrouter_model_ids) > 0
+        log.info("Loaded OpenRouter model selection: %d models", len(openrouter_model_ids))
+
+        novita_selection = self.team_manager.load_provider_selection("novita")
+        if novita_selection is None:
+            self.selected_novita_models = []
+            self.use_novita = False
+        else:
+            novita_model_ids, _novita_timeout = novita_selection
+            self.selected_novita_models = [{"id": mid, "name": mid} for mid in novita_model_ids]
+            self.use_novita = len(novita_model_ids) > 0
+            log.info("Loaded Novita model selection: %d models", len(novita_model_ids))
         
         # Load saved opponent mode
         saved_mode = self.team_manager.load_opponent_mode()
@@ -2130,6 +2132,7 @@ class MainWindow(QMainWindow):
         if self.selected_ai_models and self.opponent_mode == OpponentMode.GEMINI:
             self.opponent_mode = OpponentMode.GEMINI
             log.info("Switched opponent mode to Google")
+        self._sync_timeout_combo_to_value()
         self._refresh_model_results_table()
         self._update_mode_status_label()
 
@@ -2322,9 +2325,10 @@ class MainWindow(QMainWindow):
         if labels:
             return labels
 
-        team = self.team_manager.load_active_team_config("openrouter")
-        if team is not None:
-            for model_id in team.model_ids:
+        selection = self.team_manager.load_provider_selection("openrouter")
+        if selection is not None:
+            model_ids, _timeout_seconds = selection
+            for model_id in model_ids:
                 self._append_status_model_label(labels, model_id)
         return labels
 
@@ -2338,14 +2342,15 @@ class MainWindow(QMainWindow):
         if labels:
             return labels
 
-        team = self.team_manager.load_active_team_config("novita")
-        if team is not None:
-            for model_id in team.model_ids:
+        selection = self.team_manager.load_provider_selection("novita")
+        if selection is not None:
+            model_ids, _timeout_seconds = selection
+            for model_id in model_ids:
                 self._append_status_model_label(labels, model_id)
         return labels
 
     def _update_mode_status_label(self) -> None:
-        """Update mode status label to show current opponent mode and active model/team."""
+        """Update mode status label to show current opponent mode."""
         mode = self.opponent_mode
         text = mode.display_name_sk if isinstance(mode, OpponentMode) else "Offline AI"
         
@@ -2432,6 +2437,23 @@ class MainWindow(QMainWindow):
                 return f"{minutes} minúty"
             return f"{minutes} minút"
         return f"{seconds} sekúnd"
+
+    def _sync_timeout_combo_to_value(self) -> None:
+        combo = getattr(self, "timeout_combo", None)
+        if not isinstance(combo, QComboBox):
+            return
+        seconds = max(5, int(self.ai_move_timeout_seconds))
+        index = combo.findData(seconds)
+        if index < 0:
+            combo.addItem(self._format_timeout_choice(seconds), seconds)
+            index = combo.findData(seconds)
+        if index < 0:
+            return
+        if combo.currentIndex() == index:
+            return
+        combo.blockSignals(True)
+        combo.setCurrentIndex(index)
+        combo.blockSignals(False)
 
     def _update_env_value(self, key: str, value: str) -> None:
         os.environ[key] = value
@@ -2524,7 +2546,7 @@ class MainWindow(QMainWindow):
         self._exit_exchange_mode()
         reset_reasoning_context()
         
-        # Reload teams before starting new game (in case settings changed)
+        # Reload provider selections before starting new game (in case settings changed)
         self._load_saved_teams()
         
         # Mark game as in progress
@@ -2711,6 +2733,13 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
             setattr(self, worker_attr, None)
+        self._ai_waiting_worker = False
+        self._ai_turn_timeout_seconds = 0
+        self._active_turn_models = []
+        self._ai_ignore_worker_updates = False
+        if hasattr(self, "_ai_countdown_timer"):
+            self._ai_countdown_timer.stop()
+        self._ai_deadline = 0.0
 
     def _reset_to_idle_state(self) -> None:
         """Vráti aplikáciu do východzieho stavu pred spustením hry."""
@@ -2718,6 +2747,13 @@ class MainWindow(QMainWindow):
         self._clear_spinner_state()
         self._exit_exchange_mode()
         self._ai_thinking = False
+        self._ai_waiting_worker = False
+        self._ai_turn_timeout_seconds = 0
+        self._active_turn_models = []
+        self._ai_ignore_worker_updates = False
+        self._ai_deadline = 0.0
+        if hasattr(self, "_ai_countdown_timer"):
+            self._ai_countdown_timer.stop()
         self._ai_opening_active = False
         self._starter_side = None
         self._starter_decided = False
@@ -3731,13 +3767,16 @@ class MainWindow(QMainWindow):
         """Fallback for AI failures: exchange tiles instead of passing."""
         self._stop_status_spinner("judge")
         self._stop_status_spinner("ai")
-        self._ai_thinking = False
 
         if not self._ai_local_fallback_used:
             tracked = self._best_tracked_move()
             if tracked is not None:
                 tracked_score, tracked_move = tracked
                 self._ai_local_fallback_used = True
+                self._register_manual_candidate_attempt(
+                    tracked_move,
+                    note="tracked-timeout-selection",
+                )
                 try:
                     self.chat_dialog.add_agent_activity(
                         f"AI použila najlepší vypočítaný fallback ťah ({tracked_score} b).",
@@ -3745,11 +3784,15 @@ class MainWindow(QMainWindow):
                     )
                 except Exception:
                     pass
-                self._on_ai_proposal(tracked_move)
+                self._on_ai_proposal(tracked_move, _force=True)
                 return
             fallback_move = self._try_local_low_score_move()
             if fallback_move is not None:
                 self._ai_local_fallback_used = True
+                self._register_manual_candidate_attempt(
+                    fallback_move,
+                    note="local-low-score-fallback",
+                )
                 try:
                     self.chat_dialog.add_agent_activity(
                         "AI skúša núdzový lokálny nízkobodový ťah namiesto výmeny.",
@@ -3757,7 +3800,7 @@ class MainWindow(QMainWindow):
                     )
                 except Exception:
                     pass
-                self._on_ai_proposal(fallback_move)
+                self._on_ai_proposal(fallback_move, _force=True)
                 return
 
         requested = self._normalize_exchange_letters(requested_exchange)
@@ -3776,6 +3819,7 @@ class MainWindow(QMainWindow):
 
         if not selected:
             # No tiles to exchange - fall back to pass as last resort.
+            self._ai_thinking = False
             self._enable_human_inputs()
             self.status.showMessage("AI pasuje (výmena nie je možná)")
             self._register_scoreless_turn("AI")
@@ -3784,6 +3828,7 @@ class MainWindow(QMainWindow):
             self._check_endgame()
             return
 
+        self._ai_thinking = False
         before = "".join(self.ai_rack)
         drawn = self.bag.exchange(selected)
         remaining = self.ai_rack.copy()
@@ -4097,6 +4142,9 @@ class MainWindow(QMainWindow):
             log.debug("Skip AI turn start during shutdown")
             return
         self._ai_thinking = True
+        self._ai_waiting_worker = False
+        self._ai_turn_timeout_seconds = 0
+        self._ai_ignore_worker_updates = False
         self._reset_model_attempt_tracking()
         self._reset_single_model_attempt_stream()
         self._disable_human_inputs()
@@ -4168,12 +4216,43 @@ class MainWindow(QMainWindow):
                 try:
                     TRACE_ID_VAR.set(self.trace_id)
                     if self.use_multi_model and self.selected_models:
-                        if self.provider_type == "openai_tools":
-                            openai_tool_client = OpenAIToolClient(
-                                timeout_seconds=self.timeout_seconds
+                        if self.provider_type in {"openai_tools", "openrouter", "novita"}:
+                            api_key: str | None = None
+                            base_url: str | None = None
+                            default_headers: dict[str, str] | None = None
+                            enforce_tool_workflow = True
+
+                            if self.provider_type == "openrouter":
+                                api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+                                base_url = "https://openrouter.ai/api/v1"
+                                default_headers = {
+                                    "HTTP-Referer": "https://github.com/cisarik/scrabgpt_sk",
+                                    "X-Title": "ScrabGPT SK",
+                                }
+                            elif self.provider_type == "novita":
+                                api_key = os.getenv("NOVITA_API_KEY", "").strip()
+                                base_url = "https://api.novita.ai/openai"
+                            else:
+                                enforce_tool_workflow = (
+                                    os.getenv("OPENAI_ENFORCE_TOOL_WORKFLOW", "true")
+                                    .strip()
+                                    .lower()
+                                    in {"1", "true", "yes", "on"}
+                                )
+
+                            if self.provider_type in {"openrouter", "novita"} and not api_key:
+                                raise RuntimeError(
+                                    f"{self.provider_type.upper()}_API_KEY nie je nastavený"
+                                )
+
+                            tool_client = OpenAIToolClient(
+                                api_key=api_key or None,
+                                base_url=base_url,
+                                timeout_seconds=self.timeout_seconds,
+                                default_headers=default_headers,
                             )
 
-                            async def run_openai_multi() -> tuple[dict[str, Any], list[dict[str, Any]]]:
+                            async def run_tool_multi() -> tuple[dict[str, Any], list[dict[str, Any]]]:
                                 def on_partial(res: dict[str, Any]) -> None:
                                     try:
                                         self.partial_result.emit(res)
@@ -4181,15 +4260,11 @@ class MainWindow(QMainWindow):
                                         # Worker/object can be deleted during shutdown.
                                         pass
 
-                                enforce_tool_workflow = (
-                                    os.getenv("OPENAI_ENFORCE_TOOL_WORKFLOW", "true").strip().lower()
-                                    in {"1", "true", "yes", "on"}
-                                )
                                 try:
                                     from ..ai.tool_adapter import get_openai_tools
 
                                     move, results = await propose_move_multi_model(
-                                        openai_tool_client,  # type: ignore[arg-type]
+                                        tool_client,  # type: ignore[arg-type]
                                         self.selected_models,
                                         self.state_str,
                                         self.variant,
@@ -4202,42 +4277,50 @@ class MainWindow(QMainWindow):
                                         enforce_tool_workflow=enforce_tool_workflow,
                                     )
                                 finally:
-                                    await openai_tool_client.close()
+                                    await tool_client.close()
                                 return move, results
 
-                            resp, results = asyncio.run(run_openai_multi())
+                            resp, results = asyncio.run(run_tool_multi())
                             self.multi_model_results.emit(results)
-                            self.finished.emit(resp)
-                            return
-
-                        if self.provider_type == "novita":
-                            api_key = os.getenv("NOVITA_API_KEY", "")
-                            novita_client = NovitaClient(api_key, timeout_seconds=self.timeout_seconds)
-
-                            async def run_novita_multi() -> tuple[dict[str, Any], list[dict[str, Any]]]:
-                                def on_partial(res: dict[str, Any]) -> None:
-                                    try:
-                                        self.partial_result.emit(res)
-                                    except RuntimeError:
-                                        # Worker/object can be deleted during shutdown.
-                                        pass
-                                try:
-                                    move, results = await propose_move_novita_multi_model(
-                                        novita_client,
-                                        self.selected_models,
-                                        self.state_str,
-                                        self.variant,
-                                        self.board,
-                                        self.client,
-                                        progress_callback=on_partial,
-                                        timeout_seconds=self.timeout_seconds,
+                            if self.provider_type != "openrouter":
+                                self.finished.emit(resp)
+                                return
+                            # OpenRouter only: keep Google direct fallback for Gemini models.
+                            # This fallback is used when OpenRouter endpoint is unavailable.
+                            # The default path above already runs full agentic tool workflow.
+                            try:
+                                all_failed = all(r.get("status") != "ok" for r in results)
+                                has_gemini = any(
+                                    str(m.get("id", "")).startswith("google/gemini-3")
+                                    for m in (self.selected_models or [])
+                                )
+                                google_key = os.getenv("GOOGLE_API_KEY", "")
+                                if all_failed and has_gemini and google_key:
+                                    if self.debug_log:
+                                        try:
+                                            self.debug_log.emit(
+                                                "[Fallback] OpenRouter Gemini zlyhal, skúšam Google Gemini API."
+                                            )
+                                        except Exception:
+                                            pass
+                                    from ..ai.gemini_client import GeminiClient
+                                    gem_client = GeminiClient(
+                                        api_key=google_key, timeout_seconds=self.timeout_seconds
                                     )
-                                finally:
-                                    await novita_client.close()
-                                return move, results
-
-                            resp, results = asyncio.run(run_novita_multi())
-                            self.multi_model_results.emit(results)
+                                    final_text, usage = gem_client.generate_with_tools(
+                                        messages=[{"role": "user", "content": self.state_str}],
+                                        stream_callback=self.stream_update.emit,
+                                        reasoning_callback=self.stream_reasoning.emit,
+                                        debug_callback=self.debug_log.emit,
+                                    )
+                                    from ..ai.schema import parse_ai_move, to_move_payload
+                                    move_model, _pm = parse_ai_move(final_text)
+                                    move = to_move_payload(move_model)
+                                    move["_usage"] = usage
+                                    self.finished.emit(move)
+                                    return
+                            except Exception as g_exc:  # noqa: BLE001
+                                log.debug("Gemini API fallback failed: %s", g_exc)
                             self.finished.emit(resp)
                             return
 
@@ -4295,72 +4378,6 @@ class MainWindow(QMainWindow):
                             self.multi_model_results.emit(results)
                             self.finished.emit(resp)
                             return
-
-                        api_key = os.getenv("OPENROUTER_API_KEY", "")
-                        openrouter_client = OpenRouterClient(
-                            api_key,
-                            timeout_seconds=self.timeout_seconds,
-                        )
-
-                        async def run_multi() -> tuple[dict[str, Any], list[dict[str, Any]]]:
-                            def on_partial(res: dict[str, Any]) -> None:
-                                try:
-                                    self.partial_result.emit(res)
-                                except RuntimeError:
-                                    # Worker/object can be deleted during shutdown.
-                                    pass
-                            try:
-                                move, results = await propose_move_multi_model(
-                                    openrouter_client,
-                                    self.selected_models,
-                                    self.state_str,
-                                    self.variant,
-                                    self.board,
-                                    self.client,
-                                    progress_callback=on_partial,
-                                    timeout_seconds=self.timeout_seconds,
-                                )
-                            finally:
-                                await openrouter_client.close()
-                            return move, results
-
-                        resp, results = asyncio.run(run_multi())
-                        self.multi_model_results.emit(results)
-                        try:
-                            all_failed = all(r.get("status") != "ok" for r in results)
-                            has_gemini = any(
-                                str(m.get("id", "")).startswith("google/gemini-3")
-                                for m in (self.selected_models or [])
-                            )
-                            google_key = os.getenv("GOOGLE_API_KEY", "")
-                            if all_failed and has_gemini and google_key:
-                                if self.debug_log:
-                                    try:
-                                        self.debug_log.emit(
-                                            "[Fallback] OpenRouter Gemini zlyhal, skúšam Google Gemini API."
-                                        )
-                                    except Exception:
-                                        pass
-                                from ..ai.gemini_client import GeminiClient
-                                gem_client = GeminiClient(
-                                    api_key=google_key, timeout_seconds=self.timeout_seconds
-                                )
-                                final_text, usage = gem_client.generate_with_tools(
-                                    messages=[{"role": "user", "content": self.state_str}],
-                                    stream_callback=self.stream_update.emit,
-                                    reasoning_callback=self.stream_reasoning.emit,
-                                    debug_callback=self.debug_log.emit,
-                                )
-                                from ..ai.schema import parse_ai_move, to_move_payload
-                                move_model, _pm = parse_ai_move(final_text)
-                                move = to_move_payload(move_model)
-                                move["_usage"] = usage
-                                self.finished.emit(move)
-                                return
-                        except Exception as g_exc:  # noqa: BLE001
-                            log.debug("Gemini API fallback failed: %s", g_exc)
-                        self.finished.emit(resp)
-                        return
 
                     resp = ai_propose_move(
                         client=self.client,
@@ -4439,6 +4456,16 @@ class MainWindow(QMainWindow):
                 f"🧠 {provider_label} model chain: {model_chain}",
                 section="planning",
             )
+        timeout_seconds = max(5, int(timeout_seconds))
+        self._ai_turn_timeout_seconds = timeout_seconds
+        self._ai_waiting_worker = True
+        self._active_turn_models = []
+        for model in selected_models:
+            model_id = str(model.get("id") or "").strip()
+            if not model_id:
+                continue
+            model_name = str(model.get("name") or model_id).strip() or model_id
+            self._active_turn_models.append({"id": model_id, "name": model_name})
         # Start countdown for this AI turn
         self._ai_deadline = time.monotonic() + timeout_seconds
         self._ai_countdown_timer.start()
@@ -4482,6 +4509,15 @@ class MainWindow(QMainWindow):
                     for row in preview_rows
                     if row.get("model")
                 ]
+                if placeholder_models:
+                    self._active_turn_models = [
+                        {
+                            "id": str(row.get("id") or ""),
+                            "name": str(row.get("name") or row.get("id") or ""),
+                        }
+                        for row in placeholder_models
+                        if row.get("id")
+                    ]
                 if placeholder_models:
                     self.model_results_table.initialize_models(placeholder_models)
                 else:
@@ -4528,6 +4564,9 @@ class MainWindow(QMainWindow):
     
     def _on_multi_model_partial(self, result: dict[str, Any]) -> None:
         """Handle incremental model result updates."""
+        if not self._ai_waiting_worker and not self._ai_thinking:
+            log.debug("Ignoring stale partial model update outside active AI turn")
+            return
         model_id = result.get("model", "?")
         model_name = result.get("model_name", model_id)
         status = result.get("status", "pending")
@@ -4642,6 +4681,9 @@ class MainWindow(QMainWindow):
 
     def _on_multi_model_results(self, results: list[dict[str, Any]]) -> None:
         """Handle multi-model competition results and display in table."""
+        if not self._ai_waiting_worker and not self._ai_thinking:
+            log.debug("Ignoring stale multi-model results outside active AI turn")
+            return
         log.info("Received multi-model results: %d models", len(results))
 
         merged_results = [self._merge_attempt_summary_into_result(r) for r in results]
@@ -4910,6 +4952,126 @@ class MainWindow(QMainWindow):
             }
             self._model_attempt_tracking[model_id] = state
         return state
+
+    def _lookup_active_model_name(self, model_id: str) -> str:
+        target = str(model_id or "").strip()
+        if not target:
+            return "AI"
+        for model in self._active_turn_models:
+            active_id = str(model.get("id") or "").strip()
+            if active_id == target:
+                name = str(model.get("name") or target).strip()
+                return name or target
+        for result in getattr(self.model_results_table, "results", []):
+            if not isinstance(result, dict):
+                continue
+            result_id = str(result.get("model") or result.get("id") or "").strip()
+            if result_id != target:
+                continue
+            name = str(result.get("model_name") or target).strip()
+            return name or target
+        return target
+
+    def _resolve_attempt_target_model(self) -> tuple[str | None, str]:
+        current_id = str(getattr(self, "_current_ai_model_id", "") or "").strip()
+        if current_id:
+            current_name = str(getattr(self, "_current_ai_model", "") or "").strip()
+            if not current_name:
+                current_name = self._lookup_active_model_name(current_id)
+            return current_id, current_name or current_id
+
+        for tracked_model_id in self._model_attempt_tracking.keys():
+            tracked_id = str(tracked_model_id or "").strip()
+            if tracked_id:
+                return tracked_id, self._lookup_active_model_name(tracked_id)
+
+        for model in self._active_turn_models:
+            model_id = str(model.get("id") or "").strip()
+            if model_id:
+                return model_id, self._lookup_active_model_name(model_id)
+
+        for result in getattr(self.model_results_table, "results", []):
+            if not isinstance(result, dict):
+                continue
+            model_id = str(result.get("model") or result.get("id") or "").strip()
+            if not model_id:
+                continue
+            return model_id, self._lookup_active_model_name(model_id)
+        return None, "AI"
+
+    def _register_manual_candidate_attempt(
+        self,
+        move: dict[str, Any],
+        *,
+        note: str,
+    ) -> None:
+        model_id, model_name = self._resolve_attempt_target_model()
+        if not model_id:
+            return
+
+        score = self._score_move_payload(move)
+        if score is None or score < 0:
+            return
+
+        word = self._normalize_attempt_word(move.get("word"))
+        words = [word] if word else []
+        placements_obj = move.get("placements")
+        signature = self._placements_signature(placements_obj)
+
+        state = self._attempt_state_for_model(model_id)
+        validated_words = cast(set[str], state["validated_words"])
+        invalid_words = cast(set[str], state["invalid_words"])
+        validation_order = cast(list[str], state["validation_order"])
+        validated_word_scores = cast(dict[str, int], state["validated_word_scores"])
+        validated_word_moves = cast(dict[str, dict[str, Any]], state["validated_word_moves"])
+        scored_candidates = cast(dict[str, dict[str, Any]], state["scored_candidates"])
+
+        next_order = int(state.get("next_order", 0))
+        state["next_order"] = next_order + 1
+
+        for tracked_word in words:
+            if tracked_word not in validation_order:
+                validation_order.append(tracked_word)
+            validated_words.add(tracked_word)
+            invalid_words.discard(tracked_word)
+            current_best = self._coerce_int(validated_word_scores.get(tracked_word))
+            if current_best is None or score > current_best:
+                validated_word_scores[tracked_word] = int(score)
+                validated_word_moves[tracked_word] = {
+                    "score": int(score),
+                    "move": dict(move),
+                    "order": validation_order.index(tracked_word),
+                }
+
+        if signature:
+            current_candidate = scored_candidates.get(signature)
+            if current_candidate is None or score > int(current_candidate.get("score", -1)):
+                scored_candidates[signature] = {
+                    "signature": signature,
+                    "words": words,
+                    "score": int(score),
+                    "tool_score": int(score),
+                    "score_source": "manual_fallback",
+                    "local_legal": self._infer_local_move_legality(placements_obj),
+                    "order": next_order,
+                    "move": dict(move),
+                    "note": note,
+                }
+
+        if not self._current_ai_model_id:
+            self._current_ai_model_id = model_id
+            self._current_ai_model = model_name
+
+        update_payload = {
+            "model": model_id,
+            "model_name": model_name,
+            "status": "retry",
+            "score": int(score),
+            "words": words,
+        }
+        self.model_results_table.update_result(
+            self._merge_attempt_summary_into_result(update_payload)
+        )
 
     @staticmethod
     def _placements_from_tool_args(placements_obj: Any) -> list[Placement]:
@@ -5621,10 +5783,16 @@ class MainWindow(QMainWindow):
                 return "AI použila blank bez 'blanks' mapovania."
         return None
 
-    def _on_ai_proposal(self, proposal: dict[str, Any]) -> None:
+    def _on_ai_proposal(self, proposal: dict[str, Any], _force: bool = False) -> None:
         if getattr(self, "_shutting_down", False):
             log.debug("Ignoring AI proposal during shutdown")
             return
+        if not _force and not self._ai_waiting_worker:
+            log.debug("Ignoring late AI proposal after timeout/finalization")
+            return
+        if not _force:
+            self._ai_waiting_worker = False
+        self._ai_deadline = 0.0
         self._ai_countdown_timer.stop()
         try:
             self.chat_dialog.update_countdown(0)
@@ -5899,6 +6067,11 @@ class MainWindow(QMainWindow):
         if getattr(self, "_shutting_down", False):
             log.debug("Ignoring AI failure during shutdown: %s", e)
             return
+        if not self._ai_waiting_worker:
+            log.debug("Ignoring late AI failure after timeout/finalization: %s", e)
+            return
+        self._ai_waiting_worker = False
+        self._ai_deadline = 0.0
         self._ai_countdown_timer.stop()
         try:
             self.chat_dialog.update_countdown(0)
@@ -5986,6 +6159,12 @@ class MainWindow(QMainWindow):
         apply_premium_consumption(self.board, ps2)
 
         model_row_id = getattr(self, "_current_ai_model_id", None)
+        if not model_row_id:
+            resolved_id, resolved_name = self._resolve_attempt_target_model()
+            if resolved_id:
+                self._current_ai_model_id = resolved_id
+                self._current_ai_model = resolved_name
+                model_row_id = resolved_id
         if model_row_id:
             judged_words = [word for word, _coords in words_coords]
             update_payload = {
@@ -6491,6 +6670,9 @@ class MainWindow(QMainWindow):
     def _on_ai_countdown_tick(self) -> None:
         """Update countdown label for AI timeout."""
         if self._ai_deadline <= 0:
+            if self._ai_waiting_worker and self._ai_thinking:
+                self._on_ai_timeout_expired()
+                return
             self._ai_countdown_timer.stop()
             try:
                 self.chat_dialog.update_countdown(0)
@@ -6499,15 +6681,53 @@ class MainWindow(QMainWindow):
             return
         rem = int(self._ai_deadline - time.monotonic())
         if rem <= 0:
-            rem = 0
-            self._ai_countdown_timer.stop()
+            self._on_ai_timeout_expired()
+            return
         try:
             self.chat_dialog.update_countdown(rem)
         except Exception:
             log.debug("Countdown update skipped")
 
+    def _on_ai_timeout_expired(self) -> None:
+        self._ai_deadline = 0.0
+        self._ai_countdown_timer.stop()
+        try:
+            self.chat_dialog.update_countdown(0)
+        except Exception:
+            pass
+        if not self._ai_waiting_worker:
+            return
+        if not self._ai_thinking:
+            return
+
+        self._ai_waiting_worker = False
+        timeout_seconds = max(
+            5,
+            int(self._ai_turn_timeout_seconds or self.ai_move_timeout_seconds),
+        )
+        log.warning(
+            "AI turn hard-timeout reached at %ss, forcing best tracked candidate",
+            timeout_seconds,
+        )
+        try:
+            if self.chat_dialog:
+                self.chat_dialog.add_agent_activity(
+                    f"⏱ Timeout ({timeout_seconds}s) vypršal, vyberám najlepší pokus.",
+                    section="final",
+                )
+        except Exception:
+            pass
+
+        self._apply_ai_exchange_turn(
+            reason=f"hard-timeout:{timeout_seconds}",
+            requested_exchange=None,
+            status_message="Timeout vypršal, AI finalizuje najlepší pokus",
+        )
+
     def _on_ai_stream_update(self, delta: str) -> None:
         """Streamujúce tokeny z AI -> chat."""
+        if not self._ai_waiting_worker:
+            return
         try:
             self.chat_dialog.update_streaming_ai_message(delta)
         except Exception:
@@ -6519,6 +6739,8 @@ class MainWindow(QMainWindow):
 
     def _on_ai_stream_reasoning(self, delta: str) -> None:
         """Stream reasoning tokens into reasoning bubble."""
+        if not self._ai_waiting_worker:
+            return
         try:
             self.chat_dialog.update_reasoning_stream(delta)
         except Exception:
@@ -6530,6 +6752,8 @@ class MainWindow(QMainWindow):
 
     def _on_ai_debug_log(self, message: str) -> None:
         """Zobraz debug/profiling správy z AI klienta v chate."""
+        if not self._ai_waiting_worker:
+            return
         try:
             if not self.chat_dialog:
                 return
@@ -6629,9 +6853,9 @@ class MainWindow(QMainWindow):
             
             if openrouter_models or novita_models:
                 # Models were configured - reload everything from disk
-                # This ensures we get the correct team with proper IDs
+                # This ensures we get the persisted provider model selection.
                 self._load_saved_teams()
-                log.info("Reloaded teams after configuration")
+                log.info("Reloaded provider model selections after configuration")
             
             # Update token settings if changed
             if openrouter_models:

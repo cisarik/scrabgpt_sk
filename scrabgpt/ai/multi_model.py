@@ -383,17 +383,20 @@ async def propose_move_multi_model(
                 name for name in executed_tools_list
             }
             missing_workflow_tools: list[str] = []
-            if enforce_tool_workflow and tools and not tools_unsupported:
-                for required in ("get_board_state", "get_premium_squares"):
-                    if required not in executed_tools:
-                        missing_workflow_tools.append(required)
-                if not missing_workflow_tools:
-                    board_idx = executed_tools_list.index("get_board_state")
-                    premium_idx = executed_tools_list.index("get_premium_squares")
-                    if premium_idx < board_idx:
-                        missing_workflow_tools.append(
-                            "tool_order(get_board_state -> get_premium_squares)"
-                        )
+            if enforce_tool_workflow and tools:
+                if tools_unsupported:
+                    missing_workflow_tools.append("tool_calls_not_supported")
+                else:
+                    for required in ("get_board_state", "get_premium_squares"):
+                        if required not in executed_tools:
+                            missing_workflow_tools.append(required)
+                    if not missing_workflow_tools:
+                        board_idx = executed_tools_list.index("get_board_state")
+                        premium_idx = executed_tools_list.index("get_premium_squares")
+                        if premium_idx < board_idx:
+                            missing_workflow_tools.append(
+                                "tool_order(get_board_state -> get_premium_squares)"
+                            )
             if isinstance(call_status, str) and call_status != "ok" and not raw_content.strip():
                 error_msg = str(result.get("error") or "Model call failed")
                 log.warning(

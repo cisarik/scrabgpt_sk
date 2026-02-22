@@ -29,6 +29,7 @@ class OpenAIToolClient:
         *,
         base_url: str | None = None,
         timeout_seconds: int | None = None,
+        default_headers: dict[str, str] | None = None,
     ) -> None:
         resolved_api_key = api_key or os.getenv("OPENAI_API_KEY", "")
         resolved_base_url = base_url or os.getenv("OPENAI_BASE_URL") or os.getenv("LLMSTUDIO_BASE_URL")
@@ -44,6 +45,12 @@ class OpenAIToolClient:
         if resolved_base_url:
             client_kwargs["base_url"] = resolved_base_url.rstrip("/")
             log.info("OpenAI tool client base_url override: %s", client_kwargs["base_url"])
+        if default_headers:
+            client_kwargs["default_headers"] = dict(default_headers)
+            log.info(
+                "OpenAI tool client custom headers enabled: %s",
+                ", ".join(sorted(default_headers.keys())),
+            )
 
         self.client = OpenAI(
             api_key=resolved_api_key if resolved_api_key else None,
