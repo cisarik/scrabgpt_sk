@@ -1,41 +1,13 @@
 # AI Prompts
 
-This directory contains AI prompt templates used by ScrabGPT for move generation.
+This directory contains prompt artifacts used for ScrabGPT move generation.
 
 ## Usage
 
-1. **Edit prompts** via the UI: Click `📝 Upraviť prompt` in the toolbar
-2. **Set active prompt** in `.env`: `AI_PROMPT_FILE='prompts/your_prompt.txt'`
-3. **Create custom prompts**: Save new `.txt` files in this directory
+1. Prompt engineering for gameplay is now unified and hardcoded in `scrabgpt/ai/player.py`.
+2. `chat_protocol.txt` is kept as reference material for tool-oriented prompting.
+3. Runtime no longer loads `AI_PROMPT_FILE` from `.env`.
 
-## Template Placeholders
+## Note
 
-Your prompt can use these placeholders (they will be automatically replaced):
-
-- `{language}` - Game language (e.g., "Slovak", "English")
-- `{tile_summary}` - Letter point values (e.g., "A:1, B:2, C:3...")
-- `{compact_state}` - Current board state with premium squares
-- `{premium_legend}` - Premium square legend (e.g., "*=TW, ~=DW, $=TL, ^=DL")
-
-## Example
-
-```
-You are an expert Scrabble player for {language}.
-Available tiles: {tile_summary}
-
-Current board:
-{compact_state}
-
-Premium legend: {premium_legend}
-```
-
-## Tips
-
-- **Be specific**: Clearly state rules and constraints
-- **Use examples**: Show valid vs. invalid moves
-- **JSON format**: Always instruct AI to return pure JSON
-- **Test iteratively**: Adjust prompt based on AI behavior
-
-## Default Prompt
-
-The `default.txt` file contains the original prompt. You can always revert to it using the "🔄 Vrátiť na pôvodný" button in the editor.
+`default.txt` was removed to avoid divergent behavior between providers and modes.

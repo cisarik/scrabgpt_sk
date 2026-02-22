@@ -348,6 +348,89 @@ class TestScoringTools:
         # C=3*2=6, A=1, total=7
         assert result["total_score"] == 7
 
+    def test_scoring_score_words_tolerates_short_premium_grid(self) -> None:
+        """Given: Premium grid shorter than 15x15
+        When: Tool scores words
+        Then: It does not crash with IndexError
+        """
+        from scrabgpt.ai.mcp_tools import tool_scoring_score_words
+
+        grid = ["." * 15 for _ in range(15)]
+        short_premium_grid = [[None]]
+        placements = [
+            {"row": 7, "col": 7, "letter": "A"},
+        ]
+        words = [{"word": "A", "cells": [[7, 7]]}]
+
+        result = tool_scoring_score_words(
+            board_grid=grid,
+            premium_grid=short_premium_grid,
+            placements=placements,
+            words=words,
+        )
+
+        assert "error" not in result
+        assert isinstance(result["total_score"], int)
+
+    def test_scoring_score_words_ignores_invalid_premium_type(self) -> None:
+        """Given: Premium cell with invalid type=None
+        When: Tool scores words
+        Then: It ignores invalid premium entry and does not crash
+        """
+        from scrabgpt.ai.mcp_tools import tool_scoring_score_words
+
+        grid = ["." * 15 for _ in range(15)]
+        premium_grid = []
+        for r in range(15):
+            row = []
+            for c in range(15):
+                if r == 7 and c == 7:
+                    row.append({"type": None, "used": False})
+                else:
+                    row.append(None)
+            premium_grid.append(row)
+
+        placements = [
+            {"row": 7, "col": 7, "letter": "A"},
+        ]
+        words = [{"word": "A", "cells": [[7, 7]]}]
+
+        result = tool_scoring_score_words(
+            board_grid=grid,
+            premium_grid=premium_grid,
+            placements=placements,
+            words=words,
+        )
+
+        assert "error" not in result
+        assert isinstance(result["total_score"], int)
+
+    def test_scoring_score_words_accepts_flat_premium_squares(self) -> None:
+        """Given: Premiums passed as flat list {row,col,type,used}
+        When: Tool scores words
+        Then: Premiums are applied without crashing
+        """
+        from scrabgpt.ai.mcp_tools import tool_scoring_score_words
+
+        grid = ["." * 15 for _ in range(15)]
+        premium_squares = [{"row": 7, "col": 7, "type": "DL", "used": False}]
+        placements = [
+            {"row": 7, "col": 7, "letter": "C"},
+            {"row": 7, "col": 8, "letter": "A"},
+        ]
+        words = [{"word": "CA", "cells": [[7, 7], [7, 8]]}]
+
+        result = tool_scoring_score_words(
+            board_grid=grid,
+            premium_grid=premium_squares,
+            placements=placements,
+            words=words,
+        )
+
+        assert "error" not in result
+        # C on DL => 6, A => 1
+        assert result["total_score"] == 7
+
 
 class TestStateTools:
     """Test state/information tools that will be exposed via MCP."""

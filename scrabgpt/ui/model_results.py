@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, cast
 
 from PySide6.QtCore import Qt, QTimer, QEvent, Signal, QObject, QSize
 from PySide6.QtGui import QColor, QTextDocument, QBrush
@@ -42,10 +42,11 @@ class _AttemptsRichTextDelegate(QStyledItemDelegate):
 
         opt = QStyleOptionViewItem(option)
         self.initStyleOption(opt, index)
-        opt.text = ""
+        opt_any = cast(Any, opt)
+        opt_any.text = ""
 
-        style = opt.widget.style() if opt.widget else QApplication.style()
-        style.drawControl(QStyle.ControlElement.CE_ItemViewItem, opt, painter, opt.widget)
+        style = opt_any.widget.style() if opt_any.widget else QApplication.style()
+        style.drawControl(QStyle.ControlElement.CE_ItemViewItem, opt, painter, opt_any.widget)
 
         foreground = index.data(Qt.ItemDataRole.ForegroundRole)
         color_name = "#ffffff"
@@ -53,13 +54,13 @@ class _AttemptsRichTextDelegate(QStyledItemDelegate):
             color_name = foreground.color().name()
 
         doc = QTextDocument()
-        doc.setDefaultFont(opt.font)
+        doc.setDefaultFont(opt_any.font)
         doc.setHtml(f'<span style="color:{color_name};">{html_value}</span>')
 
         text_rect = style.subElementRect(
             QStyle.SubElement.SE_ItemViewItemText,
             opt,
-            opt.widget,
+            opt_any.widget,
         )
         doc.setTextWidth(float(text_rect.width()))
 
@@ -77,8 +78,9 @@ class _AttemptsRichTextDelegate(QStyledItemDelegate):
 
         opt = QStyleOptionViewItem(option)
         self.initStyleOption(opt, index)
+        opt_any = cast(Any, opt)
         doc = QTextDocument()
-        doc.setDefaultFont(opt.font)
+        doc.setDefaultFont(opt_any.font)
         doc.setHtml(html_value)
         return QSize(int(doc.idealWidth()) + 8, max(24, int(doc.size().height()) + 6))
 
@@ -89,6 +91,7 @@ class AIModelResultsTable(QWidget):
     Visible columns:
     - Model
     - Pokusy (legal attempts sorted by score)
+    - Štatistika (počet pokusov + rýchlosť)
     """
 
     agent_row_clicked = Signal(str, str)  # model_id, model_name
@@ -109,8 +112,8 @@ class AIModelResultsTable(QWidget):
         layout.setSpacing(0)
 
         self.table = QTableWidget()
-        self.table.setColumnCount(2)
-        self.table.setHorizontalHeaderLabels(["Model", "Pokusy"])
+        self.table.setColumnCount(3)
+        self.table.setHorizontalHeaderLabels(["Model", "Pokusy", "Štatistika"])
 
         self.table.setStyleSheet(
             """
@@ -141,6 +144,7 @@ class AIModelResultsTable(QWidget):
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         self.table.setItemDelegateForColumn(1, _AttemptsRichTextDelegate(self.table))
 
         self.table.verticalHeader().setVisible(False)
@@ -241,6 +245,13 @@ class AIModelResultsTable(QWidget):
         except (TypeError, ValueError):
             return None
 
+    @staticmethod
+    def _coerce_float(value: Any) -> float | None:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
     def _sort_score(self, entry: dict[str, Any]) -> int:
         best_attempt = self._coerce_int(entry.get("best_attempt_score"))
         if best_attempt is not None:
@@ -272,6 +283,7 @@ class AIModelResultsTable(QWidget):
             return (0, -score_value, status_priority, str(r.get("model_name", "")))
 
         sorted_results = sorted(records, key=sort_key)
+        medal_by_model = self._build_medal_map(sorted_results)
 
         self.results = sorted_results
         self.table.setRowCount(len(sorted_results))
@@ -279,7 +291,13 @@ class AIModelResultsTable(QWidget):
 
         for idx, result in enumerate(sorted_results):
             is_winner = idx == 0 and bool(result.get("judge_valid", False))
-            self._populate_row(idx, result, is_winner=is_winner)
+            model_key = str(result.get("model") or result.get("id") or "").strip()
+            self._populate_row(
+                idx,
+                result,
+                is_winner=is_winner,
+                medal=medal_by_model.get(model_key),
+            )
 
         self.table.resizeRowsToContents()
 
@@ -323,7 +341,39 @@ class AIModelResultsTable(QWidget):
             return f"⚠️ {error}"
         return "—"
 
-    def _populate_row(self, row: int, result: dict[str, Any], is_winner: bool) -> None:
+    def _stats_text(self, result: dict[str, Any], status: str) -> str:
+        attempts_count = self._coerce_int(result.get("attempts_count"))
+        best_score = self._coerce_int(result.get("best_attempt_score"))
+        if best_score is None:
+            score = self._coerce_int(result.get("score"))
+            if score is not None and score >= 0:
+                best_score = score
+
+        first_attempt_seconds = self._coerce_float(result.get("first_attempt_seconds"))
+        best_attempt_seconds = self._coerce_float(result.get("best_attempt_seconds"))
+
+        parts: list[str] = []
+        if attempts_count is not None and attempts_count > 0:
+            parts.append(f"pokusy {attempts_count}")
+        if best_score is not None and best_score >= 0:
+            parts.append(f"max {best_score} b")
+        if first_attempt_seconds is not None:
+            parts.append(f"1. {first_attempt_seconds:.1f}s")
+        if best_attempt_seconds is not None:
+            parts.append(f"top {best_attempt_seconds:.1f}s")
+
+        if parts:
+            return " | ".join(parts)
+        return "—"
+
+    def _populate_row(
+        self,
+        row: int,
+        result: dict[str, Any],
+        *,
+        is_winner: bool,
+        medal: str | None = None,
+    ) -> None:
         model_name = str(result.get("model_name", result.get("model", "Unknown")))
         status = str(result.get("status", "error") or "error").lower()
         pending_statuses = {"pending", "tool_use", "tool_result", "retry"}
@@ -380,6 +430,39 @@ class AIModelResultsTable(QWidget):
             attempts_item.setFont(font)
         self.table.setItem(row, 1, attempts_item)
 
+        stats_text = self._stats_text(result, status)
+        if medal:
+            stats_text = f"{medal} {stats_text}" if stats_text != "—" else medal
+        stats_item = QTableWidgetItem(stats_text)
+        stats_item.setBackground(bg_color)
+        stats_item.setForeground(QColor(255, 255, 255))
+        stats_item.setToolTip("pokusy | max score | čas 1. pokusu | čas najlepšieho pokusu")
+        if font_bold:
+            font = stats_item.font()
+            font.setBold(True)
+            stats_item.setFont(font)
+        self.table.setItem(row, 2, stats_item)
+
+    def _build_medal_map(self, sorted_results: list[dict[str, Any]]) -> dict[str, str]:
+        medals = ["🥇", "🥈", "🥉"]
+        pending_statuses = {"pending", "tool_use", "tool_result", "retry", "ready"}
+        result: dict[str, str] = {}
+        medal_idx = 0
+        for entry in sorted_results:
+            if medal_idx >= len(medals):
+                break
+            status = str(entry.get("status") or "").lower()
+            if status in pending_statuses:
+                continue
+            if self._sort_score(entry) < 0:
+                continue
+            model_key = str(entry.get("model") or entry.get("id") or "").strip()
+            if not model_key or model_key in result:
+                continue
+            result[model_key] = medals[medal_idx]
+            medal_idx += 1
+        return result
+
     def _pending_frame(self) -> str:
         return _PENDING_FRAMES[self._pending_phase % len(_PENDING_FRAMES)]
 
@@ -417,7 +500,7 @@ class AIModelResultsTable(QWidget):
             model_id = str(result.get("model") or "")
             model_name = str(result.get("model_name") or model_id)
 
-            if model_id.startswith("agent:"):
+            if model_id.startswith("lmstudio:") or model_id.startswith("agent:"):
                 self.agent_row_clicked.emit(model_id, model_name)
                 return
 

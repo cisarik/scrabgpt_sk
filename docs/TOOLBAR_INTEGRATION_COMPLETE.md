@@ -97,7 +97,6 @@ def open_opponent_settings(self):
 ├─────────────────────────────────────────────────────────┤
 │ [Nová hra] [⚙️ Nastavenia] [💾 Uložiť] [📂 Otvoriť]   │
 │ [🧠 Test] [🤖 Nastaviť AI] [🏁 Nastaviť OpenRouter]   │  ← NEW!
-│ [📝 Upraviť prompt]                                     │
 └─────────────────────────────────────────────────────────┘
 ```
 

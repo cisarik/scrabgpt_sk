@@ -337,9 +337,6 @@ def _on_user_chat_message(self, message: str):
 # OpenRouter API key (povinné)
 OPENROUTER_API_KEY=sk-or-v1-...
 
-# Chat protocol template (voliteľné)
-AI_PROMPT_FILE_CHAT=prompts/chat_protocol.txt
-
 # Token limits (zdieľané OpenAI + OpenRouter)
 AI_MOVE_MAX_OUTPUT_TOKENS=3600
 AI_MOVE_TIMEOUT_SECONDS=30

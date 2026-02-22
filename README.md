@@ -176,7 +176,7 @@ worker.start()
 ### Settings Integration
 - **Auto-show agents**: `SHOW_AGENT_ACTIVITY_AUTO=true` in `.env`
 - Settings accessible from "⚙️ Nastavenia" toolbar button
-- 4 tabs: Všeobecné, AI Protivník, Nastavenia API, Upraviť prompt protihráča
+- 3 tabs: Všeobecné, AI Protivník, Nastavenia API
 - Green forest theme matching game aesthetic
 
 ## Variant bootstrap pipeline

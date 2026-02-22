@@ -191,6 +191,7 @@ class VertexClient:
         tool_config: Any | None = None,
         tool_context: dict[str, Any] | None = None,
         progress_callback: Callable[[dict[str, Any]], Any] | None = None,
+        request_timeout_seconds: int | None = None,
         _fallback_depth: int = 0,
     ) -> dict[str, Any]:
         """
@@ -216,7 +217,20 @@ class VertexClient:
         if model_id.startswith("google/"):
             model_id = model_id.replace("google/", "")
 
-        self._ensure_client_location_for_model(model_id)
+        # Use an isolated client per call to avoid cross-model shared-state issues
+        # during parallel Gemini evaluation.
+        call_client = self.client
+        call_location = self.location
+        try:
+            call_client, call_config = build_client(
+                project_id=self.project_id,
+                location=self.location,
+                model=model_id,
+                verbose=False,
+            )
+            call_location = call_config.location
+        except Exception:  # noqa: BLE001
+            log.debug("Using shared Vertex client fallback for model %s", model_id, exc_info=True)
             
         resolved_max_tokens = (
             max_tokens
@@ -250,6 +264,15 @@ class VertexClient:
             )
             
             start = time.perf_counter()
+            request_timeout_budget = max(
+                5,
+                int(
+                    request_timeout_seconds
+                    if request_timeout_seconds is not None
+                    else self.timeout_seconds
+                ),
+            )
+            request_deadline = time.monotonic() + request_timeout_budget
             
             try:
                 # Construct contents
@@ -304,6 +327,10 @@ class VertexClient:
                 tool_calls_executed: list[str] = []
                 
                 while True:
+                    if (request_deadline - time.monotonic()) <= 0:
+                        raise asyncio.TimeoutError(
+                            f"Timeout during Vertex tool workflow ({request_timeout_budget}s)"
+                        )
                     # Run blocking call via dedicated executor.
                     # Avoid asyncio default executor lifecycle issues in nested worker threads.
                     if self._executor_closed:
@@ -312,10 +339,18 @@ class VertexClient:
                     max_retry_attempts = 4
                     response: Any = None
                     for attempt in range(1, max_retry_attempts + 1):
+                        remaining_request = request_deadline - time.monotonic()
+                        if remaining_request <= 0:
+                            raise asyncio.TimeoutError(
+                                f"Timeout during Vertex tool workflow ({request_timeout_budget}s)"
+                            )
                         try:
-                            response = await loop.run_in_executor(
-                                self._executor,
-                                partial(self.client.models.generate_content, **request_kwargs),
+                            response = await asyncio.wait_for(
+                                loop.run_in_executor(
+                                    self._executor,
+                                    partial(call_client.models.generate_content, **request_kwargs),
+                                ),
+                                timeout=max(1.0, min(float(remaining_request), float(self.timeout_seconds))),
                             )
                             break
                         except Exception as retry_exc:
@@ -359,7 +394,12 @@ class VertexClient:
                                         "Progress callback failed for retry notification",
                                         exc_info=True,
                                     )
-                            await asyncio.sleep(backoff_seconds)
+                            sleep_budget = request_deadline - time.monotonic()
+                            if sleep_budget <= 0:
+                                raise asyncio.TimeoutError(
+                                    f"Timeout during Vertex tool workflow ({request_timeout_budget}s)"
+                                ) from retry_exc
+                            await asyncio.sleep(min(backoff_seconds, max(0.1, sleep_budget)))
                     if response is None:
                         raise RuntimeError("Vertex response missing after retries")
                     
@@ -493,6 +533,26 @@ class VertexClient:
                     "timeout_seconds": self.timeout_seconds,
                 }
                 
+            except asyncio.TimeoutError as e:
+                elapsed = time.perf_counter() - start
+                log.warning(
+                    "[%s] Vertex model %s timed out (elapsed=%.2fs): %s",
+                    trace_id,
+                    model_id,
+                    elapsed,
+                    e,
+                )
+                return {
+                    "model": model_id,
+                    "content": "",
+                    "error": str(e) or "Timeout during Vertex tool workflow",
+                    "status": "timeout",
+                    "tool_calls_executed": [],
+                    "trace_id": trace_id,
+                    "call_id": call_id,
+                    "elapsed": elapsed,
+                    "timeout_seconds": self.timeout_seconds,
+                }
             except Exception as e:
                 fallback_model = None
                 if self.allow_model_fallback and _fallback_depth < 2:
@@ -533,7 +593,7 @@ class VertexClient:
                 hint = vertex_error_hint(
                     str(e),
                     model_id=model_id,
-                    location=self.location,
+                    location=call_location,
                 )
                 if hint:
                     log.error("[%s] Vertex troubleshooting hint: %s", trace_id, hint)

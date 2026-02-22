@@ -40,9 +40,10 @@ _RETRY_JSON_CONTRACT = (
 _NON_SCORING_RETRY_FEEDBACK = (
     "You returned exchange/pass too early. "
     "Try to play ANY legal scoring word, even low points. "
+    "Prioritize moves that use the most rack letters (prefer 7-letter bingo when legal). "
     "Use dictionary validation tools (validate_word_slovak/validate_word_english) if uncertain. "
     "If rack contains '?', evaluate wildcard-based moves as well. "
-    "Only return exchange when you truly cannot form any legal word."
+    "Only return exchange or pass when no legal scoring move exists."
 )
 
 _TOOL_WORKFLOW_INSTRUCTION = (
@@ -54,8 +55,10 @@ _TOOL_WORKFLOW_INSTRUCTION = (
     "5) Validate candidate words with validate_word_slovak/validate_word_english.\n"
     "6) If rack contains '?', you MUST evaluate candidates that consume '?'.\n"
     "7) Evaluate at least 5 candidates when possible.\n"
-    "8) Return ONLY the highest-scoring legal move from evaluated candidates.\n"
-    "9) If '?' is consumed, include blanks mapping for wildcard placements.\n"
+    "8) Prioritize candidates that consume more rack letters; prefer legal 7-tile bingo when available.\n"
+    "9) Return ONLY the highest-scoring legal move from evaluated candidates.\n"
+    "10) If '?' is consumed, include blanks mapping for wildcard placements.\n"
+    "11) If no legal scoring move exists, choose exchange letters; pass only as last resort.\n"
     "Do not finalize output before completing steps 1 and 2."
 )
 
@@ -172,8 +175,9 @@ async def propose_move_multi_model(
             "\n\nIMPORTANT: You have access to tools. "
             "Use dictionary/rules tools to verify candidate moves quickly. "
             "If any legal word exists, you MUST play it (even low score). "
+            "Prefer moves that consume more rack letters (bingo if possible). "
             "Exchange is allowed only when no legal word can be formed. "
-            "Pass is last resort only."
+            "Pass is last resort only after exhausting legal/exchange options."
         )
         if enforce_tool_workflow:
             prompt += _TOOL_WORKFLOW_INSTRUCTION
@@ -189,7 +193,8 @@ async def propose_move_multi_model(
         ),
     }
 
-    if "?" in tool_context.get("rack_letters", []):
+    rack_letters_ctx = tool_context.get("rack_letters")
+    if isinstance(rack_letters_ctx, list) and "?" in rack_letters_ctx:
         prompt += (
             "\n\nBLANK TILE MANDATE:\n"
             "- Rack contains '?'. Treat it as wildcard joker.\n"
@@ -203,6 +208,8 @@ async def propose_move_multi_model(
         active_model_id = model_id
         active_model_name = str(model_info.get("name", model_id))
         fallback_origin: str | None = None
+        client_module = str(getattr(client.__class__, "__module__", "")).lower()
+        is_vertex_client = "vertex" in client_module
         # Use provided timeout or default, but ensure we have a deadline
         deadline = asyncio.get_event_loop().time() + (timeout_seconds or 60)
         max_attempts = 6 if enforce_tool_workflow and tools else 3
@@ -234,6 +241,17 @@ async def propose_move_multi_model(
                 log.exception("Progress callback failed for model %s", model_id)
             return payload
 
+        await _notify(
+            {
+                "status": "pending",
+                "model": active_model_id,
+                "model_name": active_model_name,
+                "score": -1,
+                "words": [],
+                "message": "Model štartuje samostatný agentický workflow.",
+            }
+        )
+
         while attempt_count < max_attempts:
             remaining_time = deadline - asyncio.get_event_loop().time()
             if remaining_time <= 0:
@@ -255,7 +273,25 @@ async def propose_move_multi_model(
             if "progress_callback" in sig.parameters:
                 kwargs["progress_callback"] = _notify
             if "request_timeout_seconds" in sig.parameters:
-                kwargs["request_timeout_seconds"] = max(5, int(remaining_time))
+                if is_vertex_client:
+                    vertex_round_env = os.getenv("VERTEX_MODEL_ROUND_TIMEOUT_SECONDS")
+                    try:
+                        vertex_round_timeout = int(vertex_round_env) if vertex_round_env else 0
+                    except ValueError:
+                        vertex_round_timeout = 0
+                    if vertex_round_timeout <= 0:
+                        base_turn_timeout = max(5, int(timeout_seconds or 60))
+                        target_rounds = 4 if (enforce_tool_workflow and tools) else 2
+                        vertex_round_timeout = max(
+                            8,
+                            min(30, int(base_turn_timeout / max(1, target_rounds))),
+                        )
+                    kwargs["request_timeout_seconds"] = max(
+                        5,
+                        min(int(remaining_time), vertex_round_timeout),
+                    )
+                else:
+                    kwargs["request_timeout_seconds"] = max(5, int(remaining_time))
             if "round_timeout_seconds" in sig.parameters:
                 round_timeout_env = os.getenv("OPENAI_TOOL_ROUND_TIMEOUT_SECONDS")
                 try:
@@ -295,6 +331,11 @@ async def propose_move_multi_model(
             try:
                 # Always pass the prompt (system instruction).
                 # Clients must handle whether to use it as system msg or prepend to messages.
+                call_timeout = float(remaining_time)
+                if is_vertex_client:
+                    vertex_timeout_hint = kwargs.get("request_timeout_seconds")
+                    if isinstance(vertex_timeout_hint, (int, float)):
+                        call_timeout = max(5.0, min(float(remaining_time), float(vertex_timeout_hint)))
                 result = await asyncio.wait_for(
                     client.call_model(
                         active_model_id,
@@ -302,9 +343,34 @@ async def propose_move_multi_model(
                         max_tokens=model_info.get("max_tokens") or client.ai_move_max_output_tokens, 
                         **kwargs
                     ), 
-                    timeout=remaining_time
+                    timeout=call_timeout
                 )
             except asyncio.TimeoutError:
+                remaining_after_timeout = deadline - asyncio.get_event_loop().time()
+                if (
+                    attempt_count < max_attempts
+                    and remaining_after_timeout > 8
+                ):
+                    feedback = (
+                        "Previous attempt timed out. Continue exploring more legal words, "
+                        "re-use tools, and return the best scored JSON move."
+                    )
+                    conversation_history.append({"role": "user", "content": feedback})
+                    await _notify(
+                        {
+                            "status": "retry",
+                            "model": active_model_id,
+                            "model_name": active_model_name,
+                            "error": (
+                                f"Timeout during generation | retrying {attempt_count}/{max_attempts}"
+                            ),
+                            "remaining": int(max(0, remaining_after_timeout)),
+                            "attempt": attempt_count,
+                            "max_attempts": max_attempts,
+                        }
+                    )
+                    continue
+
                 timeout_fallback = _timeout_fallback_model(active_model_id)
                 if (
                     allow_model_fallback
@@ -330,7 +396,7 @@ async def propose_move_multi_model(
                             "error": (
                                 f"Timeout on {previous}; retrying with {timeout_fallback}."
                             ),
-                            "remaining": int(max(0, remaining_time)),
+                            "remaining": int(max(0, remaining_after_timeout)),
                             "attempt": attempt_count,
                             "max_attempts": max_attempts,
                         }
@@ -398,6 +464,7 @@ async def propose_move_multi_model(
                                 "tool_order(get_board_state -> get_premium_squares)"
                             )
             if isinstance(call_status, str) and call_status != "ok" and not raw_content.strip():
+                remaining_time_post = deadline - asyncio.get_event_loop().time()
                 error_msg = str(result.get("error") or "Model call failed")
                 log.warning(
                     "Model %s returned %s before parsing: %s",
@@ -412,7 +479,7 @@ async def propose_move_multi_model(
                 if (
                     should_retry_timeout
                     and attempt_count < max_attempts
-                    and remaining_time > 10
+                    and remaining_time_post > 10
                 ):
                     feedback = (
                         "Previous attempt timed out. Continue exploring more legal words, "
@@ -427,7 +494,7 @@ async def propose_move_multi_model(
                             "error": (
                                 f"{error_msg} | retrying {attempt_count}/{max_attempts}"
                             ),
-                            "remaining": int(max(0, remaining_time)),
+                            "remaining": int(max(0, remaining_time_post)),
                             "attempt": attempt_count,
                             "max_attempts": max_attempts,
                         }

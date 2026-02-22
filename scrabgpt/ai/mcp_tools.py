@@ -376,7 +376,7 @@ def tool_rules_extract_all_words(
 
 def tool_scoring_score_words(
     board_grid: list[str],
-    premium_grid: list[list[dict[str, Any] | None]],
+    premium_grid: list[Any] | None,
     placements: list[dict[str, Any]],
     words: list[dict[str, Any]],
 ) -> dict[str, Any]:
@@ -392,6 +392,19 @@ def tool_scoring_score_words(
         {total_score: int, breakdowns: list[{word, base_points, ...}]}
     """
     try:
+        def _coerce_premium(prem_type_raw: Any) -> Premium | None:
+            if not isinstance(prem_type_raw, str):
+                return None
+            key = prem_type_raw.strip().upper()
+            return Premium.__members__.get(key)
+
+        def _coerce_bool(raw: Any) -> bool:
+            if isinstance(raw, bool):
+                return raw
+            if isinstance(raw, str):
+                return raw.strip().lower() in {"1", "true", "yes", "on"}
+            return bool(raw)
+
         board = Board(get_premiums_path())
         
         # Reconstruct board with letters
@@ -402,22 +415,60 @@ def tool_scoring_score_words(
         
         # Apply premiums if provided
         if premium_grid is not None:
-            if premium_grid:
-                # Non-empty: apply provided premiums
-                for r in range(BOARD_SIZE):
-                    for c in range(BOARD_SIZE):
-                        premium_cell = premium_grid[r][c]
-                        if premium_cell:
-                            prem_type = premium_cell["type"]
-                            prem_used = premium_cell["used"]
-                            board.cells[r][c].premium = Premium[prem_type]
-                            board.cells[r][c].premium_used = prem_used
-            else:
+            if isinstance(premium_grid, list) and premium_grid:
+                is_matrix = all(isinstance(row, list) for row in premium_grid)
+                is_flat = all(isinstance(item, dict) for item in premium_grid)
+
+                if is_matrix:
+                    # Matrix form: tolerate short rows/columns or partial grids.
+                    row_count = min(BOARD_SIZE, len(premium_grid))
+                    for r in range(row_count):
+                        row = premium_grid[r]
+                        if not isinstance(row, list):
+                            continue
+                        col_count = min(BOARD_SIZE, len(row))
+                        for c in range(col_count):
+                            premium_cell = row[c]
+                            if not isinstance(premium_cell, dict):
+                                continue
+                            prem_enum = _coerce_premium(premium_cell.get("type"))
+                            if prem_enum is None:
+                                continue
+                            board.cells[r][c].premium = prem_enum
+                            board.cells[r][c].premium_used = _coerce_bool(
+                                premium_cell.get("used", False)
+                            )
+                elif is_flat:
+                    # Flat form: list of {row, col, type, used}
+                    for item in premium_grid:
+                        if not isinstance(item, dict):
+                            continue
+                        row_raw = item.get("row")
+                        col_raw = item.get("col")
+                        try:
+                            r = int(row_raw)
+                            c = int(col_raw)
+                        except (TypeError, ValueError):
+                            continue
+                        if not (0 <= r < BOARD_SIZE and 0 <= c < BOARD_SIZE):
+                            continue
+                        prem_enum = _coerce_premium(item.get("type"))
+                        if prem_enum is None:
+                            continue
+                        board.cells[r][c].premium = prem_enum
+                        board.cells[r][c].premium_used = _coerce_bool(item.get("used", False))
+                else:
+                    log.debug(
+                        "Ignoring unsupported premium_grid structure in tool_scoring_score_words"
+                    )
+            elif isinstance(premium_grid, list) and not premium_grid:
                 # Empty list: mark all premiums as used (no premiums active)
                 for r in range(BOARD_SIZE):
                     for c in range(BOARD_SIZE):
                         if board.cells[r][c].premium:
                             board.cells[r][c].premium_used = True
+            else:
+                log.debug("Ignoring non-list premium_grid in tool_scoring_score_words")
         
         placement_objs = [
             Placement(row=p["row"], col=p["col"], letter=p["letter"])

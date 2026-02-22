@@ -59,10 +59,16 @@ def openrouter_api_key() -> str | None:
 def pytest_collection_modifyitems(config, items):
     """Auto-mark tests based on markers.
     
-    - Tests with @pytest.mark.openai or @pytest.mark.openrouter are also marked as @pytest.mark.internet
+    - Tests with @pytest.mark.openai / @pytest.mark.google / @pytest.mark.openrouter
+      are also marked as @pytest.mark.internet
     - Tests with @pytest.mark.network are also marked as @pytest.mark.internet
     """
     for item in items:
         # Auto-add internet marker to API tests
-        if "openai" in item.keywords or "openrouter" in item.keywords or "network" in item.keywords:
+        if (
+            "openai" in item.keywords
+            or "google" in item.keywords
+            or "openrouter" in item.keywords
+            or "network" in item.keywords
+        ):
             item.add_marker(pytest.mark.internet)

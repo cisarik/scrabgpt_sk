@@ -301,6 +301,7 @@ class OpenAIToolClient:
                                 "role": "user",
                                 "content": (
                                     "Continue searching for better scoring legal moves. "
+                                    "Prioritize moves that consume more rack letters. "
                                     "Use tools again and avoid repeating already invalid ideas."
                                 ),
                             }
@@ -579,6 +580,7 @@ class OpenAIToolClient:
                                     part
                                     for part in (
                                         "Do not finalize yet. Evaluate more candidate words with tools.",
+                                        "Prefer legal candidates that use more rack letters (bingo if available).",
                                         (
                                             f"Validate at least {min_word_validations} words."
                                             if min_word_validations > 0
@@ -589,7 +591,8 @@ class OpenAIToolClient:
                                             if min_scored_candidates > 0
                                             else ""
                                         ),
-                                        "When time is short, return only the best move as JSON.",
+                                        "When time is short, return the best legal move JSON; "
+                                        "exchange only if no legal scoring move exists.",
                                     )
                                     if part
                                 ),

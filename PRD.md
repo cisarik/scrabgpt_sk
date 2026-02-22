@@ -204,11 +204,10 @@ worker.progress_update.connect(on_progress)
 - Implementácia: `scrabgpt/ai/variant_agent.py`, testy v `tests/test_variant_agent.py`.
 
 #### Settings Dialog (Unified)
-4 taby v zelenej téme:
+3 taby v zelenej téme:
 1. **Všeobecné**: Variant, Jazyky (tlačidlo "Aktualizovať"), Repro mód, Auto-show agents checkbox
 2. **AI Protivník**: Opponent mode (budúcnosť)
 3. **Nastavenia API**: OpenAI/OpenRouter keys, max tokens
-4. **Upraviť prompt**: Embedded prompt editor
 
 **Clickable status bar**: Klik v settings otvára Agents dialog (aj keď settings modal).
 

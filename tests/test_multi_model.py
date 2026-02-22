@@ -52,7 +52,7 @@ def _make_variant() -> VariantDefinition:
 
 
 @pytest.mark.asyncio
-async def test_openrouter_multi_model_returns_pass_on_all_errors() -> None:
+async def test_openrouter_multi_model_returns_exchange_on_all_errors() -> None:
     client = _ErroringClient()
     judge = _StubJudge()
     models = [{"id": "m1", "name": "Model 1"}, {"id": "m2", "name": "Model 2"}]
@@ -65,19 +65,18 @@ async def test_openrouter_multi_model_returns_pass_on_all_errors() -> None:
         judge_client=judge,
     )
 
-    assert move.get("pass") is True
+    assert move.get("pass") is False
     assert move.get("placements") == []
     assert move.get("exchange") == []
     reason = str(move.get("reason", ""))
     assert reason
-    assert "Model 1" in reason
-    assert "Simulated failure" in reason
+    assert "fallback to exchange" in reason.lower()
     assert len(results) == len(models)
     assert all(r.get("status") != "ok" for r in results)
 
 
 @pytest.mark.asyncio
-async def test_novita_multi_model_returns_pass_on_all_errors() -> None:
+async def test_novita_multi_model_returns_exchange_on_all_errors() -> None:
     client = _ErroringClient()
     judge = _StubJudge()
     models = [{"id": "n1", "name": "Novita 1"}]
@@ -90,7 +89,7 @@ async def test_novita_multi_model_returns_pass_on_all_errors() -> None:
         judge_client=judge,
     )
 
-    assert move.get("pass") is True
+    assert move.get("pass") is False
     assert move.get("placements") == []
     assert move.get("exchange") == []
     reason = str(move.get("reason", ""))

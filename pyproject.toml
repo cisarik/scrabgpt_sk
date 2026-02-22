@@ -48,6 +48,7 @@ asyncio_mode = "auto"
 markers = [
     "network: tests that perform live network requests (httpx)",
     "openai: tests that call OpenAI API (requires OPENAI_API_KEY)",
+    "google: tests that call Google Vertex/Gemini API (requires Vertex auth setup)",
     "openrouter: tests that call OpenRouter API (requires OPENROUTER_API_KEY)",
     "internet: tests that require internet access (network or API calls)",
     "stress: stress tests / IQ tests for AI validation",

@@ -79,7 +79,7 @@ Now shows:
   - Better formatting for move details
   - Show judge validation inline
   
-- `prompts/default.txt`
+- `scrabgpt/ai/player.py` (unified hardcoded gameplay prompt)
   - Enhanced first-move rule with examples
   - 56 → 62 lines total
 

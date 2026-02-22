@@ -39,6 +39,12 @@ RACK AND SCORING:
 - Rack: {rack}
 - Tile points: {tile_summary}
 - Premium legend: {premium_legend}
+- Manage rack leave (balance vowels/consonants, keep flexible stems for next turn).
+- Use '?' (blank) adaptively, not by a fixed score threshold.
+- Do not spend '?' for low gain if a similarly strong move exists without '?'.
+- Spend '?' aggressively when it creates clear value: bingo, much higher score than alternatives,
+  critical board control, or when the only alternative is weak exchange/pass.
+- If multiple legal moves have similar score, prefer better board control and better next-turn rack.
 
 TOOLS:
 - If tools are available, you may call them.

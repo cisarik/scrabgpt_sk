@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 import json
 import os
-from pathlib import Path
 from typing import Any, Callable, cast
 
 from openai.types.chat import ChatCompletionMessageParam
@@ -335,84 +334,78 @@ def reset_reasoning_context() -> None:
     _CONTEXT_SESSION = None
 
 
-def _load_prompt_template(use_chat_protocol: bool = True) -> str:
-    """Load AI prompt template from file specified in .env or use default.
-    
-    Args:
-        use_chat_protocol: If True, load chat protocol template (delta updates, local tools).
-                          If False, load legacy zero-shot template.
-    """
-    if use_chat_protocol:
-        # Nový chat protokol s internými validačnými nástrojmi
-        prompt_file = os.getenv("AI_PROMPT_FILE_CHAT", "prompts/chat_protocol.txt")
-    else:
-        # Legacy zero-shot protokol
-        prompt_file = os.getenv("AI_PROMPT_FILE", "prompts/default.txt")
-    
-    try:
-        path = Path(prompt_file)
-        if path.exists():
-            return path.read_text(encoding="utf-8")
-        else:
-            log.warning("Prompt file not found: %s, using fallback", prompt_file)
-    except Exception as e:
-        log.exception("Failed to load prompt from %s: %s", prompt_file, e)
-    
-    # Fallback to embedded default if file loading fails
-    if use_chat_protocol:
-        # Embedded chat protocol fallback
-        return """Hráš Scrabble v jazyku {language}. Používaj interné validačné nástroje.
+_UNIFIED_MOVE_PROMPT_TEMPLATE = """You are an elite tournament Scrabble engine for {language}.
 
-=== PRAVIDLÁ ===
-- Prvý ťah musí pokrývať stred (7,7)
-- Políčka v jednom riadku/stĺpci bez medzier
-- Pripájaj sa k existujúcim písmenám
-- Všetky slová platné v {language}
+MISSION:
+- Play like a professional opponent: maximize game-winning expected value, not only raw turn score.
+- Return exactly one legal move in strict JSON.
 
-=== BODOVÉ HODNOTY ===
-{tile_summary}
+LEGALITY (NON-NEGOTIABLE):
+- Use only rack tiles for NEW placements.
+- Never overwrite existing board letters.
+- Place in one straight contiguous line without gaps.
+- First move must cross center (7,7).
+- Later moves must connect to existing board letters.
+- All created words (main + cross words) must be valid in {language}.
+- Respect diacritics exactly.
 
-=== PRÉMIÁ ===
-* = TW (×3 slovo)
-~ = DW (×2 slovo)
-$ = TL (×3 písmeno)
-^ = DL (×2 písmeno)
+STRATEGIC PRIORITIES:
+1) Generate multiple legal candidates before finalizing.
+2) Track both immediate score and rack leave quality.
+3) Prefer bingo when legal and not strategically losing.
+4) Use premium squares aggressively when risk is acceptable.
+5) Block dangerous openings when ahead; create volatility when behind.
+6) Value strong hooks, cross-checking, and board control.
+7) Rank candidates by estimated winning EV, not points alone.
 
-=== JOKER '?' (BLANK) ===
-- '?' je zástupný kameň a môže reprezentovať ľubovoľné písmeno.
-- Keď máš '?' na racku, POVINNE posúď aj ťahy, ktoré ho použijú.
-- Pri rovnakom skóre preferuj ťah, ktorý spotrebuje '?'.
-- Ak '?' použiješ, do `placements` daj výsledné písmeno a vyplň `blanks` mapovanie.
+GAME PHASE GUIDANCE:
+- Opening: prioritize balanced leave and board flexibility unless a clear premium/bingo edge exists.
+- Midgame: maximize EV = score + leave + board control; avoid opening premium lanes for free.
+- Endgame: strongly prefer guaranteed points and tile unload; exchange only when it improves finish odds.
 
-=== FORMÁT ODPOVEDE ===
-```json
-{{
-  "start": {{"row": 7, "col": 7}},
-  "direction": "ACROSS",
-  "placements": [{{"row": 7, "col": 7, "letter": "K"}}],
-  "word": "KOT",
-  "blanks": [{{"row": 7, "col": 7, "as": "K"}}]
-}}
-```
+BLANK ('?') POLICY:
+- Use blank adaptively, never by a fixed points threshold.
+- Avoid spending blank for low gain if similar value exists without blank.
+- Spend blank aggressively for clear value: bingo, major score jump, strong defense, or avoiding weak exchange/pass.
+- On near-equal score candidates, prefer the line with better leave and safer board.
 
-Ak nie je možný ťah: skús nájsť aspoň výmenu, ale NIKDY nepasuj. "pass": true je zakázané.
-"""
-    else:
-        # Embedded legacy fallback
-        return """You are an expert Scrabble player for the {language} language variant. Play to win and obey official Scrabble rules for that language. Do NOT overwrite existing board letters; place only on empty cells. Placements must form a single contiguous line with no gaps and must connect to existing letters after previous move. Use only letters from ai_rack; for '?' use chosen uppercase letter (respecting diacritics). If your rack contains '?', you MUST evaluate candidate moves that consume it and prefer consuming '?' on score ties. Points you can get for each tile: {tile_summary}. Always evaluate moves that use all 7 rack tiles for the 50 point bingo bonus; play it when legal. Prefer the move that maximizes total points, spending high-value rack letters on premium squares. Do not glue your letters to adjacent existing letters unless the resulting main word is a valid {language} word. Use intersections/hooks properly; you may share letters with the board only at overlapping cells; do not extend an existing word into a non-word. The field 'word' must equal the final main word formed on the board (existing board letters plus your placements). All cross-words should plausibly be valid {language} words. Diacritics is very important so distinguishing between 'Ú' and 'U' for example and every letter with diacritic. NEVER GIVE UP. Always find a valid move. DO NOT PASS. "pass": true is FORBIDDEN. If board is empty, the first move must cross the center star at H8 (row=7,col=7). Coordinates are 0-based. No explanations — JSON only. Always return a JSON object with keys: start:{{row:int,col:int}}, direction:'ACROSS'|'DOWN', placements:[{{row,col,letter}}], optional blanks:[{{row,col,as}}] when wildcard is used. Empty premium squares in the grid already show their multiplier symbol (see legend). Prioritize TL/DL for high-value letters and aim to span DW/TW with the main word when possible; stacking letter multipliers that feed into word multipliers yields maximal score. Also value high-scoring cross-words created by your placements.
+ANTI-BLUNDER RULES:
+- Never choose a move that is lower score and worse leave than another legal candidate.
+- Never open an obvious TW/DW hotspot for opponent without compensating gain.
+- If uncertain between close candidates, prefer the safer board-shape option.
 
-Given this compact state, propose exactly one move with placements in a single line using only valid {language} words.
+TOOLS WORKFLOW (IF TOOLS ARE AVAILABLE):
+- First inspect position with `get_board_state`.
+- Then inspect multipliers with `get_premium_squares`.
+- Then iterate candidates using:
+  - `validate_move_legality`
+  - `calculate_move_score`
+  - `validate_word_slovak` / `validate_word_english`
+- In early search, evaluate at least one safe legal scoring move quickly (time-discipline).
+- If rack contains '?', include blank-consuming candidates in the first search wave.
+- Keep a ranked shortlist of legal scored candidates and return the best one before timeout.
+- Before final answer, compare top candidates and choose the best EV move.
 
-Sanity rules:
-- Place tiles in exactly one line (ACROSS or DOWN); no gaps.
-- Do not extend existing words unless the resulting contiguous main word is valid in {language}.
-- Prefer hooks/intersections instead of blind prefix/suffix sticking.
-- 'word' must equal the final main word on the board.
+NO-SCORING FALLBACK:
+- Exchange/pass is forbidden while any legal scoring move exists.
+- Consider exchange only after multiple failed legality/word attempts with no legal scoring candidate.
+- If no legal scoring move exists, choose a strategic exchange.
+- Pass only as absolute last resort when exchange is impossible.
 
-State:
+RACK AND POSITION:
+- Rack: {rack}
+- Tile points: {tile_summary}
+- Premium legend: {premium_legend}
+
+CURRENT STATE:
 {compact_state}
+"""
 
-Premium legend: {premium_legend}"""
+
+def _load_prompt_template(use_chat_protocol: bool = True) -> str:
+    """Return unified hardcoded prompt template for every opponent mode/provider."""
+    _ = use_chat_protocol  # Backward-compatible signature; prompt is unified now.
+    return _UNIFIED_MOVE_PROMPT_TEMPLATE
 
 
 def _format_tile_summary(variant: VariantDefinition) -> str:
@@ -431,9 +424,11 @@ def _strict_output_contract(language: str) -> str:
         "- No <thinking>, no <thinking_process>, no XML/HTML tags.\n"
         "- First character must be '{' and last character must be '}'.\n"
         f"- All created words must be valid in {language}.\n"
-        "- Do NOT output pass=true.\n"
-        "- Required keys: start, direction, placements, word.\n"
-        "- Optional key: blanks (only if '?' wildcard is consumed).\n"
+        "- Required key in all cases: placements (use [] for exchange/pass fallback).\n"
+        "- For a scoring move, include: start, direction, placements, word.\n"
+        "- Optional keys: blanks (if '?' consumed), exchange, pass.\n"
+        "- Prefer scoring move; exchange only if no legal scoring move exists.\n"
+        "- Use pass=true only as absolute last resort when exchange is impossible.\n"
         "- If you use wildcard '?', output actual placed letter in placements and map it in blanks.\n"
         "- JSON shape:\n"
         "{\n"
@@ -443,15 +438,16 @@ def _strict_output_contract(language: str) -> str:
         '  "word": "..."\n'
         "}\n"
         "Optional when wildcard is used:\n"
-        '{"blanks":[{"row":7,"col":7,"as":"A"}]}'
+        '{"blanks":[{"row":7,"col":7,"as":"A"}]}\n'
+        "Fallback when no scoring move exists:\n"
+        '{"placements":[],"exchange":["A","E","I"],"pass":false}'
     )
 
 
 def _build_prompt(compact_state: str, variant: VariantDefinition) -> str:
-    """Zostaví prompt pre AI hráča načítaním šablóny zo súboru.
-    
-    Šablóna je načítaná zo súboru definovaného v AI_PROMPT_FILE (.env).
-    Podporuje placeholdery: {language}, {tile_summary}, {compact_state}, {premium_legend}
+    """Zostaví unifikovaný hardcoded prompt pre AI hráča.
+
+    Rovnaký prompt sa používa naprieč providermi a módmi.
     """
     def _overlay_premiums(state: str) -> tuple[str, str] | None:
         """Vráti stav s prémiami priamo v gride a legendu symbolov.
@@ -695,7 +691,9 @@ async def propose_move_chat(
         system_prompt = template.format(
             language=variant.language,
             tile_summary=tile_summary,
-            rack=", ".join(ai_rack),  # Fallback for templates that still use {rack}
+            rack=", ".join(ai_rack),
+            premium_legend="*=TW (word*3), ~=DW (word*2), $=TL (letter*3), ^=DL (letter*2)",
+            compact_state="(State is streamed incrementally in subsequent user messages.)",
         )
         session._base_prompt = system_prompt
         

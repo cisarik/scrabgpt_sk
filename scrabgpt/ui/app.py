@@ -157,6 +157,7 @@ AI_MOVE_TIMEOUT_CHOICES: list[tuple[int, str]] = [
 
 TILE_MIME = "application/x-scrabgpt-tile"
 _ATTEMPT_WORD_PATTERN = re.compile(r"[^\W\d_]{2,15}", flags=re.UNICODE)
+_HOURGLASS_FRAMES = ["⏳", "⌛"]
 
 # Typ alias pre strany pri určovaní štartéra
 StarterSide = Literal["HUMAN", "AI"]
@@ -1625,8 +1626,10 @@ class MainWindow(QMainWindow):
         self._single_model_attempt_eval_limit: int = 32
         self._ai_waiting_worker: bool = False
         self._ai_turn_timeout_seconds: int = 0
+        self._ai_turn_started_monotonic: float = 0.0
         self._active_turn_models: list[dict[str, str]] = []
         self._ai_ignore_worker_updates: bool = False
+        self._runtime_disabled_models: set[str] = set()
 
         # Repro mód nastavenia (iba runtime)
         # Pozn.: Nastavuje sa v dialógu Nastavenia a používa pri "Nová hra".
@@ -1908,6 +1911,10 @@ class MainWindow(QMainWindow):
         )
         timeout_layout.addWidget(self.lbl_mode_status)
 
+        self.lbl_mode_countdown = QLabel("")
+        self.lbl_mode_countdown.setObjectName("modeCountdownLabel")
+        timeout_layout.addWidget(self.lbl_mode_countdown)
+
         # Spacer to push timeout to the right
         timeout_layout.addStretch(1)
 
@@ -1960,6 +1967,7 @@ class MainWindow(QMainWindow):
 
         v.addWidget(self.timeout_frame)
         self._update_mode_status_label()
+        self._update_mode_timeout_indicator()
 
         # AI Model Results Table (below rack)
         self.model_results_table = AIModelResultsTable()
@@ -2104,6 +2112,9 @@ class MainWindow(QMainWindow):
             )
         else:
             openrouter_model_ids, _openrouter_timeout = openrouter_selection
+        if self._runtime_disabled_models:
+            disabled = self._runtime_disabled_models
+            openrouter_model_ids = [mid for mid in openrouter_model_ids if mid not in disabled]
 
         self.selected_ai_models = [{"id": mid, "name": mid} for mid in openrouter_model_ids]
         self.use_multi_model = len(openrouter_model_ids) > 0
@@ -2115,6 +2126,9 @@ class MainWindow(QMainWindow):
             self.use_novita = False
         else:
             novita_model_ids, _novita_timeout = novita_selection
+            if self._runtime_disabled_models:
+                disabled = self._runtime_disabled_models
+                novita_model_ids = [mid for mid in novita_model_ids if mid not in disabled]
             self.selected_novita_models = [{"id": mid, "name": mid} for mid in novita_model_ids]
             self.use_novita = len(novita_model_ids) > 0
             log.info("Loaded Novita model selection: %d models", len(novita_model_ids))
@@ -2123,7 +2137,7 @@ class MainWindow(QMainWindow):
         saved_mode = self.team_manager.load_opponent_mode()
         if saved_mode:
             try:
-                self.opponent_mode = OpponentMode(saved_mode)
+                self.opponent_mode = OpponentMode.from_string(saved_mode)
                 log.info("Loaded opponent mode from config: %s", self.opponent_mode.value)
             except ValueError:
                 log.warning("Invalid opponent mode in config: %s", saved_mode)
@@ -2161,23 +2175,21 @@ class MainWindow(QMainWindow):
         return "gpt-5.2"
 
     def _resolve_agent_display_name(self) -> str:
-        """Resolve the human-readable name of the selected agent."""
-        if self.selected_agent_name:
-            return self.selected_agent_name
+        """Resolve the LMStudio model label shown in UI."""
         env_base = os.getenv("OPENAI_BASE_URL") or os.getenv("LLMSTUDIO_BASE_URL")
-        lmstudio_model = (os.getenv("LLMSTUDIO_MODEL") or "").strip()
+        lmstudio_model = (
+            os.getenv("LLMSTUDIO_MODEL")
+            or os.getenv("OPENAI_MODEL")
+            or ""
+        ).strip()
         if env_base and lmstudio_model:
             return f"LMStudio – {lmstudio_model}"
         if env_base:
-            return "LMStudio agent"
+            return "LMStudio – lokálny endpoint"
         openai_models = self._parse_model_csv(os.getenv("OPENAI_MODELS", ""))
         if openai_models:
-            return f"OpenAI – {openai_models[0]}"
-        for agent in self.available_agents:
-            name = agent.get("name")
-            if isinstance(name, str) and name.strip():
-                return name
-        return "OpenAI Agent"
+            return f"LMStudio – {openai_models[0]}"
+        return "LMStudio"
 
     def _resolve_google_model_label(self) -> str:
         """Resolve human-readable label for selected Google/Gemini model."""
@@ -2221,10 +2233,38 @@ class MainWindow(QMainWindow):
         unique_chain: list[str] = []
         for model_id in chain:
             normalized = model_id.strip()
-            if not normalized or normalized in unique_chain:
+            if (
+                not normalized
+                or normalized in unique_chain
+                or normalized in self._runtime_disabled_models
+            ):
                 continue
             unique_chain.append(normalized)
         return [{"id": model_id, "name": model_id} for model_id in unique_chain]
+
+    def _build_lmstudio_model_candidates(self) -> list[dict[str, str]]:
+        """Return the model list for LMStudio mode (single local model)."""
+        chain = self._parse_model_csv(os.getenv("LLMSTUDIO_MODEL", ""))
+        if not chain:
+            chain = self._parse_model_csv(os.getenv("OPENAI_MODEL", ""))
+        if not chain:
+            chain = self._parse_model_csv(os.getenv("OPENAI_MODELS", ""))
+        if not chain and self.ai_client is not None:
+            try:
+                runtime_model = getattr(self.ai_client, "model", None)
+                if isinstance(runtime_model, str) and runtime_model.strip():
+                    chain = [runtime_model.strip()]
+            except Exception:
+                pass
+        if not chain:
+            chain = ["gpt-5.2"]
+
+        selected = chain[0].strip()
+        if not selected:
+            selected = "gpt-5.2"
+        if selected in self._runtime_disabled_models:
+            return []
+        return [{"id": selected, "name": selected}]
 
     @staticmethod
     def _google_model_display_name(model_id: str) -> str:
@@ -2249,7 +2289,11 @@ class MainWindow(QMainWindow):
         unique_chain: list[str] = []
         for model_id in chain:
             normalized = model_id.replace("google/", "").strip()
-            if not normalized or normalized in unique_chain:
+            if (
+                not normalized
+                or normalized in unique_chain
+                or normalized in self._runtime_disabled_models
+            ):
                 continue
             unique_chain.append(normalized)
 
@@ -2356,6 +2400,43 @@ class MainWindow(QMainWindow):
         
         if hasattr(self, 'lbl_mode_status') and self.lbl_mode_status is not None:
             self.lbl_mode_status.setText(text)
+        self._update_mode_timeout_indicator()
+
+    @staticmethod
+    def _format_countdown_mmss(seconds: int) -> str:
+        total = max(0, int(seconds))
+        minutes, secs = divmod(total, 60)
+        return f"{minutes}:{secs:02d}"
+
+    def _update_mode_timeout_indicator(self, remaining_seconds: int | None = None) -> None:
+        label = getattr(self, "lbl_mode_countdown", None)
+        if not isinstance(label, QLabel):
+            return
+
+        active = bool(
+            getattr(self, "_ai_thinking", False)
+            and getattr(self, "_ai_waiting_worker", False)
+            and float(getattr(self, "_ai_deadline", 0.0)) > 0.0
+        )
+        if active:
+            if remaining_seconds is None:
+                rem = max(0, int(float(getattr(self, "_ai_deadline", 0.0)) - time.monotonic()))
+            else:
+                rem = max(0, int(remaining_seconds))
+            frame = _HOURGLASS_FRAMES[rem % len(_HOURGLASS_FRAMES)]
+            label.setText(f"{frame} {self._format_countdown_mmss(rem)}")
+            label.setStyleSheet(
+                "QLabel#modeCountdownLabel { color: #f8c146; font-size: 14px; font-weight: 700; }"
+            )
+            label.setToolTip("Aktuálny odpočet AI ťahu")
+            return
+
+        limit_seconds = max(5, int(self.ai_move_timeout_seconds))
+        label.setText(f"⏱ {self._format_countdown_mmss(limit_seconds)}")
+        label.setStyleSheet(
+            "QLabel#modeCountdownLabel { color: #9fb3c8; font-size: 14px; font-weight: 600; }"
+        )
+        label.setToolTip("Nastavený timeout AI ťahu")
 
     def _build_model_preview_entries(self) -> list[dict[str, Any]]:
         """Build placeholder rows for the model results table."""
@@ -2407,11 +2488,16 @@ class MainWindow(QMainWindow):
                 model_id = model.get("id", f"gemini-{idx}")
                 label = model.get("name", self._google_model_display_name(model_id))
                 entries.append(_entry(f"google:{model_id}", str(label), idx))
-        elif mode == OpponentMode.AGENT:
-            agent_name = self._resolve_agent_display_name()
-            entries.append(
-                _entry(f"agent:{agent_name}", f"Agent – {agent_name}", 0)
-            )
+        elif mode == OpponentMode.LMSTUDIO:
+            lmstudio_candidates = self._build_lmstudio_model_candidates()
+            if lmstudio_candidates:
+                model = lmstudio_candidates[0]
+                model_id = str(model.get("id") or "lmstudio")
+                model_name = str(model.get("name") or model_id)
+                entries.append(_entry(f"lmstudio:{model_id}", f"LMStudio – {model_name}", 0))
+            else:
+                label = self._resolve_agent_display_name()
+                entries.append(_entry("lmstudio:unconfigured", label, 0))
 
         return entries
 
@@ -2680,6 +2766,7 @@ class MainWindow(QMainWindow):
             return
         self.ai_move_timeout_seconds = seconds
         self._update_env_value("AI_MOVE_TIMEOUT_SECONDS", str(seconds))
+        self._update_mode_timeout_indicator()
         display = self._format_timeout_choice(seconds)
         log.info("Timeout updated to %s (%ds)", display, seconds)
         if hasattr(self, "status") and isinstance(self.status, QStatusBar):
@@ -2735,11 +2822,13 @@ class MainWindow(QMainWindow):
             setattr(self, worker_attr, None)
         self._ai_waiting_worker = False
         self._ai_turn_timeout_seconds = 0
+        self._ai_turn_started_monotonic = 0.0
         self._active_turn_models = []
         self._ai_ignore_worker_updates = False
         if hasattr(self, "_ai_countdown_timer"):
             self._ai_countdown_timer.stop()
         self._ai_deadline = 0.0
+        self._update_mode_timeout_indicator()
 
     def _reset_to_idle_state(self) -> None:
         """Vráti aplikáciu do východzieho stavu pred spustením hry."""
@@ -2749,11 +2838,13 @@ class MainWindow(QMainWindow):
         self._ai_thinking = False
         self._ai_waiting_worker = False
         self._ai_turn_timeout_seconds = 0
+        self._ai_turn_started_monotonic = 0.0
         self._active_turn_models = []
         self._ai_ignore_worker_updates = False
         self._ai_deadline = 0.0
         if hasattr(self, "_ai_countdown_timer"):
             self._ai_countdown_timer.stop()
+        self._update_mode_timeout_indicator()
         self._ai_opening_active = False
         self._starter_side = None
         self._starter_decided = False
@@ -3820,6 +3911,7 @@ class MainWindow(QMainWindow):
         if not selected:
             # No tiles to exchange - fall back to pass as last resort.
             self._ai_thinking = False
+            self._update_mode_timeout_indicator()
             self._enable_human_inputs()
             self.status.showMessage("AI pasuje (výmena nie je možná)")
             self._register_scoreless_turn("AI")
@@ -3829,6 +3921,7 @@ class MainWindow(QMainWindow):
             return
 
         self._ai_thinking = False
+        self._update_mode_timeout_indicator()
         before = "".join(self.ai_rack)
         drawn = self.bag.exchange(selected)
         remaining = self.ai_rack.copy()
@@ -4216,7 +4309,7 @@ class MainWindow(QMainWindow):
                 try:
                     TRACE_ID_VAR.set(self.trace_id)
                     if self.use_multi_model and self.selected_models:
-                        if self.provider_type in {"openai_tools", "openrouter", "novita"}:
+                        if self.provider_type in {"openai_tools", "openrouter", "novita", "lmstudio"}:
                             api_key: str | None = None
                             base_url: str | None = None
                             default_headers: dict[str, str] | None = None
@@ -4232,6 +4325,13 @@ class MainWindow(QMainWindow):
                             elif self.provider_type == "novita":
                                 api_key = os.getenv("NOVITA_API_KEY", "").strip()
                                 base_url = "https://api.novita.ai/openai"
+                            elif self.provider_type == "lmstudio":
+                                base_url = (
+                                    os.getenv("OPENAI_BASE_URL")
+                                    or os.getenv("LLMSTUDIO_BASE_URL")
+                                    or "http://127.0.0.1:1234/v1"
+                                ).strip()
+                                enforce_tool_workflow = True
                             else:
                                 enforce_tool_workflow = (
                                     os.getenv("OPENAI_ENFORCE_TOOL_WORKFLOW", "true")
@@ -4433,6 +4533,16 @@ class MainWindow(QMainWindow):
                 len(selected_models),
                 [m.get("id") for m in selected_models],
             )
+        elif self.opponent_mode == OpponentMode.LMSTUDIO:
+            provider_type = "lmstudio"
+            selected_models = [dict(m) for m in self._build_lmstudio_model_candidates()]
+            timeout_seconds = self.ai_move_timeout_seconds
+            use_multi = bool(selected_models)
+            log.info(
+                "Using LMStudio agentic workflow with %d model(s): %s",
+                len(selected_models),
+                [m.get("id") for m in selected_models],
+            )
         else:
             log.info("Using single-model mode (opponent_mode=%s)", self.opponent_mode)
             # Priprav chat na streaming výstupu
@@ -4443,21 +4553,28 @@ class MainWindow(QMainWindow):
                 log.debug("Chat streaming start skipped")
 
         if self.chat_dialog and use_multi and selected_models:
-            model_chain = " -> ".join(str(m.get("name") or m.get("id") or "?") for m in selected_models)
+            model_agent_names = [
+                str(m.get("name") or m.get("id") or "?").strip() or "?"
+                for m in selected_models
+            ]
             if provider_type == "vertex":
                 provider_label = "Google"
             elif provider_type == "novita":
                 provider_label = "Novita"
+            elif provider_type == "lmstudio":
+                provider_label = "LMStudio"
             elif provider_type == "openai_tools":
                 provider_label = "OpenAI"
             else:
                 provider_label = "OpenRouter"
             self.chat_dialog.add_agent_activity(
-                f"🧠 {provider_label} model chain: {model_chain}",
+                f"🧠 {provider_label} paralelní agenti ({len(model_agent_names)}): "
+                + ", ".join(model_agent_names),
                 section="planning",
             )
         timeout_seconds = max(5, int(timeout_seconds))
         self._ai_turn_timeout_seconds = timeout_seconds
+        self._ai_turn_started_monotonic = time.monotonic()
         self._ai_waiting_worker = True
         self._active_turn_models = []
         for model in selected_models:
@@ -4467,7 +4584,8 @@ class MainWindow(QMainWindow):
             model_name = str(model.get("name") or model_id).strip() or model_id
             self._active_turn_models.append({"id": model_id, "name": model_name})
         # Start countdown for this AI turn
-        self._ai_deadline = time.monotonic() + timeout_seconds
+        self._ai_deadline = self._ai_turn_started_monotonic + timeout_seconds
+        self._update_mode_timeout_indicator(timeout_seconds)
         self._ai_countdown_timer.start()
         try:
             self.chat_dialog.update_countdown(int(timeout_seconds))
@@ -4551,6 +4669,8 @@ class MainWindow(QMainWindow):
                 provider_name = "Novita"
             elif provider_type == "vertex":
                 provider_name = "Google"
+            elif provider_type == "lmstudio":
+                provider_name = "LMStudio"
             elif provider_type == "openai_tools":
                 provider_name = "OpenAI"
             else:
@@ -4564,6 +4684,9 @@ class MainWindow(QMainWindow):
     
     def _on_multi_model_partial(self, result: dict[str, Any]) -> None:
         """Handle incremental model result updates."""
+        if self._ai_ignore_worker_updates:
+            log.debug("Ignoring worker partial update after forced timeout finalization")
+            return
         if not self._ai_waiting_worker and not self._ai_thinking:
             log.debug("Ignoring stale partial model update outside active AI turn")
             return
@@ -4571,11 +4694,27 @@ class MainWindow(QMainWindow):
         model_name = result.get("model_name", model_id)
         status = result.get("status", "pending")
         score = result.get("score")
+        model_key = str(model_id or "").strip()
+        if model_key and model_key in self._runtime_disabled_models:
+            return
 
         if status == "timer":
             remaining = result.get("remaining", 0)
             if self.chat_dialog:
                 self.chat_dialog.update_countdown(remaining)
+            return
+
+        if status == "pending":
+            if self.chat_dialog:
+                pending_msg = str(
+                    result.get("message") or "Model štartuje samostatný agentický workflow."
+                )
+                self.chat_dialog.add_agent_activity(
+                    f"🚀 {model_name}: {pending_msg}",
+                    section="planning",
+                )
+            self.model_results_table.update_result(self._merge_attempt_summary_into_result(result))
+            self.status.showMessage(f"{model_name}: štartujem paralelný agent...")
             return
 
         if self._should_drop_model_from_results_table(result):
@@ -4665,12 +4804,28 @@ class MainWindow(QMainWindow):
             return
 
         if status == "error":
+            error_text = str(result.get("error") or "")
+            was_disabled = self._disable_model_after_error(
+                str(model_id or ""),
+                str(model_name or model_id or ""),
+                error_text=error_text,
+            )
             if self.chat_dialog:
-                self.chat_dialog.add_agent_activity(
-                    f"❌ {model_name}: API chyba, pokračujem ďalšími modelmi.",
-                    section="final",
-                )
-            self.status.showMessage(f"{model_name}: API chyba – čakám na ostatné modely")
+                if was_disabled:
+                    self.chat_dialog.add_agent_activity(
+                        f"❌ {model_name}: nekompatibilná API chyba, model je vyradený.",
+                        section="final",
+                    )
+                else:
+                    self.chat_dialog.add_agent_activity(
+                        f"⚠️ {model_name}: API chyba v tomto pokuse, model ostáva v hre.",
+                        section="final",
+                    )
+            if was_disabled:
+                self.status.showMessage(f"{model_name}: model vyradený po API chybe")
+            else:
+                self.status.showMessage(f"{model_name}: API chyba – čakám na ostatné modely")
+            return
         elif status == "timeout":
             if self.chat_dialog:
                 self.chat_dialog.add_agent_activity(
@@ -4681,6 +4836,9 @@ class MainWindow(QMainWindow):
 
     def _on_multi_model_results(self, results: list[dict[str, Any]]) -> None:
         """Handle multi-model competition results and display in table."""
+        if self._ai_ignore_worker_updates:
+            log.debug("Ignoring worker final results after forced timeout finalization")
+            return
         if not self._ai_waiting_worker and not self._ai_thinking:
             log.debug("Ignoring stale multi-model results outside active AI turn")
             return
@@ -4690,6 +4848,8 @@ class MainWindow(QMainWindow):
         visible_results = [
             r for r in merged_results
             if not self._should_drop_model_from_results_table(r)
+            and str(r.get("model") or r.get("id") or "").strip()
+            not in self._runtime_disabled_models
         ]
         
         # Update table immediately with results
@@ -4754,11 +4914,74 @@ class MainWindow(QMainWindow):
         )
         return any(marker in lowered for marker in markers)
 
+    @staticmethod
+    def _is_unrecoverable_model_error(error_text: str) -> bool:
+        lowered = str(error_text or "").lower()
+        markers = (
+            "invalid_request_body",
+            "invalid request",
+            "bad request",
+            "400",
+            "not found",
+            "unknown model",
+            "unsupported",
+            "not supported",
+            "does not support",
+            "authentication",
+            "unauthorized",
+            "forbidden",
+            "permission denied",
+            "api key",
+            "max_tokens",
+            "max completion tokens",
+        )
+        return any(marker in lowered for marker in markers)
+
+    def _model_has_attempt_activity(self, model_id: str) -> bool:
+        target_id = str(model_id or "").strip()
+        if not target_id:
+            return False
+
+        state = self._model_attempt_tracking.get(target_id)
+        if isinstance(state, dict):
+            for key in (
+                "validated_words",
+                "validation_order",
+                "validated_word_scores",
+                "validated_word_moves",
+                "scored_candidates",
+            ):
+                value = state.get(key)
+                if isinstance(value, (dict, list, set)) and len(value) > 0:
+                    return True
+
+        for entry in list(getattr(self.model_results_table, "results", [])):
+            if not isinstance(entry, dict):
+                continue
+            entry_id = str(entry.get("model") or entry.get("id") or "").strip()
+            if entry_id != target_id:
+                continue
+            attempts_display = str(entry.get("attempts_display") or "").strip()
+            if attempts_display:
+                return True
+            words_obj = entry.get("words")
+            if isinstance(words_obj, list) and len(words_obj) > 0:
+                return True
+            best_attempt_score = MainWindow._coerce_int(entry.get("best_attempt_score"))
+            if best_attempt_score is not None and best_attempt_score >= 0:
+                return True
+        return False
+
     def _should_drop_model_from_results_table(self, result: dict[str, Any]) -> bool:
         status = str(result.get("status") or "").lower()
         if status not in {"error", "timeout"}:
             return False
-        return self._is_resource_exhausted_error(str(result.get("error") or ""))
+        if not self._is_resource_exhausted_error(str(result.get("error") or "")):
+            return False
+        model_id = str(result.get("model") or result.get("id") or "").strip()
+        if model_id and self._model_has_attempt_activity(model_id):
+            return False
+        return True
 
     def _reset_single_model_attempt_stream(self) -> None:
         self._single_model_reasoning_buffer = ""
@@ -4799,6 +5022,7 @@ class MainWindow(QMainWindow):
         validated_words = cast(set[str], state["validated_words"])
         validation_order = cast(list[str], state["validation_order"])
         validated_word_scores = cast(dict[str, int], state["validated_word_scores"])
+        validated_word_times = cast(dict[str, float], state["validated_word_times"])
         validated_word_moves = cast(dict[str, dict[str, Any]], state["validated_word_moves"])
         scored_candidates = cast(dict[str, dict[str, Any]], state["scored_candidates"])
 
@@ -4823,10 +5047,13 @@ class MainWindow(QMainWindow):
             score, move = self._find_best_local_move_for_word(word)
             if score < 0 or move is None:
                 continue
+            tracked_at = time.monotonic()
 
             if word not in validation_order:
                 validation_order.append(word)
             validated_words.add(word)
+            if word not in validated_word_times:
+                validated_word_times[word] = tracked_at
 
             prev_word_score = self._coerce_int(validated_word_scores.get(word))
             if prev_word_score is None or score > prev_word_score:
@@ -4839,6 +5066,7 @@ class MainWindow(QMainWindow):
                     "score": score,
                     "move": dict(move),
                     "order": validation_order.index(word),
+                    "tracked_at": tracked_at,
                 }
 
             signature = self._placements_signature(move.get("placements"))
@@ -4854,6 +5082,7 @@ class MainWindow(QMainWindow):
                         "score": score,
                         "local_legal": True,
                         "order": next_order,
+                        "tracked_at": tracked_at,
                         "move": dict(move),
                     }
 
@@ -4889,6 +5118,22 @@ class MainWindow(QMainWindow):
             return int(value)
         except (TypeError, ValueError):
             return None
+
+    @staticmethod
+    def _coerce_float(value: Any) -> float | None:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _elapsed_from_turn_start(self, tracked_at: Any) -> float | None:
+        tracked = self._coerce_float(tracked_at)
+        if tracked is None:
+            return None
+        start = float(getattr(self, "_ai_turn_started_monotonic", 0.0) or 0.0)
+        if start <= 0.0:
+            return None
+        return round(max(0.0, tracked - start), 1)
 
     @staticmethod
     def _normalize_attempt_word(value: Any) -> str:
@@ -4945,6 +5190,7 @@ class MainWindow(QMainWindow):
                 "invalid_words": set(),
                 "validation_order": [],
                 "validated_word_scores": {},
+                "validated_word_times": {},
                 "validated_word_moves": {},
                 "legality_by_signature": {},
                 "scored_candidates": {},
@@ -4999,6 +5245,108 @@ class MainWindow(QMainWindow):
             return model_id, self._lookup_active_model_name(model_id)
         return None, "AI"
 
+    def _finalize_pending_model_rows_as_timeout(self, timeout_seconds: int) -> None:
+        pending_statuses = {"pending", "ready", "tool_use", "tool_result", "retry"}
+        known_ids: set[str] = set()
+        for entry in list(getattr(self.model_results_table, "results", [])):
+            if not isinstance(entry, dict):
+                continue
+            model_id = str(entry.get("model") or entry.get("id") or "").strip()
+            if not model_id:
+                continue
+            known_ids.add(model_id)
+            status = str(entry.get("status") or "").lower()
+            if status not in pending_statuses:
+                continue
+            model_name = str(entry.get("model_name") or model_id).strip() or model_id
+            payload = {
+                "model": model_id,
+                "model_name": model_name,
+                "status": "timeout",
+                "error": f"Timeout during generation ({timeout_seconds}s)",
+                "score": -1,
+                "words": [],
+            }
+            self.model_results_table.update_result(
+                self._merge_attempt_summary_into_result(payload)
+            )
+
+        for model in self._active_turn_models:
+            model_id = str(model.get("id") or "").strip()
+            if not model_id or model_id in known_ids:
+                continue
+            model_name = str(model.get("name") or model_id).strip() or model_id
+            payload = {
+                "model": model_id,
+                "model_name": model_name,
+                "status": "timeout",
+                "error": f"Timeout during generation ({timeout_seconds}s)",
+                "score": -1,
+                "words": [],
+            }
+            self.model_results_table.update_result(payload)
+
+    def _disable_model_after_error(
+        self,
+        model_id: str,
+        model_name: str,
+        *,
+        error_text: str,
+    ) -> bool:
+        target_id = str(model_id or "").strip()
+        if not target_id:
+            return False
+        if target_id in self._runtime_disabled_models:
+            return True
+
+        has_attempt_activity = self._model_has_attempt_activity(target_id)
+        unrecoverable = self._is_unrecoverable_model_error(error_text)
+        if has_attempt_activity or not unrecoverable:
+            log.info(
+                "Keeping model %s active after recoverable error (activity=%s, unrecoverable=%s): %s",
+                target_id,
+                has_attempt_activity,
+                unrecoverable,
+                error_text,
+            )
+            return False
+
+        self._runtime_disabled_models.add(target_id)
+
+        def _filter_models(models: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            return [
+                dict(model)
+                for model in models
+                if str(model.get("id") or "").strip() != target_id
+            ]
+
+        self.selected_ai_models = _filter_models(self.selected_ai_models)
+        self.selected_novita_models = _filter_models(self.selected_novita_models)
+        self._active_turn_models = [
+            dict(model)
+            for model in self._active_turn_models
+            if str(model.get("id") or "").strip() != target_id
+        ]
+        self._model_attempt_tracking.pop(target_id, None)
+
+        if str(self._current_ai_model_id or "").strip() == target_id:
+            self._current_ai_model_id = None
+            self._current_ai_model = "AI"
+
+        self.use_multi_model = len(self.selected_ai_models) > 0
+        self.use_novita = len(self.selected_novita_models) > 0
+        self.model_results_table.remove_model(target_id)
+        self._update_mode_status_label()
+
+        safe_name = model_name.strip() or target_id
+        log.warning(
+            "Disabling model %s (%s) after API error: %s",
+            target_id,
+            safe_name,
+            error_text,
+        )
+        return True
+
     def _register_manual_candidate_attempt(
         self,
         move: dict[str, Any],
@@ -5023,8 +5371,10 @@ class MainWindow(QMainWindow):
         invalid_words = cast(set[str], state["invalid_words"])
         validation_order = cast(list[str], state["validation_order"])
         validated_word_scores = cast(dict[str, int], state["validated_word_scores"])
+        validated_word_times = cast(dict[str, float], state["validated_word_times"])
         validated_word_moves = cast(dict[str, dict[str, Any]], state["validated_word_moves"])
         scored_candidates = cast(dict[str, dict[str, Any]], state["scored_candidates"])
+        tracked_at = time.monotonic()
 
         next_order = int(state.get("next_order", 0))
         state["next_order"] = next_order + 1
@@ -5034,6 +5384,8 @@ class MainWindow(QMainWindow):
                 validation_order.append(tracked_word)
             validated_words.add(tracked_word)
             invalid_words.discard(tracked_word)
+            if tracked_word not in validated_word_times:
+                validated_word_times[tracked_word] = tracked_at
             current_best = self._coerce_int(validated_word_scores.get(tracked_word))
             if current_best is None or score > current_best:
                 validated_word_scores[tracked_word] = int(score)
@@ -5041,6 +5393,7 @@ class MainWindow(QMainWindow):
                     "score": int(score),
                     "move": dict(move),
                     "order": validation_order.index(tracked_word),
+                    "tracked_at": tracked_at,
                 }
 
         if signature:
@@ -5054,6 +5407,7 @@ class MainWindow(QMainWindow):
                     "score_source": "manual_fallback",
                     "local_legal": self._infer_local_move_legality(placements_obj),
                     "order": next_order,
+                    "tracked_at": tracked_at,
                     "move": dict(move),
                     "note": note,
                 }
@@ -5516,19 +5870,48 @@ class MainWindow(QMainWindow):
         invalid_words = cast(set[str], state["invalid_words"])
         validation_order = cast(list[str], state["validation_order"])
         validated_word_scores = cast(dict[str, int], state["validated_word_scores"])
+        validated_word_times = cast(dict[str, float], state["validated_word_times"])
         validated_word_moves = cast(dict[str, dict[str, Any]], state["validated_word_moves"])
         legality_by_signature = cast(dict[str, bool], state["legality_by_signature"])
         scored_candidates = cast(dict[str, dict[str, Any]], state["scored_candidates"])
 
+        def _register_local_word_validity(candidate_words: list[str], tracked_at: float) -> bool:
+            for raw_word in candidate_words:
+                word = self._normalize_attempt_word(raw_word)
+                if not word:
+                    continue
+                if word in invalid_words:
+                    return False
+                if word in validated_words:
+                    if word not in validated_word_times:
+                        validated_word_times[word] = tracked_at
+                    continue
+                if self._local_word_valid(word):
+                    validated_words.add(word)
+                    if word not in validation_order:
+                        validation_order.append(word)
+                    if word not in validated_word_times:
+                        validated_word_times[word] = tracked_at
+                    continue
+                invalid_words.add(word)
+                validated_word_scores.pop(word, None)
+                validated_word_times.pop(word, None)
+                validated_word_moves.pop(word, None)
+                return False
+            return True
+
         if tool_name in {"validate_word_slovak", "validate_word_english"}:
             word = self._normalize_attempt_word(tool_args.get("word"))
             if word:
+                tracked_at = time.monotonic()
                 is_valid = bool(tool_result.get("valid"))
                 if is_valid:
                     validated_words.add(word)
                     invalid_words.discard(word)
                     if word not in validation_order:
                         validation_order.append(word)
+                    if word not in validated_word_times:
+                        validated_word_times[word] = tracked_at
                     best_score, best_move = self._find_best_local_move_for_word(word)
                     if best_score >= 0:
                         validated_word_scores[word] = best_score
@@ -5537,17 +5920,74 @@ class MainWindow(QMainWindow):
                             "score": best_score,
                             "move": best_move,
                             "order": validation_order.index(word),
+                            "tracked_at": tracked_at,
                         }
                 else:
                     invalid_words.add(word)
                     validated_word_scores.pop(word, None)
+                    validated_word_times.pop(word, None)
                     validated_word_moves.pop(word, None)
             return
 
         if tool_name == "validate_move_legality":
-            signature = self._placements_signature(tool_args.get("placements"))
+            placements_obj = tool_args.get("placements")
+            signature = self._placements_signature(placements_obj)
+            is_valid = bool(tool_result.get("valid"))
             if signature:
-                legality_by_signature[signature] = bool(tool_result.get("valid"))
+                legality_by_signature[signature] = is_valid
+            if not is_valid or not signature:
+                return
+
+            # Keep legal candidates visible in "Pokusy" even when models timeout
+            # before they call explicit scoring tools.
+            placements = self._placements_from_tool_args(placements_obj)
+            if not placements:
+                return
+            placements, normalize_err = self._normalize_new_placements(placements)
+            if normalize_err is not None:
+                return
+
+            board_snapshot = deepcopy(self.board)
+            board_snapshot.place_letters(placements)
+            words_found = extract_all_words(board_snapshot, placements)
+            legal_words_payload = [
+                {
+                    "word": wf.word,
+                    "cells": [[r, c] for r, c in wf.letters],
+                }
+                for wf in words_found
+            ]
+            words = self._extract_words_from_tool_payload(legal_words_payload)
+            if not words:
+                return
+            tracked_at = time.monotonic()
+            if not _register_local_word_validity(words, tracked_at):
+                return
+
+            candidate_move = self._build_move_from_tool_candidate(
+                placements_obj=placements_obj,
+                words_obj=legal_words_payload,
+            )
+            local_score = self._score_move_payload(candidate_move) if candidate_move else None
+            if local_score is None or local_score < 0:
+                return
+
+            next_order = int(state.get("next_order", 0))
+            state["next_order"] = next_order + 1
+            existing = scored_candidates.get(signature)
+            existing_score = self._coerce_int(existing.get("score")) if existing else None
+            if existing_score is None or int(local_score) > existing_score:
+                scored_candidates[signature] = {
+                    "signature": signature,
+                    "words": words,
+                    "score": int(local_score),
+                    "tool_score": int(local_score),
+                    "score_source": "local_legality",
+                    "local_legal": True,
+                    "order": next_order,
+                    "tracked_at": tracked_at,
+                    "move": candidate_move,
+                }
             return
 
         if tool_name not in {"calculate_move_score", "scoring_score_words"}:
@@ -5564,6 +6004,9 @@ class MainWindow(QMainWindow):
             return
         if not signature:
             return
+        tracked_at = time.monotonic()
+        if not _register_local_word_validity(words, tracked_at):
+            return
 
         local_legal = self._infer_local_move_legality(placements_obj)
         next_order = int(state.get("next_order", 0))
@@ -5575,13 +6018,9 @@ class MainWindow(QMainWindow):
             words_obj=words_payload,
         )
         local_score = self._score_move_payload(candidate_move) if candidate_move else None
-        best_score = (
-            local_score
-            if local_score is not None
-            else (total_score if total_score is not None and total_score >= 0 else None)
-        )
-        if best_score is None:
+        if local_score is None or local_score < 0:
             return
+        candidate_score = int(local_score)
 
         if (
             local_score is not None
@@ -5597,15 +6036,16 @@ class MainWindow(QMainWindow):
                 local_score,
             )
 
-        if existing is None or best_score > int(existing.get("score", -1)):
+        if existing is None or candidate_score > int(existing.get("score", -1)):
             scored_candidates[signature] = {
                 "signature": signature,
                 "words": words,
-                "score": int(best_score),
+                "score": candidate_score,
                 "tool_score": total_score,
                 "score_source": "local" if local_score is not None else "tool",
                 "local_legal": local_legal,
                 "order": next_order,
+                "tracked_at": tracked_at,
                 "move": candidate_move,
             }
 
@@ -5618,10 +6058,27 @@ class MainWindow(QMainWindow):
         invalid_words = cast(set[str], state.get("invalid_words", set()))
         validation_order = cast(list[str], state.get("validation_order", []))
         validated_word_scores = cast(dict[str, int], state.get("validated_word_scores", {}))
+        validated_word_times = cast(dict[str, float], state.get("validated_word_times", {}))
         legality_by_signature = cast(dict[str, bool], state.get("legality_by_signature", {}))
         scored_candidates = cast(dict[str, dict[str, Any]], state.get("scored_candidates", {}))
 
-        best_by_words: dict[str, tuple[int, int]] = {}
+        def _summary_word_is_valid(word: str) -> bool:
+            normalized = self._normalize_attempt_word(word)
+            if not normalized:
+                return False
+            if normalized in invalid_words:
+                return False
+            if normalized in validated_words:
+                return True
+            if self._local_word_valid(normalized):
+                validated_words.add(normalized)
+                return True
+            invalid_words.add(normalized)
+            validated_word_scores.pop(normalized, None)
+            validated_word_times.pop(normalized, None)
+            return False
+
+        best_by_words: dict[str, tuple[int, int, float | None]] = {}
         for candidate in scored_candidates.values():
             words = [
                 self._normalize_attempt_word(word)
@@ -5641,9 +6098,7 @@ class MainWindow(QMainWindow):
             if not bool(candidate.get("local_legal", False)):
                 continue
 
-            if any(word in invalid_words for word in words):
-                continue
-            if validated_words and not any(word in validated_words for word in words):
+            if not all(_summary_word_is_valid(word) for word in words):
                 continue
 
             score = self._coerce_int(candidate.get("score"))
@@ -5651,10 +6106,19 @@ class MainWindow(QMainWindow):
                 continue
 
             order_value = self._coerce_int(candidate.get("order")) or 0
+            tracked_at = self._coerce_float(candidate.get("tracked_at"))
             words_key = "+".join(words)
             previous_best = best_by_words.get(words_key)
-            if previous_best is None or score > previous_best[0]:
-                best_by_words[words_key] = (score, order_value)
+            if (
+                previous_best is None
+                or score > previous_best[0]
+                or (
+                    score == previous_best[0]
+                    and tracked_at is not None
+                    and (previous_best[2] is None or tracked_at < previous_best[2])
+                )
+            ):
+                best_by_words[words_key] = (score, order_value, tracked_at)
 
         for order_idx, word in enumerate(validation_order):
             if word in invalid_words or word not in validated_words:
@@ -5664,8 +6128,17 @@ class MainWindow(QMainWindow):
                 continue
             word_key = word
             previous_best = best_by_words.get(word_key)
-            if previous_best is None or score > previous_best[0]:
-                best_by_words[word_key] = (score, order_idx)
+            tracked_at = self._coerce_float(validated_word_times.get(word))
+            if (
+                previous_best is None
+                or score > previous_best[0]
+                or (
+                    score == previous_best[0]
+                    and tracked_at is not None
+                    and (previous_best[2] is None or tracked_at < previous_best[2])
+                )
+            ):
+                best_by_words[word_key] = (score, order_idx, tracked_at)
 
         if not best_by_words:
             return {}
@@ -5675,11 +6148,20 @@ class MainWindow(QMainWindow):
             key=lambda item: (-item[1][0], item[1][1], item[0]),
         )
         display_parts: list[str] = []
-        for words_key, (score, _order_value) in ordered:
+        for words_key, (score, _order_value, _tracked_at) in ordered:
             human_words = "+".join(part.lower() for part in words_key.split("+"))
             display_parts.append(f"{human_words} ({score})")
         if not display_parts:
             return {}
+
+        best_score = ordered[0][1][0]
+        best_tracked_at = ordered[0][1][2]
+        first_tracked_at: float | None = None
+        for _words_key, (_score, _order_value, tracked_at) in ordered:
+            if tracked_at is None:
+                continue
+            if first_tracked_at is None or tracked_at < first_tracked_at:
+                first_tracked_at = tracked_at
 
         first_part = html.escape(display_parts[0])
         other_parts = [html.escape(part) for part in display_parts[1:]]
@@ -5690,7 +6172,10 @@ class MainWindow(QMainWindow):
         return {
             "attempts_display": ", ".join(display_parts),
             "attempts_html": attempts_html,
-            "best_attempt_score": ordered[0][1][0],
+            "attempts_count": len(ordered),
+            "best_attempt_score": best_score,
+            "first_attempt_seconds": self._elapsed_from_turn_start(first_tracked_at),
+            "best_attempt_seconds": self._elapsed_from_turn_start(best_tracked_at),
         }
 
     def _merge_attempt_summary_into_result(self, result: dict[str, Any]) -> dict[str, Any]:
@@ -5706,7 +6191,13 @@ class MainWindow(QMainWindow):
     
     def _update_table_for_judging(self, words: list[str]) -> None:
         """Update table to highlight which words are being judged."""
-        model_name = getattr(self, '_current_ai_model', "AI")
+        model_name = str(getattr(self, "_current_ai_model", "") or "").strip() or "AI"
+        if model_name == "AI":
+            resolved_id, resolved_name = self._resolve_attempt_target_model()
+            if resolved_id:
+                self._current_ai_model_id = resolved_id
+                self._current_ai_model = resolved_name
+                model_name = resolved_name
         log.info("Judge validating words %s from model %s", words, model_name)
         
         # Update status message to show which model's move is being judged
@@ -5790,10 +6281,14 @@ class MainWindow(QMainWindow):
         if not _force and not self._ai_waiting_worker:
             log.debug("Ignoring late AI proposal after timeout/finalization")
             return
+        if _force:
+            self._ai_ignore_worker_updates = True
         if not _force:
             self._ai_waiting_worker = False
+        self._ai_turn_started_monotonic = 0.0
         self._ai_deadline = 0.0
         self._ai_countdown_timer.stop()
+        self._update_mode_timeout_indicator()
         try:
             self.chat_dialog.update_countdown(0)
         except Exception:
@@ -6071,8 +6566,11 @@ class MainWindow(QMainWindow):
             log.debug("Ignoring late AI failure after timeout/finalization: %s", e)
             return
         self._ai_waiting_worker = False
+        self._ai_ignore_worker_updates = True
+        self._ai_turn_started_monotonic = 0.0
         self._ai_deadline = 0.0
         self._ai_countdown_timer.stop()
+        self._update_mode_timeout_indicator()
         try:
             self.chat_dialog.update_countdown(0)
         except Exception:
@@ -6209,6 +6707,7 @@ class MainWindow(QMainWindow):
             pass
         self._update_scores_label()
         self._ai_thinking = False
+        self._update_mode_timeout_indicator()
         self._enable_human_inputs()
         self.status.showMessage("Hrá hráč…")
         self._register_scoring_turn("AI")
@@ -6259,6 +6758,7 @@ class MainWindow(QMainWindow):
         self._game_end_reason = reason
         self._disable_human_inputs()
         self._ai_thinking = False
+        self._update_mode_timeout_indicator()
 
         # Mark game as no longer in progress
         self.game_in_progress = False
@@ -6326,8 +6826,8 @@ class MainWindow(QMainWindow):
                 
                 # Update status message
                 mode_name = new_mode.display_name_sk
-                if new_mode == OpponentMode.AGENT and new_agent:
-                    self.status.showMessage(f"AI Režim: {mode_name} ({new_agent})", 3000)
+                if new_mode == OpponentMode.LMSTUDIO:
+                    self.status.showMessage(f"AI Režim: {mode_name}", 3000)
                 else:
                     self.status.showMessage(f"AI Režim: {mode_name}", 3000)
 
@@ -6622,12 +7122,12 @@ class MainWindow(QMainWindow):
         log.debug("Statusbar clicked, opening chat dialog")
 
     def _on_agent_row_clicked(self, model_id: str, model_name: str) -> None:
-        """Klik na agent row v tabuľke modelov - otvorí chat s týmto agentom."""
+        """Klik na LMStudio row v tabuľke modelov - otvorí profiling/chat."""
         self.selected_agent_name = model_name
-        self.opponent_mode = OpponentMode.AGENT
+        self.opponent_mode = OpponentMode.LMSTUDIO
         self._update_mode_status_label()
         try:
-            self.chat_dialog.setWindowTitle(f"Agent Chat – {model_name}")
+            self.chat_dialog.setWindowTitle(f"LMStudio Chat – {model_name}")
         except Exception:
             pass
         # Otvor Agents dialog a prepni na daného agenta
@@ -6674,6 +7174,7 @@ class MainWindow(QMainWindow):
                 self._on_ai_timeout_expired()
                 return
             self._ai_countdown_timer.stop()
+            self._update_mode_timeout_indicator()
             try:
                 self.chat_dialog.update_countdown(0)
             except Exception:
@@ -6683,6 +7184,7 @@ class MainWindow(QMainWindow):
         if rem <= 0:
             self._on_ai_timeout_expired()
             return
+        self._update_mode_timeout_indicator(rem)
         try:
             self.chat_dialog.update_countdown(rem)
         except Exception:
@@ -6691,6 +7193,7 @@ class MainWindow(QMainWindow):
     def _on_ai_timeout_expired(self) -> None:
         self._ai_deadline = 0.0
         self._ai_countdown_timer.stop()
+        self._update_mode_timeout_indicator(0)
         try:
             self.chat_dialog.update_countdown(0)
         except Exception:
@@ -6701,10 +7204,12 @@ class MainWindow(QMainWindow):
             return
 
         self._ai_waiting_worker = False
+        self._ai_ignore_worker_updates = True
         timeout_seconds = max(
             5,
             int(self._ai_turn_timeout_seconds or self.ai_move_timeout_seconds),
         )
+        self._finalize_pending_model_rows_as_timeout(timeout_seconds)
         log.warning(
             "AI turn hard-timeout reached at %ss, forcing best tracked candidate",
             timeout_seconds,
@@ -6723,6 +7228,8 @@ class MainWindow(QMainWindow):
             requested_exchange=None,
             status_message="Timeout vypršal, AI finalizuje najlepší pokus",
         )
+        self._ai_turn_started_monotonic = 0.0
+        self._update_mode_timeout_indicator()
 
     def _on_ai_stream_update(self, delta: str) -> None:
         """Streamujúce tokeny z AI -> chat."""
@@ -6884,8 +7391,8 @@ class MainWindow(QMainWindow):
             
             # Update status message
             mode_name = new_mode.display_name_sk
-            if new_mode == OpponentMode.AGENT and new_agent:
-                self.status.showMessage(f"AI Režim: {mode_name} ({new_agent})")
+            if new_mode == OpponentMode.LMSTUDIO:
+                self.status.showMessage(f"AI Režim: {mode_name}")
             else:
                 self.status.showMessage(f"AI Režim: {mode_name}")
             

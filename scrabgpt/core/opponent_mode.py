@@ -9,14 +9,14 @@ class OpponentMode(Enum):
     """AI opponent mode selection.
     
     Determines how the AI opponent generates moves:
-    - AGENT: Uses configurable local agent with Scrabble tools
+    - LMSTUDIO: Local OpenAI-compatible endpoint (LMStudio/localhost)
     - BEST_MODEL: Parallel OpenAI model competition (from OPENAI_MODELS)
     - OPENROUTER: Multi-model competition via OpenRouter
     - NOVITA: Multi-model competition via Novita (reasoning models)
     - GEMINI: Google Gemini model via Vertex AI (streaming + reasoning)
 """
     
-    AGENT = "agent"
+    LMSTUDIO = "lmstudio"
     BEST_MODEL = "best_model"
     OPENROUTER = "openrouter"
     NOVITA = "novita"
@@ -26,7 +26,7 @@ class OpponentMode(Enum):
     def display_name_sk(self) -> str:
         """Slovak display name for UI."""
         names = {
-            OpponentMode.AGENT: "Agent",
+            OpponentMode.LMSTUDIO: "LMStudio",
             OpponentMode.BEST_MODEL: "OpenAI",
             OpponentMode.OPENROUTER: "OpenRouter",
             OpponentMode.NOVITA: "Novita AI",
@@ -38,9 +38,9 @@ class OpponentMode(Enum):
     def description_sk(self) -> str:
         """Slovak description for UI."""
         descriptions = {
-            OpponentMode.AGENT: (
-                "Hrať proti agentovi s lokálnymi Scrabble nástrojmi a vybraným LLM "
-                "napojeným cez .env/LMStudio."
+            OpponentMode.LMSTUDIO: (
+                "Lokálny OpenAI-compatible endpoint (napr. LMStudio) s rovnakým "
+                "agentickým flow ako ostatné režimy."
             ),
             OpponentMode.BEST_MODEL: (
                 "Paralelné volanie vybraných OpenAI modelov. "
@@ -62,7 +62,7 @@ class OpponentMode(Enum):
         """Convert string to OpponentMode.
         
         Args:
-            mode: Mode string (e.g., "agent", "single")
+            mode: Mode string (e.g., "lmstudio", "best_model")
         
         Returns:
             OpponentMode enum value
@@ -70,8 +70,17 @@ class OpponentMode(Enum):
         Raises:
             ValueError: If mode string is invalid
         """
+        normalized = mode.lower().strip()
+        legacy_map = {
+            "agent": cls.LMSTUDIO,
+            "offline": cls.LMSTUDIO,
+            "llmstudio": cls.LMSTUDIO,
+        }
+        mapped = legacy_map.get(normalized)
+        if mapped is not None:
+            return mapped
         try:
-            return cls(mode.lower())
+            return cls(normalized)
         except ValueError:
             valid_modes = ", ".join([m.value for m in cls])
             raise ValueError(

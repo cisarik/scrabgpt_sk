@@ -7,11 +7,10 @@ This session implemented a **complete async agent system with background executi
 ## Files Created (5 new files)
 
 ### 1. `scrabgpt/ui/settings_dialog.py` (1,312 lines)
-**Unified Settings Dialog** with 4 tabs:
+**Unified Settings Dialog** with 3 tabs:
 - **Všeobecné**: Variant, Languages, Repro mode, Agent auto-show
 - **AI Protivník**: Opponent mode selector (placeholder)
 - **Nastavenia API**: OpenAI/OpenRouter keys, max tokens config
-- **Upraviť prompt protihráča**: Embedded prompt editor
 
 **Features**:
 - Green forest theme (#0f1a12 background, #2e7d32 accents)

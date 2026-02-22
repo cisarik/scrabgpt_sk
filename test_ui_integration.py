@@ -39,12 +39,11 @@ def test_settings_dialog():
     
     if result:
         selected_mode = dialog.get_selected_mode()
-        selected_agent = dialog.get_selected_agent_name()
         
         print("\n✓ Settings accepted!")
         print(f"  Mode: {selected_mode.display_name_sk} ({selected_mode.value})")
-        if selected_mode == OpponentMode.AGENT and selected_agent:
-            print(f"  Agent: {selected_agent}")
+        if selected_mode == OpponentMode.LMSTUDIO:
+            print("  LMStudio: configured via OPENAI_BASE_URL + LLMSTUDIO_MODEL")
     else:
         print("\n✗ Settings cancelled")
     

@@ -6,16 +6,17 @@ import logging
 import os
 from pathlib import Path
 from typing import Optional, Sequence, TYPE_CHECKING, Any
+from urllib.parse import urlparse
 
 if TYPE_CHECKING:
     from .app import MainWindow
 
 from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QIntValidator, QFont, QMouseEvent
+from PySide6.QtGui import QIntValidator, QMouseEvent
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QPushButton,
     QLabel, QTabWidget, QWidget, QMessageBox, QFormLayout,
-    QLineEdit, QCheckBox, QComboBox, QTextEdit, QInputDialog, QSpinBox, QDialogButtonBox,
+    QLineEdit, QCheckBox, QComboBox, QSpinBox, QDialogButtonBox,
 )
 
 from ..core.opponent_mode import OpponentMode
@@ -41,7 +42,6 @@ from .agents_dialog import AsyncAgentWorker, AgentActivityWidget
 from .settings_dialog_helper import update_lang_status_animation
 from .opponent_mode_selector import OpponentModeSelector
 from .ai_config import AIConfigDialog
-from .agent_config_dialog import AgentConfigDialog
 
 log = logging.getLogger("scrabgpt.ui")
 
@@ -85,8 +85,8 @@ class SettingsDialog(QDialog):
         Args:
             parent: Parent widget
             current_mode: Current opponent mode
-            current_agent_name: Current agent name (if AGENT mode)
-            available_agents: List of available agent configurations
+            current_agent_name: Legacy field (unused in LMStudio mode)
+            available_agents: Legacy list (unused in LMStudio mode)
             game_in_progress: Whether a game is currently in progress
             ai_move_max_tokens: Max tokens for AI moves
             ai_tokens_from_env: Whether tokens from env
@@ -124,14 +124,6 @@ class SettingsDialog(QDialog):
         self.selected_variant_slug = get_active_variant_slug()
         self._installed_variants: list[VariantDefinition] = []
         self._languages: list[LanguageInfo] = []
-        
-        # Prompt editor state - používateľská zložka
-        self.prompts_dir = Path.home() / ".scrabgpt" / "prompts"
-        self.prompts_dir.mkdir(parents=True, exist_ok=True)
-        self._ensure_default_prompt()
-        self.current_prompt_file = os.getenv("AI_PROMPT_FILE", str(self.prompts_dir / "default.txt"))
-        self.default_prompt_file = str(self.prompts_dir / "default.txt")
-        self.prompt_modified = False
         
         # Language fetch animation state
         self._lang_dot_count = 0
@@ -188,12 +180,9 @@ class SettingsDialog(QDialog):
         api_tab = self._create_api_tab()
         self.tabs.addTab(api_tab, "⚡ Nastavenia API")
         
-        # Prompt Editor tab
-        prompt_tab = self._create_prompt_tab()
-        self.tabs.addTab(prompt_tab, "📝 Upraviť prompt protihráča")
-        
-        # Set active tab
-        self.tabs.setCurrentIndex(self.active_tab_index)
+        # Set active tab (safety clamp for stale indices from older builds)
+        max_index = max(0, self.tabs.count() - 1)
+        self.tabs.setCurrentIndex(max(0, min(self.active_tab_index, max_index)))
         
         layout.addWidget(self.tabs)
         
@@ -283,7 +272,7 @@ class SettingsDialog(QDialog):
         self.mode_selector.configure_openai_requested.connect(self._configure_openai)
         self.mode_selector.configure_openrouter_requested.connect(self._configure_openrouter)
         self.mode_selector.configure_novita_requested.connect(self._configure_novita)
-        self.mode_selector.configure_agent_requested.connect(self._configure_agent)
+        self.mode_selector.configure_lmstudio_requested.connect(self._configure_offline)
         self.mode_selector.configure_offline_requested.connect(self._configure_offline)
         self.mode_selector.set_openai_models_preview(self.selected_openai_models)
         
@@ -297,16 +286,6 @@ class SettingsDialog(QDialog):
         """Handle OK button click."""
         # Validate configuration
         selected_mode = self.mode_selector.get_selected_mode()
-        
-        if selected_mode == OpponentMode.AGENT:
-            agent_name = self.mode_selector.get_selected_agent_name()
-            if not agent_name:
-                QMessageBox.warning(
-                    self,
-                    "Chyba",
-                    "Prosím vyberte agenta pre Agent mód.",
-                )
-                return
         if selected_mode == OpponentMode.BEST_MODEL and not self.selected_openai_models:
             QMessageBox.warning(
                 self,
@@ -326,10 +305,10 @@ class SettingsDialog(QDialog):
         return self.mode_selector.get_selected_mode()
     
     def get_selected_agent_name(self) -> Optional[str]:
-        """Get selected agent name (if AGENT mode).
+        """Legacy getter kept for compatibility.
         
         Returns:
-            Agent name or None
+            Always None (Agent mode was replaced by LMStudio mode)
         """
         return self.mode_selector.get_selected_agent_name()
     
@@ -593,44 +572,34 @@ class SettingsDialog(QDialog):
             # Refresh model info display in mode selector
             if hasattr(self, 'mode_selector') and self.mode_selector:
                 self.mode_selector.refresh_novita_team_info()
-    
-    def _configure_agent(self) -> None:
-        """Open Agent configuration dialog."""
-        dialog = AgentConfigDialog(
-            parent=self,
-            available_agents=self.available_agents,
-            current_agent_name=self.current_agent_name,
-        )
-        
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            # Store selected agent
-            agent_name = dialog.get_selected_agent_name()
-            if agent_name:
-                self.current_agent_name = agent_name
-                
-                # Show confirmation
-                QMessageBox.information(
-                    self,
-                    "Agent Nastavený",
-                    f"Vybraný agent: {agent_name}",
-                )
 
     def _configure_offline(self) -> None:
-        """Open dialog to configure offline LLM (LMStudio/LLMStudio)."""
+        """Open dialog to configure LMStudio/OpenAI-compatible local server."""
         dialog = QDialog(self)
-        dialog.setWindowTitle("Offline LLM (LMStudio)")
+        dialog.setWindowTitle("LMStudio")
         form = QFormLayout(dialog)
         form.setContentsMargins(12, 12, 12, 12)
         form.setSpacing(10)
-        
-        base_url = QLineEdit(dialog)
-        base_url.setPlaceholderText("http://127.0.0.1:1234/v1")
-        base_url.setText(
+
+        current_url = (
             os.getenv("OPENAI_BASE_URL")
             or os.getenv("LLMSTUDIO_BASE_URL")
             or "http://127.0.0.1:1234/v1"
-        )
-        form.addRow("Server URL:", base_url)
+        ).strip()
+        parsed_current = urlparse(current_url if "://" in current_url else f"http://{current_url}")
+        current_scheme = parsed_current.scheme or "http"
+        current_host = parsed_current.hostname or "127.0.0.1"
+        current_port = parsed_current.port or 1234
+
+        host_edit = QLineEdit(dialog)
+        host_edit.setPlaceholderText("http://127.0.0.1")
+        host_edit.setText(f"{current_scheme}://{current_host}")
+        form.addRow("URL:", host_edit)
+
+        port_spin = QSpinBox(dialog)
+        port_spin.setRange(1, 65535)
+        port_spin.setValue(int(current_port))
+        form.addRow("Port:", port_spin)
         
         model = QLineEdit(dialog)
         model.setPlaceholderText("gpt-5.2")
@@ -657,11 +626,21 @@ class SettingsDialog(QDialog):
         form.addRow(buttons_layout)
         
         def _save() -> None:
-            url_val = base_url.text().strip()
+            host_val = host_edit.text().strip()
             model_val = model.text().strip()
-            if not url_val or not model_val:
-                QMessageBox.warning(dialog, "Offline LLM", "Vyplňte URL aj model.")
+            if not host_val or not model_val:
+                QMessageBox.warning(dialog, "LMStudio", "Vyplňte URL aj model.")
                 return
+            if "://" not in host_val:
+                host_val = f"http://{host_val}"
+            parsed_host = urlparse(host_val)
+            hostname = (parsed_host.hostname or "").strip()
+            if not hostname:
+                QMessageBox.warning(dialog, "LMStudio", "Neplatná URL adresa.")
+                return
+            scheme = (parsed_host.scheme or "http").strip() or "http"
+            port_val = int(port_spin.value())
+            url_val = f"{scheme}://{hostname}:{port_val}/v1"
             tokens_val = str(tokens.value())
             timeout_val = str(timeout.value())
             
@@ -1265,578 +1244,6 @@ class SettingsDialog(QDialog):
         except Exception as e:
             QMessageBox.critical(self, "Test zlyhal", str(e))
     
-    def _create_prompt_tab(self) -> QWidget:
-        """Create prompt editor tab.
-        
-        Returns:
-            Widget with prompt editor
-        """
-        widget = QWidget()
-        layout = QVBoxLayout(widget)
-        layout.setSpacing(12)
-        layout.setContentsMargins(16, 16, 16, 16)
-        
-        # Header with prompt selector
-        header_layout = QHBoxLayout()
-        
-        prompt_label = QLabel("Vyberte prompt:")
-        prompt_label.setStyleSheet("color: #b6e0bd; font-weight: bold; font-size: 13px;")
-        header_layout.addWidget(prompt_label)
-        
-        self.prompt_combo = QComboBox(widget)
-        self.prompt_combo.currentTextChanged.connect(self._on_prompt_selected)
-        self.prompt_combo.setStyleSheet(
-            "QComboBox { "
-            "background: #000000; color: #e8f5e9; padding: 6px; "
-            "border: 1px solid #2f5c39; border-radius: 4px; "
-            "min-width: 250px; font-size: 13px; "
-            "} "
-            "QComboBox:hover { border-color: #4caf50; background: #0a0a0a; } "
-            "QComboBox:focus { border-color: #4caf50; } "
-            "QComboBox::drop-down { border: none; width: 20px; } "
-            "QComboBox QAbstractItemView { "
-            "background: #000000; color: #e8f5e9; "
-            "selection-background-color: #295c33; "
-            "}"
-        )
-        header_layout.addWidget(self.prompt_combo)
-        
-        # Nové tlačidlá pre manažment promptov
-        new_btn = QPushButton("➕ Nový prompt", widget)
-        new_btn.clicked.connect(self._create_new_prompt)
-        new_btn.setStyleSheet(
-            "QPushButton { "
-            "padding: 6px 12px; font-size: 12px; border-radius: 4px; "
-            "background-color: #182c1d; color: #b6e0bd; border: 1px solid #2f5c39; "
-            "} "
-            "QPushButton:hover { background-color: #213f29; border-color: #4caf50; }"
-        )
-        header_layout.addWidget(new_btn)
-        
-        rename_btn = QPushButton("✏️ Premenovať", widget)
-        rename_btn.clicked.connect(self._rename_prompt)
-        rename_btn.setStyleSheet(
-            "QPushButton { "
-            "padding: 6px 12px; font-size: 12px; border-radius: 4px; "
-            "background-color: #182c1d; color: #b6e0bd; border: 1px solid #2f5c39; "
-            "} "
-            "QPushButton:hover { background-color: #213f29; border-color: #4caf50; }"
-        )
-        header_layout.addWidget(rename_btn)
-        
-        delete_btn = QPushButton("🗑️ Vymazať", widget)
-        delete_btn.clicked.connect(self._delete_prompt)
-        delete_btn.setStyleSheet(
-            "QPushButton { "
-            "padding: 6px 12px; font-size: 12px; border-radius: 4px; "
-            "background-color: #2c1d1d; color: #e0b6b6; border: 1px solid #5c2f2f; "
-            "} "
-            "QPushButton:hover { background-color: #3f2929; border-color: #af4c4c; }"
-        )
-        header_layout.addWidget(delete_btn)
-        
-        header_layout.addStretch()
-        
-        # Load available prompts
-        self._load_available_prompts()
-        
-        layout.addLayout(header_layout)
-        
-        # Info label
-        info_label = QLabel(
-            "Upravte prompt podľa potreby. Použite {language}, {tile_summary}, {compact_state}, {premium_legend}"
-        )
-        info_label.setStyleSheet("color: #8a9d8f; font-size: 11px; font-style: italic;")
-        info_label.setWordWrap(True)
-        layout.addWidget(info_label)
-        
-        # Text editor
-        self.prompt_text_edit = QTextEdit(widget)
-        font = QFont("Monospace")
-        font.setPointSize(11)
-        self.prompt_text_edit.setFont(font)
-        self.prompt_text_edit.textChanged.connect(self._on_prompt_text_changed)
-        self.prompt_text_edit.setStyleSheet(
-            "QTextEdit { "
-            "background: #000000; color: #e8f5e9; "
-            "border: 2px solid #2f5c39; border-radius: 6px; "
-            "padding: 12px; font-family: 'Monospace', 'Courier New'; "
-            "font-size: 11pt; line-height: 1.5; "
-            "} "
-            "QTextEdit:hover { border-color: #4caf50; } "
-            "QTextEdit:focus { border-color: #4caf50; background: #0a0a0a; }"
-        )
-        layout.addWidget(self.prompt_text_edit, 1)  # Stretch factor 1
-        
-        # Load current prompt
-        self._load_prompt(self.current_prompt_file)
-        
-        # Bottom buttons
-        button_layout = QHBoxLayout()
-        
-        revert_btn = QPushButton("🔄 Vrátiť na pôvodný", widget)
-        revert_btn.clicked.connect(self._revert_prompt_to_default)
-        revert_btn.setStyleSheet(
-            "QPushButton { "
-            "padding: 8px 16px; font-size: 12px; border-radius: 4px; "
-            "background-color: #3d2a0f; color: #ffd54f; border: 1px solid #8a6a4a; "
-            "} "
-            "QPushButton:hover { background-color: #4d3a1f; border-color: #ff9800; }"
-        )
-        button_layout.addWidget(revert_btn)
-        
-        button_layout.addStretch()
-        
-        save_btn = QPushButton("💾 Uložiť", widget)
-        save_btn.clicked.connect(self._save_current_prompt)
-        save_btn.setStyleSheet(
-            "QPushButton { "
-            "padding: 8px 16px; font-size: 12px; border-radius: 4px; "
-            "background-color: #1b5e20; color: #e8f5e9; border: 1px solid #2e7d32; "
-            "} "
-            "QPushButton:hover { background-color: #2e7d32; border-color: #4caf50; }"
-        )
-        button_layout.addWidget(save_btn)
-        
-        save_as_btn = QPushButton("💾 Uložiť ako...", widget)
-        save_as_btn.clicked.connect(self._save_prompt_as)
-        save_as_btn.setStyleSheet(
-            "QPushButton { "
-            "padding: 8px 16px; font-size: 12px; border-radius: 4px; "
-            "background-color: #182c1d; color: #b6e0bd; border: 1px solid #2f5c39; "
-            "} "
-            "QPushButton:hover { background-color: #213f29; border-color: #4caf50; }"
-        )
-        button_layout.addWidget(save_as_btn)
-        
-        layout.addLayout(button_layout)
-        
-        return widget
-    
-    def _ensure_default_prompt(self) -> None:
-        """Skopírovať default.txt do používateľskej zložky ak neexistuje."""
-        default_user_path = self.prompts_dir / "default.txt"
-        if not default_user_path.exists():
-            # Skopírovať z pôvodnej prompts/ zložky
-            original_default = Path("prompts/default.txt")
-            if original_default.exists():
-                import shutil
-                shutil.copy2(original_default, default_user_path)
-                log.info("Skopírovaný default.txt do %s", default_user_path)
-            else:
-                # Použiť rovnaký template ako v PromptEditorDialog
-                default_content = """You are an expert Scrabble player for the {language} language variant.
-
-RULES:
-- Play to win and obey official Scrabble rules for {language}
-- Do NOT overwrite existing board letters; place only on empty cells
-- Placements must form a single contiguous line with no gaps
-- Connect to existing letters after previous move
-- Use only letters from ai_rack
-- For '?' (blank), use chosen uppercase letter (respecting diacritics)
-
-SCORING:
-- Points for each tile: {tile_summary}
-- 7-tile bingo bonus: +50 points
-- Maximize total points using premium squares
-- Empty premium squares show their multiplier symbol (see legend below)
-- Prioritize TL/DL for high-value letters
-- Aim to span DW/TW with the main word
-- Stacking letter multipliers that feed into word multipliers yields maximal score
-
-WORD VALIDITY:
-- Do not glue your letters to adjacent existing letters unless the resulting main word is valid in {language}
-- Use intersections/hooks properly
-- Share letters with the board only at overlapping cells
-- Do not extend an existing word into a non-word
-- All cross-words must be valid {language} words
-- Diacritics are CRITICAL: 'Ú' ≠ 'U', 'Á' ≠ 'A', etc.
-
-SPECIAL CASES:
-- ⭐ CRITICAL: If board is empty, the FIRST MOVE MUST include a tile at coordinates (row=7, col=7)
-  This is the center star (H8 in chess notation). AT LEAST ONE of your placements must have row=7 AND col=7.
-  Example valid first moves:
-    * ACROSS from (7,5): places tiles at (7,5), (7,6), (7,7) ✓ crosses center
-    * DOWN from (5,7): places tiles at (5,7), (6,7), (7,7) ✓ crosses center
-    * ACROSS from (7,8): INVALID ✗ doesn't cross (7,7)
-    * DOWN from (8,7): INVALID ✗ doesn't cross (7,7)
-- If no legal word is found, prefer exchange over pass. Avoid "pass": true.
-- The 'word' field must equal the final main word formed (existing letters + your placements)
-
-OUTPUT FORMAT:
-- Coordinates are 0-based (row and col: 0-14)
-- Return ONLY pure JSON, no explanations, no markdown
-- Required structure: start:{{row:int,col:int}}, direction:'ACROSS'|'DOWN', placements:[{{row,col,letter}}]
-
-STRATEGY:
-Given this compact state, propose exactly ONE move that:
-1. Forms valid {language} words
-2. Maximizes points
-3. Uses premium squares effectively
-4. Creates high-scoring cross-words
-
-SANITY CHECKS:
-- Place tiles in exactly one line (ACROSS or DOWN); no gaps
-- Do not extend existing words unless the resulting contiguous main word is valid in {language}
-- Prefer hooks/intersections instead of blind prefix/suffix sticking
-- 'word' field must equal the final main word on the board
-
-==== CURRENT STATE ====
-{compact_state}
-
-Premium legend: {premium_legend}
-
-==== YOUR MOVE (JSON only) ===="""
-                default_user_path.write_text(default_content, encoding="utf-8")
-                log.info("Vytvorený nový default.txt v %s", default_user_path)
-    
-    def _load_available_prompts(self) -> None:
-        """Load all available prompt files from prompts/ directory."""
-        self.prompt_combo.clear()
-        
-        if not self.prompts_dir.exists():
-            return
-        
-        prompt_files = sorted(self.prompts_dir.glob("*.txt"))
-        
-        for prompt_file in prompt_files:
-            display_name = prompt_file.stem
-            # Špeciálne zobrazenie pre default.txt
-            if display_name == "default":
-                display_name = "Predvolený"
-            self.prompt_combo.addItem(display_name, str(prompt_file))
-        
-        # Select current file
-        for i in range(self.prompt_combo.count()):
-            if self.prompt_combo.itemData(i) == self.current_prompt_file:
-                self.prompt_combo.setCurrentIndex(i)
-                break
-    
-    def _load_prompt(self, filepath: str) -> None:
-        """Load prompt from file."""
-        # Skip if prompt_text_edit doesn't exist yet (called before widget creation)
-        if not hasattr(self, 'prompt_text_edit'):
-            return
-        
-        try:
-            path = Path(filepath)
-            if path.exists():
-                content = path.read_text(encoding="utf-8")
-                self.prompt_text_edit.blockSignals(True)
-                self.prompt_text_edit.setPlainText(content)
-                self.prompt_text_edit.blockSignals(False)
-                self.current_prompt_file = filepath
-                self.prompt_modified = False
-                log.info("Loaded prompt from %s", filepath)
-            else:
-                log.warning("Prompt file not found: %s", filepath)
-                QMessageBox.warning(
-                    self,
-                    "Súbor nenájdený",
-                    f"Prompt súbor nenájdený: {filepath}"
-                )
-        except Exception as e:
-            log.exception("Failed to load prompt: %s", e)
-            QMessageBox.critical(
-                self,
-                "Chyba načítania",
-                f"Nepodarilo sa načítať prompt: {e}"
-            )
-    
-    def _save_prompt(self, filepath: str) -> bool:
-        """Save current prompt to file."""
-        try:
-            path = Path(filepath)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            
-            content = self.prompt_text_edit.toPlainText()
-            path.write_text(content, encoding="utf-8")
-            
-            self.current_prompt_file = filepath
-            self.prompt_modified = False
-            log.info("Saved prompt to %s", filepath)
-            return True
-        except Exception as e:
-            log.exception("Failed to save prompt: %s", e)
-            QMessageBox.critical(
-                self,
-                "Chyba uloženia",
-                f"Nepodarilo sa uložiť prompt: {e}"
-            )
-            return False
-    
-    def _on_prompt_selected(self, display_name: str) -> None:
-        """Handle prompt selection from dropdown."""
-        if not display_name:
-            return
-        
-        filepath = self.prompt_combo.currentData()
-        if filepath and filepath != self.current_prompt_file:
-            if self.prompt_modified:
-                reply = QMessageBox.question(
-                    self,
-                    "Neuložené zmeny",
-                    "Máte neuložené zmeny. Chcete ich uložiť pred načítaním iného promptu?",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No | QMessageBox.StandardButton.Cancel
-                )
-                
-                if reply == QMessageBox.StandardButton.Cancel:
-                    # Revert combo selection
-                    for i in range(self.prompt_combo.count()):
-                        if self.prompt_combo.itemData(i) == self.current_prompt_file:
-                            self.prompt_combo.blockSignals(True)
-                            self.prompt_combo.setCurrentIndex(i)
-                            self.prompt_combo.blockSignals(False)
-                            break
-                    return
-                elif reply == QMessageBox.StandardButton.Yes:
-                    self._save_current_prompt()
-            
-            self._load_prompt(filepath)
-    
-    def _on_prompt_text_changed(self) -> None:
-        """Mark prompt as modified when text changes."""
-        self.prompt_modified = True
-    
-    def _revert_prompt_to_default(self) -> None:
-        """Revert current prompt to default."""
-        reply = QMessageBox.question(
-            self,
-            "Potvrdiť obnovenie",
-            "Naozaj chcete obnoviť pôvodný prompt? Všetky neuložené zmeny budú stratené.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-        )
-        
-        if reply == QMessageBox.StandardButton.Yes:
-            self._load_prompt(self.default_prompt_file)
-    
-    def _save_current_prompt(self) -> None:
-        """Save current prompt to current file."""
-        if self._save_prompt(self.current_prompt_file):
-            QMessageBox.information(
-                self,
-                "Uložené",
-                f"Prompt bol úspešne uložený do {Path(self.current_prompt_file).name}"
-            )
-    
-    def _save_prompt_as(self) -> None:
-        """Save current prompt to a new file."""
-        name, ok = QInputDialog.getText(
-            self,
-            "Uložiť ako",
-            "Zadajte názov pre nový prompt (bez prípony):"
-        )
-        
-        if ok and name:
-            # Sanitize filename
-            name = "".join(c for c in name if c.isalnum() or c in (' ', '-', '_')).strip()
-            if not name:
-                QMessageBox.warning(
-                    self,
-                    "Neplatný názov",
-                    "Názov musí obsahovať aspoň jeden alfanumerický znak."
-                )
-                return
-            
-            filepath = str(self.prompts_dir / f"{name}.txt")
-            
-            if Path(filepath).exists():
-                reply = QMessageBox.question(
-                    self,
-                    "Súbor existuje",
-                    f"Súbor {name}.txt už existuje. Chcete ho prepísať?",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-                )
-                
-                if reply != QMessageBox.StandardButton.Yes:
-                    return
-            
-            if self._save_prompt(filepath):
-                # Reload available prompts and select the new one
-                self._load_available_prompts()
-                QMessageBox.information(
-                    self,
-                    "Uložené",
-                    f"Prompt bol úspešne uložený ako {name}.txt"
-                )
-    
-    def _create_new_prompt(self) -> None:
-        """Vytvoriť nový prázdny prompt súbor."""
-        name, ok = QInputDialog.getText(
-            self,
-            "Nový prompt",
-            "Zadajte názov promptu:"
-        )
-        
-        if ok and name:
-            # Sanitize filename
-            name = "".join(c for c in name if c.isalnum() or c in (' ', '-', '_')).strip()
-            if not name:
-                QMessageBox.warning(
-                    self,
-                    "Neplatný názov",
-                    "Názov musí obsahovať aspoň jeden alfanumerický znak."
-                )
-                return
-            
-            filepath = str(self.prompts_dir / f"{name}.txt")
-            
-            if Path(filepath).exists():
-                reply = QMessageBox.question(
-                    self,
-                    "Súbor existuje",
-                    f"Súbor {name}.txt už existuje. Chcete ho prepísať?",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-                )
-                
-                if reply != QMessageBox.StandardButton.Yes:
-                    return
-            
-            # Minimálny template text
-            template_content = """You are an expert Scrabble player for the {language} language variant.
-
-[Add your custom instructions here]
-
-==== CURRENT STATE ====
-{compact_state}
-
-Premium legend: {premium_legend}
-
-==== YOUR MOVE (JSON only) ===="""
-            
-            try:
-                Path(filepath).write_text(template_content, encoding="utf-8")
-                
-                # Reload available prompts and select the new one
-                self._load_available_prompts()
-                self._load_prompt(filepath)
-                
-                QMessageBox.information(
-                    self,
-                    "Vytvorený",
-                    f"Nový prompt '{name}' bol úspešne vytvorený."
-                )
-                log.info("Vytvorený nový prompt: %s", filepath)
-                
-            except Exception as e:
-                log.exception("Failed to create new prompt: %s", e)
-                QMessageBox.critical(
-                    self,
-                    "Chyba vytvorenia",
-                    f"Nepodarilo sa vytvoriť nový prompt: {e}"
-                )
-    
-    def _rename_prompt(self) -> None:
-        """Premenovať aktuálny prompt súbor."""
-        current_path = Path(self.current_prompt_file)
-        
-        # Ochrana default.txt
-        if current_path.stem == "default":
-            QMessageBox.warning(
-                self,
-                "Chránený súbor",
-                "Predvolený prompt je chránený a nemožno ho premenovať týmto spôsobom."
-            )
-            return
-        
-        current_name = current_path.stem
-        name, ok = QInputDialog.getText(
-            self,
-            "Premenovať prompt",
-            "Zadajte nový názov promptu:",
-            text=current_name
-        )
-        
-        if ok and name and name != current_name:
-            # Sanitize filename
-            name = "".join(c for c in name if c.isalnum() or c in (' ', '-', '_')).strip()
-            if not name:
-                QMessageBox.warning(
-                    self,
-                    "Neplatný názov",
-                    "Názov musí obsahovať aspoň jeden alfanumerický znak."
-                )
-                return
-            
-            new_filepath = self.prompts_dir / f"{name}.txt"
-            
-            if new_filepath.exists():
-                reply = QMessageBox.question(
-                    self,
-                    "Súbor existuje",
-                    f"Súbor {name}.txt už existuje. Chcete ho prepísať?",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-                )
-                
-                if reply != QMessageBox.StandardButton.Yes:
-                    return
-            
-            try:
-                current_path.rename(new_filepath)
-                
-                # Reload available prompts and select the renamed file
-                self._load_available_prompts()
-                self._load_prompt(str(new_filepath))
-                
-                QMessageBox.information(
-                    self,
-                    "Premenovaný",
-                    f"Prompt bol úspešne premenovaný na '{name}'."
-                )
-                log.info("Premenovaný prompt: %s -> %s", current_path, new_filepath)
-                
-            except Exception as e:
-                log.exception("Failed to rename prompt: %s", e)
-                QMessageBox.critical(
-                    self,
-                    "Chyba premenovania",
-                    f"Nepodarilo sa premenovať prompt: {e}"
-                )
-    
-    def _delete_prompt(self) -> None:
-        """Vymazať aktuálny prompt súbor."""
-        current_path = Path(self.current_prompt_file)
-        
-        # Ochrana default.txt
-        if current_path.stem == "default":
-            QMessageBox.warning(
-                self,
-                "Chránený súbor",
-                "Predvolený prompt je chránený a nemožno ho vymazať."
-            )
-            return
-        
-        current_name = current_path.stem
-        reply = QMessageBox.question(
-            self,
-            "Potvrdiť vymazanie",
-            f"Naozaj chcete vymazať prompt '{current_name}'?\n\nTáto akcia sa nedá vrátiť späť.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-        )
-        
-        if reply == QMessageBox.StandardButton.Yes:
-            try:
-                current_path.unlink()
-                
-                # Reload available prompts and select default
-                self._load_available_prompts()
-                self._load_prompt(self.default_prompt_file)
-                
-                QMessageBox.information(
-                    self,
-                    "Vymazaný",
-                    f"Prompt '{current_name}' bol úspešne vymazaný."
-                )
-                log.info("Vymazaný prompt: %s", current_path)
-                
-            except Exception as e:
-                log.exception("Failed to delete prompt: %s", e)
-                QMessageBox.critical(
-                    self,
-                    "Chyba vymazania",
-                    f"Nepodarilo sa vymazať prompt: {e}"
-                )
-    
     def _load_agent_auto_show(self) -> bool:
         """Load agent auto-show setting from environment.
         
@@ -1929,13 +1336,6 @@ Premium legend: {premium_legend}
             _set_key_agent(ENV_PATH, "SHOW_AGENT_ACTIVITY_AUTO", agent_auto_show)
         except Exception:
             pass
-        
-        # Save prompt if modified
-        if self.prompt_modified:
-            self._save_current_prompt()
-        
-        # Update environment variable for prompt
-        os.environ["AI_PROMPT_FILE"] = self.current_prompt_file
         
         # Reload provider model selections and refresh UI in main window after saving settings
         if hasattr(self, 'parent') and self.parent():

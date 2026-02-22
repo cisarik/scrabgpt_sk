@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import pytest
 from PySide6.QtWidgets import QApplication
+
 from scrabgpt.core.opponent_mode import OpponentMode
 
 
 @pytest.fixture(scope="session")
 def qapp():
-    """Create QApplication instance for tests."""
     app = QApplication.instance()
     if app is None:
         app = QApplication([])
@@ -18,81 +18,31 @@ def qapp():
 
 @pytest.fixture
 def sample_agents() -> list[dict]:
-    """Sample agent configurations for testing."""
+    # Legacy fixture kept because SettingsDialog still accepts available_agents.
     return [
-        {
-            "name": "Full Access",
-            "model": "gpt-4o",
-            "tools": ["tool1", "tool2", "tool3"],
-        },
-        {
-            "name": "Minimal",
-            "model": "gpt-4o-mini",
-            "tools": ["tool1"],
-        },
+        {"name": "Full Access", "model": "gpt-4o", "tools": ["tool1"]},
+        {"name": "Minimal", "model": "gpt-4o-mini", "tools": ["tool1"]},
     ]
 
 
 class TestOpponentModeSelector:
-    """Test OpponentModeSelector widget."""
+    def test_legacy_agent_mode_maps_to_lmstudio(self, qapp) -> None:
+        assert OpponentMode.from_string("agent") == OpponentMode.LMSTUDIO
 
     def test_creates_with_default_mode(self, qapp, sample_agents: list[dict]) -> None:
-        """Given: OpponentModeSelector created
-        When: No mode specified
-        Then: Defaults to BEST_MODEL
-        """
         from scrabgpt.ui.opponent_mode_selector import OpponentModeSelector
 
         selector = OpponentModeSelector(available_agents=sample_agents)
-
         assert selector.get_selected_mode() == OpponentMode.BEST_MODEL
 
     def test_can_set_mode_programmatically(self, qapp, sample_agents: list[dict]) -> None:
-        """Given: Selector exists
-        When: Setting mode to AGENT
-        Then: Mode is changed and agent selector shown
-        """
         from scrabgpt.ui.opponent_mode_selector import OpponentModeSelector
 
         selector = OpponentModeSelector(available_agents=sample_agents)
-        selector.set_mode(OpponentMode.AGENT)
-
-        assert selector.get_selected_mode() == OpponentMode.AGENT
-        assert selector.agent_selector_widget.isVisible()
-
-    def test_agent_selector_hidden_for_non_agent_mode(
-        self, qapp, sample_agents: list[dict]
-    ) -> None:
-        """Given: Selector in BEST_MODEL mode
-        When: Checking agent selector visibility
-        Then: Agent selector is hidden
-        """
-        from scrabgpt.ui.opponent_mode_selector import OpponentModeSelector
-
-        selector = OpponentModeSelector(available_agents=sample_agents)
-        selector.set_mode(OpponentMode.BEST_MODEL)
-
-        assert selector.get_selected_mode() == OpponentMode.BEST_MODEL
-        assert not selector.agent_selector_widget.isVisible()
-
-    def test_can_select_agent_by_name(self, qapp, sample_agents: list[dict]) -> None:
-        """Given: Selector with available agents
-        When: Setting agent name
-        Then: Agent is selected in dropdown
-        """
-        from scrabgpt.ui.opponent_mode_selector import OpponentModeSelector
-
-        selector = OpponentModeSelector(available_agents=sample_agents)
-        selector.set_mode(OpponentMode.AGENT)
-        selector.set_agent_name("Minimal")
-
-        assert selector.get_selected_agent_name() == "Minimal"
+        selector.set_mode(OpponentMode.LMSTUDIO)
+        assert selector.get_selected_mode() == OpponentMode.LMSTUDIO
 
     def test_all_modes_are_present(self, qapp, sample_agents: list[dict]) -> None:
-        """Given: Selector created
-        When: Reading all radio modes
-        Then: All defined OpponentMode values are represented
-        """
         from scrabgpt.ui.opponent_mode_selector import OpponentModeSelector
 
         selector = OpponentModeSelector(available_agents=sample_agents)
@@ -101,19 +51,13 @@ class TestOpponentModeSelector:
         assert OpponentMode.BEST_MODEL in button_modes
         assert OpponentMode.OPENROUTER in button_modes
         assert OpponentMode.NOVITA in button_modes
-        assert OpponentMode.AGENT in button_modes
+        assert OpponentMode.LMSTUDIO in button_modes
 
     def test_emits_signal_on_mode_change(self, qapp, sample_agents: list[dict]) -> None:
-        """Given: Selector with mode
-        When: User clicks different mode button
-        Then: mode_changed signal is emitted
-        """
         from scrabgpt.ui.opponent_mode_selector import OpponentModeSelector
 
         selector = OpponentModeSelector(available_agents=sample_agents)
-
-        # Connect to signal
-        received_mode = None
+        received_mode: OpponentMode | None = None
 
         def on_mode_changed(mode: OpponentMode) -> None:
             nonlocal received_mode
@@ -121,55 +65,33 @@ class TestOpponentModeSelector:
 
         selector.mode_changed.connect(on_mode_changed)
 
-        # Find AGENT mode button and click it
         for button in selector.button_group.buttons():
-            mode = button.property("mode")
-            if mode == OpponentMode.AGENT:
+            if button.property("mode") == OpponentMode.LMSTUDIO:
                 button.click()
                 break
 
-        assert received_mode == OpponentMode.AGENT
+        assert received_mode == OpponentMode.LMSTUDIO
 
-    def test_disables_all_buttons_when_disabled(
-        self, qapp, sample_agents: list[dict]
-    ) -> None:
-        """Given: Selector enabled
-        When: Calling set_enabled(False)
-        Then: All buttons (except OFFLINE) are disabled
-        """
+    def test_disables_all_buttons_when_disabled(self, qapp, sample_agents: list[dict]) -> None:
         from scrabgpt.ui.opponent_mode_selector import OpponentModeSelector
 
         selector = OpponentModeSelector(available_agents=sample_agents)
         selector.set_enabled(False)
-
         for button in selector.button_group.buttons():
             assert not button.isEnabled()
 
 
 class TestSettingsDialog:
-    """Test SettingsDialog."""
-
     def test_creates_with_mode(self, qapp, sample_agents: list[dict]) -> None:
-        """Given: Settings dialog created with mode
-        When: Getting selected mode
-        Then: Returns configured mode
-        """
         from scrabgpt.ui.settings_dialog import SettingsDialog
 
         dialog = SettingsDialog(
-            current_mode=OpponentMode.AGENT,
+            current_mode=OpponentMode.LMSTUDIO,
             available_agents=sample_agents,
         )
+        assert dialog.get_selected_mode() == OpponentMode.LMSTUDIO
 
-        assert dialog.get_selected_mode() == OpponentMode.AGENT
-
-    def test_shows_warning_when_game_in_progress(
-        self, qapp, sample_agents: list[dict]
-    ) -> None:
-        """Given: Settings dialog with game_in_progress=True
-        When: Dialog is shown
-        Then: Mode selector remains enabled (changes apply next game)
-        """
+    def test_shows_warning_when_game_in_progress(self, qapp, sample_agents: list[dict]) -> None:
         from scrabgpt.ui.settings_dialog import SettingsDialog
 
         dialog = SettingsDialog(
@@ -177,33 +99,29 @@ class TestSettingsDialog:
             available_agents=sample_agents,
             game_in_progress=True,
         )
-
         assert dialog.mode_selector.button_group.buttons()[0].isEnabled()
 
-    def test_validates_agent_selection_for_agent_mode(
-        self, qapp, sample_agents: list[dict]
-    ) -> None:
-        """Given: Settings dialog in AGENT mode
-        When: No agent selected
-        Then: Validation fails
-        """
+    def test_openai_mode_requires_models(self, qapp, sample_agents: list[dict]) -> None:
         from scrabgpt.ui.settings_dialog import SettingsDialog
 
         dialog = SettingsDialog(
-            current_mode=OpponentMode.AGENT,
+            current_mode=OpponentMode.BEST_MODEL,
+            available_agents=sample_agents,
+        )
+        dialog.selected_openai_models = []
+
+        selected_mode = dialog.mode_selector.get_selected_mode()
+        assert selected_mode == OpponentMode.BEST_MODEL
+        assert not dialog.selected_openai_models
+
+    def test_prompt_editor_tab_removed(self, qapp, sample_agents: list[dict]) -> None:
+        from scrabgpt.ui.settings_dialog import SettingsDialog
+
+        dialog = SettingsDialog(
+            current_mode=OpponentMode.BEST_MODEL,
             available_agents=sample_agents,
         )
 
-        # Set mode to AGENT but don't select agent
-        dialog.mode_selector.set_mode(OpponentMode.AGENT)
-        dialog.mode_selector.current_agent_name = None
-
-        # Try to click OK
-        # Note: In real UI test, we'd simulate button click
-        # Here we just test the validation logic directly
-        selected_mode = dialog.mode_selector.get_selected_mode()
-        agent_name = dialog.mode_selector.get_selected_agent_name()
-
-        if selected_mode == OpponentMode.AGENT:
-            # Should require agent name
-            assert agent_name is not None  # Will fail if not set
+        tab_titles = [dialog.tabs.tabText(i).lower() for i in range(dialog.tabs.count())]
+        assert dialog.tabs.count() == 3
+        assert all("prompt" not in title for title in tab_titles)
