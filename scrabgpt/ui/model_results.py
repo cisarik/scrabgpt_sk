@@ -19,8 +19,6 @@ from PySide6.QtWidgets import (
     QStyle,
 )
 
-from .response_detail import ResponseDetailDialog
-
 log = logging.getLogger("scrabgpt.ui")
 
 _PENDING_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
@@ -165,7 +163,7 @@ class AIModelResultsTable(QWidget):
         self.table.setRowCount(0)
 
     def _on_cell_entered(self, _row: int, column: int) -> None:
-        if column == 0:
+        if 0 <= _row < len(self.results):
             self.table.viewport().setCursor(Qt.CursorShape.PointingHandCursor)
         else:
             self.table.viewport().setCursor(Qt.CursorShape.ArrowCursor)
@@ -320,6 +318,9 @@ class AIModelResultsTable(QWidget):
         if attempts_display:
             return attempts_display
 
+        if status == "timeout":
+            return "⏳ Timeout"
+
         words = result.get("words") or []
         score = self._coerce_int(result.get("score"))
         if status == "ok" and words:
@@ -423,7 +424,12 @@ class AIModelResultsTable(QWidget):
         attempts_item.setForeground(QColor(255, 255, 255))
         if attempts_html_raw:
             attempts_item.setData(Qt.ItemDataRole.UserRole, attempts_html_raw)
-        attempts_item.setToolTip(str(result.get("error") or attempts_text))
+        tooltip_text = str(result.get("error") or attempts_text).strip()
+        if status == "timeout":
+            tooltip_text = "Timeout"
+        elif status == "error" and "timeout" in tooltip_text.lower():
+            tooltip_text = "Timeout"
+        attempts_item.setToolTip(tooltip_text)
         if font_bold:
             font = attempts_item.font()
             font.setBold(True)
@@ -496,15 +502,8 @@ class AIModelResultsTable(QWidget):
     def _on_cell_clicked(self, row: int, _column: int) -> None:
         if 0 <= row < len(self.results):
             result = self.results[row]
-            status = str(result.get("status") or "").lower()
-            model_id = str(result.get("model") or "")
+            model_id = str(result.get("model") or result.get("id") or "").strip()
             model_name = str(result.get("model_name") or model_id)
-
-            if model_id.startswith("lmstudio:") or model_id.startswith("agent:"):
-                self.agent_row_clicked.emit(model_id, model_name)
+            if not model_id:
                 return
-
-            if status in {"pending", "ready", "tool_use", "tool_result", "retry"}:
-                return
-            dialog = ResponseDetailDialog(result, parent=self)
-            dialog.exec()
+            self.agent_row_clicked.emit(model_id, model_name)

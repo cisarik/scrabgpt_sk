@@ -8,21 +8,14 @@ import os
 from datetime import datetime
 from typing import Any, Callable
 
-from PySide6.QtCore import QEasingCurve, QPropertyAnimation, QThread, QTimer, Qt, Signal
+from PySide6.QtCore import QThread, Qt, Signal
 from PySide6.QtGui import QCloseEvent, QFont, QTextCursor
 from PySide6.QtWidgets import (
     QDialog,
-    QDialogButtonBox,
-    QFormLayout,
     QGraphicsOpacityEffect,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
-    QListWidget,
-    QMessageBox,
     QPushButton,
-    QProgressBar,
-    QSpinBox,
     QTabWidget,
     QTextEdit,
     QVBoxLayout,
@@ -165,10 +158,10 @@ class AsyncAgentWorker(QThread):
 
 
 class AgentActivityWidget(QWidget):
-    """Widget showing activity for a single agent."""
-    
+    """Widget showing profiling blocks for a single model/agent."""
+
     llm_config_changed = Signal(dict)
-    
+
     def __init__(
         self,
         agent_name: str,
@@ -178,390 +171,278 @@ class AgentActivityWidget(QWidget):
         super().__init__(parent)
         self.agent_name = agent_name
         self.llm_config: dict[str, object] | None = default_llm_config
-        self._reasoning_anim: QPropertyAnimation | None = None
-        self._reasoning_effect: QGraphicsOpacityEffect | None = None
+        self._html_snippets: list[dict[str, str]] = []
         self._setup_ui()
-        
-    def _setup_ui(self) -> None:
-        """Setup UI components."""
-        layout = QVBoxLayout(self)
-        layout.setSpacing(12)
-        layout.setContentsMargins(16, 16, 16, 16)
 
-        button_layout = QHBoxLayout()
-        self.html_snippet_button = QPushButton("Zobraziť HTML snippety", self)
-        self.html_snippet_button.setEnabled(False)
-        self.html_snippet_button.clicked.connect(self._show_html_snippet_dialog)
-        button_layout.addWidget(self.html_snippet_button)
-        
-        self.add_llm_button = QPushButton("➕ Pridať LLM", self)
-        self.add_llm_button.clicked.connect(self._open_llm_dialog)
-        self.add_llm_button.setToolTip("Pridať/aktualizovať hlavný LLM (URL, model, limity)")
-        self.add_llm_button.setStyleSheet(
-            "QPushButton { padding: 6px 10px; border-radius: 6px; "
-            "background: #1d2c22; color: #b6e0bd; border: 1px solid #2f5c39; } "
-            "QPushButton:hover { background: #243a2a; }"
+    @staticmethod
+    def _tile_style(active: bool) -> str:
+        if active:
+            return (
+                "QLabel {"
+                "background:qlineargradient(x1:0,y1:0,x2:0,y2:1,"
+                "stop:0 #f8f8f8, stop:1 #e1e1e1);"
+                "border:1px solid #9aa4a0;"
+                "border-radius:7px;"
+                "color:#1c3c1c;"
+                "font-weight:700;"
+                "font-size:19px;"
+                "}"
+            )
+        return (
+            "QLabel {"
+            "background:#24452c;"
+            "border:1px dashed #3c6544;"
+            "border-radius:7px;"
+            "color:#7ea686;"
+            "font-size:15px;"
+            "}"
         )
-        button_layout.addWidget(self.add_llm_button)
-        button_layout.addStretch()
-        layout.addLayout(button_layout)
 
-        # Status bar
-        status_layout = QHBoxLayout()
+    def _setup_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+        layout.setContentsMargins(14, 14, 14, 14)
+
+        tile_px = 44
+        spacing_px = 6
+        rack_padding_px = 6
+        rack_width_px = (
+            7 * tile_px
+            + (7 - 1) * spacing_px
+            + rack_padding_px * 2
+        )
+        rack_height_px = tile_px + rack_padding_px * 2
 
         self.status_label = QLabel("Pripravený")
         self.status_label.setStyleSheet(
-            "color: #b6e0bd; font-weight: bold; font-size: 13px;"
+            "color: #b6e0bd; font-weight: 700; font-size: 14px; padding: 2px 0;"
         )
-        status_layout.addWidget(self.status_label)
-        
-        self.context_label = QLabel("Context: --")
-        self.context_label.setStyleSheet(
-            "color: #96a28f; font-size: 11px; font-family: 'Fira Sans';"
-        )
-        status_layout.addWidget(self.context_label)
-        
-        status_layout.addStretch()
-        
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setRange(0, 100)
-        self.progress_bar.setValue(0)
-        self.progress_bar.setVisible(False)
-        self.progress_bar.setMinimumWidth(200)
-        self.progress_bar.setStyleSheet(
-            "QProgressBar { "
-            "background: #0f1a12; color: #e8f5e9; "
-            "border: 1px solid #2f5c39; border-radius: 4px; "
-            "text-align: center; height: 20px; "
-            "} "
-            "QProgressBar::chunk { "
-            "background: #4b7d5d; "
-            "border-radius: 3px; "
+        layout.addWidget(self.status_label)
+
+        rack_title = QLabel("🎯 Rack AI:")
+        rack_title.setStyleSheet("color:#cde7d1; font-weight:700; font-size:12px;")
+        layout.addWidget(rack_title)
+
+        self.rack_shell = QWidget(self)
+        self.rack_shell.setStyleSheet(
+            "QWidget {"
+            "background:qlineargradient(x1:0,y1:0,x2:0,y2:1,"
+            "stop:0 #1a8c1a, stop:0.6 #147414, stop:1 #0b3d0b);"
+            "border:1px solid #083508;"
+            "border-radius:14px;"
             "}"
         )
-        status_layout.addWidget(self.progress_bar, stretch=2)  # Give it more space
-        
-        layout.addLayout(status_layout)
-        
-        # Activity log (thinking + status)
-        activity_label = QLabel("🧠 Aktivita:")
-        activity_label.setStyleSheet("color: #b6e0bd; font-weight: bold; font-size: 13px;")
-        layout.addWidget(activity_label)
-        
-        # Reasoning flash (fade in/out)
-        self.reasoning_flash = QLabel("")
-        self.reasoning_flash.setWordWrap(True)
-        self.reasoning_flash.setAlignment(
-            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop
+        self.rack_shell.setFixedSize(rack_width_px, rack_height_px)
+        rack_shadow = QGraphicsOpacityEffect(self.rack_shell)
+        rack_shadow.setOpacity(0.98)
+        self.rack_shell.setGraphicsEffect(rack_shadow)
+        rack_layout = QHBoxLayout(self.rack_shell)
+        rack_layout.setContentsMargins(rack_padding_px, rack_padding_px, rack_padding_px, rack_padding_px)
+        rack_layout.setSpacing(spacing_px)
+        self._rack_tiles: list[QLabel] = []
+        for _ in range(7):
+            tile = QLabel("")
+            tile.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            tile.setFixedSize(tile_px, tile_px)
+            tile.setStyleSheet(self._tile_style(active=False))
+            rack_layout.addWidget(tile)
+            self._rack_tiles.append(tile)
+        layout.addWidget(self.rack_shell, alignment=Qt.AlignmentFlag.AlignLeft)
+
+        self.tool_calls_log = self._create_log_section(
+            layout,
+            "🛠️ Tool calls",
+            min_height=120,
         )
-        self.reasoning_flash.setStyleSheet(
-            "background: #050805; color: #8cd9a0; border: 1px solid #1f2f23; "
-            "border-radius: 6px; padding: 8px; font-family: 'Fira Code', 'Consolas'; "
-            "font-size: 11px; opacity: 0;"
+        self.word_validation_log = self._create_log_section(
+            layout,
+            "📚 Overovanie slov",
+            min_height=120,
         )
-        self._reasoning_effect = QGraphicsOpacityEffect(self.reasoning_flash)
-        self._reasoning_effect.setOpacity(0.0)
-        self.reasoning_flash.setGraphicsEffect(self._reasoning_effect)
-        layout.addWidget(self.reasoning_flash)
-        
-        self.activity_log = QTextEdit()
-        self.activity_log.setReadOnly(True)
-        self.activity_log.setAcceptRichText(True)  # Enable HTML formatting
-        font = QFont("Monospace")
-        font.setPointSize(10)
-        self.activity_log.setFont(font)
-        self.activity_log.setStyleSheet(
-            "QTextEdit { "
-            "background: #000000; color: #e8f5e9; "
-            "border: 2px solid #2f5c39; border-radius: 6px; "
-            "padding: 12px; font-family: 'Monospace', 'Courier New'; "
-            "} "
-            "QTextEdit:focus { border-color: #4caf50; }"
+        self.judge_log = self._create_log_section(
+            layout,
+            "⚖️ Judge",
+            min_height=110,
         )
-        layout.addWidget(self.activity_log, 2)  # Stretch factor 2
-        
-        # Response output
-        response_label = QLabel("✅ Odpoveď:")
-        response_label.setStyleSheet("color: #b6e0bd; font-weight: bold; font-size: 13px;")
-        layout.addWidget(response_label)
-        
+
+        output_label = QLabel("✅ Výstup modelu:")
+        output_label.setStyleSheet("color:#cde7d1; font-weight:700; font-size:12px;")
+        layout.addWidget(output_label)
+
         self.response_text = QTextEdit()
         self.response_text.setReadOnly(True)
+        font = QFont("Monospace")
+        font.setPointSize(10)
         self.response_text.setFont(font)
+        self.response_text.setMaximumHeight(96)
         self.response_text.setStyleSheet(
-            "QTextEdit { "
-            "background: #0f1a12; color: #4caf50; "
-            "border: 2px solid #2f5c39; border-radius: 6px; "
-            "padding: 12px; font-family: 'Monospace', 'Courier New'; "
-            "} "
-            "QTextEdit:focus { border-color: #4caf50; }"
+            "QTextEdit {"
+            "background:#0f1a12; color:#8ef0a7;"
+            "border:1px solid #2f5c39; border-radius:6px; padding:10px;"
+            "}"
         )
-        layout.addWidget(self.response_text, 1)  # Stretch factor 1
+        layout.addWidget(self.response_text)
 
-        # Clear button
-        clear_btn = QPushButton("🗑️ Vymazať log")
+        clear_btn = QPushButton("🗑️ Vymazať")
         clear_btn.clicked.connect(self.clear_log)
         clear_btn.setStyleSheet(
-            "QPushButton { "
-            "padding: 8px 16px; font-size: 12px; border-radius: 4px; "
-            "background-color: #3d2a0f; color: #ffd54f; border: 1px solid #8a6a4a; "
-            "} "
-            "QPushButton:hover { background-color: #4d3a1f; border-color: #ff9800; }"
+            "QPushButton {"
+            "padding:7px 14px; font-size:12px; border-radius:5px;"
+            "background:#3d2a0f; color:#ffd54f; border:1px solid #8a6a4a;"
+            "}"
+            "QPushButton:hover { background:#4d3a1f; border-color:#ff9800; }"
         )
         layout.addWidget(clear_btn, alignment=Qt.AlignmentFlag.AlignLeft)
-       
-        self._html_snippets: list[dict[str, str]] = []
-        self._current_progress: int = 0
-        
-        # Ak je predvyplnený LLM, zobraz ho v stave
+
+        # Backward-compat alias used in app helpers.
+        self.activity_log = self.tool_calls_log
+
         if self.llm_config:
             self.set_llm_config(self.llm_config)
-        
+
+    def _create_log_section(
+        self,
+        layout: QVBoxLayout,
+        title: str,
+        *,
+        min_height: int,
+    ) -> QTextEdit:
+        title_label = QLabel(title)
+        title_label.setStyleSheet("color:#cde7d1; font-weight:700; font-size:12px;")
+        layout.addWidget(title_label)
+
+        editor = QTextEdit()
+        editor.setReadOnly(True)
+        editor.setAcceptRichText(True)
+        editor.setMinimumHeight(min_height)
+        editor.setStyleSheet(
+            "QTextEdit {"
+            "background:#060a07; color:#e8f5e9;"
+            "border:1px solid #2f5c39; border-radius:6px; padding:10px;"
+            "font-family:'Monospace', 'Courier New'; font-size:11px;"
+            "}"
+        )
+        layout.addWidget(editor)
+        return editor
+
+    def _editor_for_section(self, section: str) -> QTextEdit:
+        normalized = (section or "tool_calls").strip().lower()
+        if normalized in {"word", "words", "word_validation", "validation"}:
+            return self.word_validation_log
+        if normalized in {"judge", "result", "final"}:
+            return self.judge_log
+        return self.tool_calls_log
+
+    @staticmethod
+    def _auto_section(prefix: str, message: str) -> str:
+        text = f"{prefix} {message}".lower()
+        if "overenie slova" in text or "validate_word" in text:
+            return "word_validation"
+        if "rozhodca" in text or "judge" in text or "⚖" in prefix:
+            return "judge"
+        return "tool_calls"
+
     def set_status(self, status: str, is_working: bool = False) -> None:
-        """Update status label and progress bar."""
-        self.status_label.setText(status)
-        self.progress_bar.setVisible(is_working)
+        marker = "🟢 " if is_working else "✅ "
+        self.status_label.setText(f"{marker}{status}")
 
     def update_progress(self, percent: int | None) -> None:
-        if percent is None:
-            return
-        clamped = max(0, min(100, percent))
-        self._current_progress = clamped
-        self.progress_bar.setVisible(True)
-        self.progress_bar.setValue(clamped)
-        self.context_label.setText(f"Context: {clamped}%")
+        del percent
 
     def update_context_progress(self, percent: int | None) -> None:
-        """Alias na update_progress pre jasnejší význam."""
-        self.update_progress(percent)
+        del percent
 
-    def append_activity(self, message: str, prefix: str = "ℹ️", color: str | None = None) -> None:
-        """Append message to activity log with timestamp.
-        
-        Args:
-            message: Message text
-            prefix: Emoji prefix
-            color: Optional color for message (HTML color)
-        """
-        # Check if user has manually scrolled up before appending
-        scrollbar = self.activity_log.verticalScrollBar()
-        was_at_bottom = scrollbar.value() >= scrollbar.maximum() - 10  # Within 10px of bottom
-        
+    def set_ai_rack(self, letters: list[str]) -> None:
+        normalized = [str(ch).strip().upper() for ch in letters if str(ch).strip()][:7]
+        for idx, tile in enumerate(self._rack_tiles):
+            if idx < len(normalized):
+                tile.setText(normalized[idx])
+                tile.setStyleSheet(self._tile_style(active=True))
+            else:
+                tile.setText("")
+                tile.setStyleSheet(self._tile_style(active=False))
+
+    def append_activity(
+        self,
+        message: str,
+        prefix: str = "ℹ️",
+        color: str | None = None,
+        *,
+        section: str = "auto",
+    ) -> None:
+        target_section = section
+        if section == "auto":
+            target_section = self._auto_section(prefix, message)
+        editor = self._editor_for_section(target_section)
+        scrollbar = editor.verticalScrollBar()
+        was_at_bottom = scrollbar.value() >= scrollbar.maximum() - 10
+
         timestamp = datetime.now().strftime("%H:%M:%S")
-        
         if color:
-            # Use HTML formatting for colored text
-            formatted = f'<span style="color: white;">[{timestamp}] {prefix}</span> <span style="color: {color};">{message}</span>'
-            self.activity_log.append(formatted)
+            formatted = (
+                f'<span style="color:#d9eadc;">[{timestamp}] {prefix}</span> '
+                f'<span style="color:{color};">{message}</span>'
+            )
+            editor.append(formatted)
         else:
-            formatted = f"[{timestamp}] {prefix} {message}"
-            self.activity_log.append(formatted)
-        
-        # Auto-scroll to bottom ONLY if user was already at bottom
-        # This allows manual scrolling without being forced back down
-        if was_at_bottom:
-            cursor = self.activity_log.textCursor()
-            cursor.movePosition(QTextCursor.MoveOperation.End)
-            self.activity_log.setTextCursor(cursor)
-            scrollbar.setValue(scrollbar.maximum())
-    
-    def append_thinking(self, thought: str) -> None:
-        """Append agent thinking to activity log."""
-        self.append_activity(thought, prefix="💭")
-        self._show_reasoning_flash(thought)
-    
-    def append_status(self, status: str) -> None:
-        """Append status update to activity log."""
-        self.append_activity(status, prefix="📊")
-    
-    def append_prompt(self, prompt: str) -> None:
-        """Append prompt text in green color."""
-        # Split prompt into lines for better readability
-        lines = prompt.split('\n')
-        for line in lines:
-            if line.strip():
-                self.append_activity(line, prefix="  ", color="#4caf50")
+            editor.append(f"[{timestamp}] {prefix} {message}")
 
-    def _show_reasoning_flash(self, text: str) -> None:
-        """Zobraz krátky fade-in/out blok s reasoning obsahom."""
-        effect = self._reasoning_effect
-        if effect is None:
-            return
-        self.reasoning_flash.setText(text)
-        effect.setOpacity(0.0)
-        
-        anim = QPropertyAnimation(effect, b"opacity", self)
-        anim.setDuration(220)
-        anim.setStartValue(0.0)
-        anim.setEndValue(1.0)
-        anim.setEasingCurve(QEasingCurve.Type.InOutQuad)
-        anim.start()
-        self._reasoning_anim = anim
-        
-        def _fade_out() -> None:
-            out_anim = QPropertyAnimation(effect, b"opacity", self)
-            out_anim.setDuration(350)
-            out_anim.setStartValue(1.0)
-            out_anim.setEndValue(0.0)
-            out_anim.setEasingCurve(QEasingCurve.Type.InOutQuad)
-            out_anim.start()
-            self._reasoning_anim = out_anim
-        
-        QTimer.singleShot(1200, _fade_out)
+        if was_at_bottom:
+            cursor = editor.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+            editor.setTextCursor(cursor)
+            scrollbar.setValue(scrollbar.maximum())
+
+    def append_thinking(self, thought: str) -> None:
+        self.append_activity(thought, prefix="💭", section="tool_calls")
+
+    def append_status(self, status: str) -> None:
+        self.append_activity(status, prefix="📊", section="tool_calls")
+
+    def append_prompt(self, prompt: str) -> None:
+        for line in prompt.split("\n"):
+            if line.strip():
+                self.append_activity(line, prefix="🧾", color="#8ef0a7", section="tool_calls")
 
     def add_html_snippet(self, label: str, raw_html: str, summary: str) -> None:
-        snippet = {
-            "label": label,
-            "raw": raw_html,
-            "summary": summary,
-        }
-        self._html_snippets.append(snippet)
-        self.html_snippet_button.setEnabled(True)
-        self.html_snippet_button.setText(f"Zobraziť HTML ({label})")
-    
+        self._html_snippets.append(
+            {
+                "label": label,
+                "raw": raw_html,
+                "summary": summary,
+            }
+        )
+        self.append_activity(
+            f"HTML snippet uložený: {label}",
+            prefix="📎",
+            color="#9ec8ff",
+            section="tool_calls",
+        )
+
     def set_llm_config(self, cfg: dict[str, object]) -> None:
-        """Ulož LLM config a emituj signál."""
         self.llm_config = cfg
         self.llm_config_changed.emit(cfg)
-        short_model = str(cfg.get("model", ""))[:32]
-        self.status_label.setText(f"LLM: {short_model}")
 
     def set_response(self, response: str) -> None:
-        """Set response text (replacing previous)."""
-        self.response_text.setPlainText(response)
+        self.response_text.setPlainText(response.strip())
 
     def append_response(self, response: str) -> None:
-        """Append to response text."""
-        self.response_text.append(response)
-    
+        if not response:
+            return
+        current = self.response_text.toPlainText().strip()
+        if not current:
+            self.response_text.setPlainText(response.strip())
+            return
+        self.response_text.setPlainText(f"{current}\n{response.strip()}")
+
     def clear_log(self) -> None:
-        """Clear activity log and response."""
-        self.activity_log.clear()
+        self.tool_calls_log.clear()
+        self.word_validation_log.clear()
+        self.judge_log.clear()
         self.response_text.clear()
         self.set_status("Pripravený", is_working=False)
         self._html_snippets.clear()
-        self.html_snippet_button.setEnabled(False)
-        self.html_snippet_button.setText("Zobraziť HTML snippety")
-        self._current_progress = 0
-        self.progress_bar.setValue(0)
-        self.progress_bar.setVisible(False)
-        if self._reasoning_effect:
-            self._reasoning_effect.setOpacity(0.0)
-
-    def _open_llm_dialog(self) -> None:
-        """Dialog pre nastavenie hlavného LLM (URL, model, limity)."""
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Hlavný LLM")
-        form = QFormLayout(dialog)
-        form.setContentsMargins(12, 12, 12, 12)
-        form.setSpacing(10)
-        cfg_map = self.llm_config or {}
-
-        def _cfg_int(key: str, default: int) -> int:
-            raw = cfg_map.get(key, default)
-            if isinstance(raw, bool):
-                return default
-            if isinstance(raw, int):
-                return raw
-            if isinstance(raw, float):
-                return int(raw)
-            if isinstance(raw, str):
-                try:
-                    return int(raw)
-                except ValueError:
-                    return default
-            return default
-        
-        url_edit = QLineEdit(dialog)
-        url_edit.setPlaceholderText("http://127.0.0.1:1234")
-        url_edit.setText(
-            str(cfg_map.get("base_url", "http://127.0.0.1:1234"))
-        )
-        form.addRow("Server URL:", url_edit)
-        
-        model_edit = QLineEdit(dialog)
-        model_edit.setPlaceholderText("gpt-5.2")
-        model_edit.setText(str(cfg_map.get("model", "")))
-        form.addRow("Model:", model_edit)
-        
-        max_tokens_spin = QSpinBox(dialog)
-        max_tokens_spin.setRange(500, 20000)
-        max_tokens_spin.setValue(_cfg_int("max_tokens", 4000))
-        form.addRow("Max tokens:", max_tokens_spin)
-        
-        timeout_spin = QSpinBox(dialog)
-        timeout_spin.setRange(5, 120)
-        timeout_spin.setSuffix(" s")
-        timeout_spin.setValue(_cfg_int("timeout", 30))
-        form.addRow("Timeout:", timeout_spin)
-        
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
-            parent=dialog,
-        )
-        buttons.accepted.connect(dialog.accept)
-        buttons.rejected.connect(dialog.reject)
-        form.addRow(buttons)
-        
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            try:
-                cfg = normalize_llm_config(
-                    url_edit.text(),
-                    model_edit.text(),
-                    max_tokens_spin.value(),
-                    timeout_spin.value(),
-                )
-            except ValueError as exc:
-                QMessageBox.warning(self, "LLM nastavenie", str(exc))
-                return
-            
-            self.set_llm_config(cfg)
-            self.append_status(
-                f"Nastavený LLM: {cfg['model']} @ {cfg['base_url']} "
-                f"(max_tokens={cfg['max_tokens']}, timeout={cfg['timeout']}s)"
-            )
-
-    def _show_html_snippet_dialog(self) -> None:
-        if not self._html_snippets:
-            return
-        dialog = QDialog(self)
-        dialog.setWindowTitle("HTML snippety")
-        dialog.resize(900, 700)
-
-        layout = QVBoxLayout(dialog)
-        list_widget = QListWidget(dialog)
-        for snippet in self._html_snippets:
-            list_widget.addItem(snippet["label"])
-        layout.addWidget(QLabel("Vyber snippet:"))
-        layout.addWidget(list_widget)
-
-        summary_edit = QTextEdit(dialog)
-        summary_edit.setReadOnly(True)
-        summary_edit.setFont(QFont("Monospace"))
-        layout.addWidget(QLabel("Sumarizovaný text:"))
-        layout.addWidget(summary_edit, stretch=1)
-
-        raw_edit = QTextEdit(dialog)
-        raw_edit.setReadOnly(True)
-        raw_edit.setFont(QFont("Monospace"))
-        layout.addWidget(QLabel("Čisté HTML:"))
-        layout.addWidget(raw_edit, stretch=1)
-
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, parent=dialog)
-        buttons.rejected.connect(dialog.reject)
-        buttons.accepted.connect(dialog.accept)
-        layout.addWidget(buttons)
-
-        def update(index: int) -> None:
-            if index < 0 or index >= len(self._html_snippets):
-                return
-            data = self._html_snippets[index]
-            summary_edit.setPlainText(data.get("summary", ""))
-            raw_edit.setPlainText(data.get("raw", ""))
-
-        list_widget.currentRowChanged.connect(update)
-        list_widget.setCurrentRow(len(self._html_snippets) - 1)
-        dialog.exec()
+        self.set_ai_rack([])
 
 
 class AgentsDialog(QDialog):
@@ -648,7 +529,12 @@ class AgentsDialog(QDialog):
             AgentActivityWidget for the agent
         """
         if agent_name in self.agent_tabs:
-            return self.agent_tabs[agent_name]
+            widget = self.agent_tabs[agent_name]
+            if display_name:
+                idx = self.tabs.indexOf(widget)
+                if idx >= 0 and self.tabs.tabText(idx) != display_name:
+                    self.tabs.setTabText(idx, display_name)
+            return widget
         
         widget = AgentActivityWidget(
             agent_name,

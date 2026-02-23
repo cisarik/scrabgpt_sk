@@ -88,7 +88,7 @@ from ..ai.vertex import VertexClient
 from ..ai.vertex_genai_client import build_client as build_vertex_genai_client
 from ..ai.multi_model import propose_move_multi_model
 from ..ai.mcp_tools import tool_validate_word_english, tool_validate_word_slovak
-from .agents_dialog import AgentsDialog, AsyncAgentWorker
+from .agents_dialog import AgentsDialog, AsyncAgentWorker, AgentActivityWidget
 from .agent_status_widget import AgentStatusWidget
 from .chat_dialog import ChatDialog
 from google.genai import types as vertex_types
@@ -1620,6 +1620,7 @@ class MainWindow(QMainWindow):
         self._current_ai_model: str = "AI"
         self._current_ai_model_id: Optional[str] = None
         self._model_attempt_tracking: dict[str, dict[str, Any]] = {}
+        self._profile_last_attempts_preview: dict[str, str] = {}
         self._single_model_reasoning_buffer: str = ""
         self._single_model_seen_attempt_words: set[str] = set()
         self._single_model_attempt_eval_count: int = 0
@@ -2512,6 +2513,8 @@ class MainWindow(QMainWindow):
             table.set_results(entries)
         else:
             table.clear_results()
+        if self.agents_dialog is not None:
+            self._sync_agent_profile_tabs(self.agents_dialog)
 
     @staticmethod
     def _format_timeout_choice(seconds: int) -> str:
@@ -3858,6 +3861,7 @@ class MainWindow(QMainWindow):
         """Fallback for AI failures: exchange tiles instead of passing."""
         self._stop_status_spinner("judge")
         self._stop_status_spinner("ai")
+        profile_model_id, profile_model_name = self._resolve_profile_target_model()
 
         if not self._ai_local_fallback_used:
             tracked = self._best_tracked_move()
@@ -3875,6 +3879,25 @@ class MainWindow(QMainWindow):
                     )
                 except Exception:
                     pass
+                if profile_model_id:
+                    tracked_words = self._extract_words_from_move_for_profile(tracked_move)
+                    tracked_words_text = ", ".join(tracked_words) if tracked_words else "?"
+                    self._append_agent_profile_activity(
+                        profile_model_id,
+                        profile_model_name,
+                        (
+                            "Použitý lokálny fallback z doterajších kandidátov: "
+                            f"{tracked_words_text} ({tracked_score} b)."
+                        ),
+                        prefix="📈",
+                        color="#8ef0a7",
+                        section="judge",
+                    )
+                    self._emit_attempt_summary_activity(
+                        profile_model_id,
+                        profile_model_name,
+                        force=True,
+                    )
                 self._on_ai_proposal(tracked_move, _force=True)
                 return
             fallback_move = self._try_local_low_score_move()
@@ -3891,6 +3914,27 @@ class MainWindow(QMainWindow):
                     )
                 except Exception:
                     pass
+                if profile_model_id:
+                    fallback_words = self._extract_words_from_move_for_profile(fallback_move)
+                    fallback_words_text = ", ".join(fallback_words) if fallback_words else "?"
+                    fallback_score = self._score_move_payload(fallback_move)
+                    fallback_score_text = f"{fallback_score} b" if fallback_score is not None else "?"
+                    self._append_agent_profile_activity(
+                        profile_model_id,
+                        profile_model_name,
+                        (
+                            "Použitý núdzový lokálny fallback (nie výstup modelu): "
+                            f"{fallback_words_text} ({fallback_score_text})."
+                        ),
+                        prefix="🛟",
+                        color="#ffcc80",
+                        section="judge",
+                    )
+                    self._emit_attempt_summary_activity(
+                        profile_model_id,
+                        profile_model_name,
+                        force=True,
+                    )
                 self._on_ai_proposal(fallback_move, _force=True)
                 return
 
@@ -3914,6 +3958,21 @@ class MainWindow(QMainWindow):
             self._update_mode_timeout_indicator()
             self._enable_human_inputs()
             self.status.showMessage("AI pasuje (výmena nie je možná)")
+            if profile_model_id:
+                self._append_agent_profile_activity(
+                    profile_model_id,
+                    profile_model_name,
+                    "Výmena nie je možná, AI pasuje.",
+                    prefix="⚠️",
+                    color="#ffcc80",
+                    section="judge",
+                )
+                self._set_agent_profile_status(
+                    profile_model_id,
+                    profile_model_name,
+                    "Pas (exchange nedostupný)",
+                    is_working=False,
+                )
             self._register_scoreless_turn("AI")
             if self._ai_opening_active:
                 self._ai_opening_active = False
@@ -3937,10 +3996,29 @@ class MainWindow(QMainWindow):
         self._register_scoreless_turn("AI")
         message = status_message or "AI mení písmená"
         self.status.showMessage(message)
+        self._set_all_agent_profile_racks(self.ai_rack)
         try:
             self.chat_dialog.add_agent_activity(message, section="final")
         except Exception:
             pass
+        if profile_model_id:
+            self._append_agent_profile_activity(
+                profile_model_id,
+                profile_model_name,
+                (
+                    f"Exchange ({reason}): mením {''.join(selected)} -> "
+                    f"nový rack {''.join(self.ai_rack)}"
+                ),
+                prefix="🔁",
+                color="#ffcc80",
+                section="judge",
+            )
+            self._set_agent_profile_status(
+                profile_model_id,
+                profile_model_name,
+                "Ťah ukončený výmenou písmen",
+                is_working=False,
+            )
 
         log.info(
             "[AI] exchange fallback reason=%s requested=%s exchanged=%s before=%s after=%s drawn=%d",
@@ -4583,6 +4661,49 @@ class MainWindow(QMainWindow):
                 continue
             model_name = str(model.get("name") or model_id).strip() or model_id
             self._active_turn_models.append({"id": model_id, "name": model_name})
+        dialog = self.get_agents_dialog()
+        self._sync_agent_profile_tabs(dialog)
+        if self._active_turn_models:
+            turn_header = (
+                f"Nový ťah • rack={''.join(self.ai_rack)} • "
+                f"skóre AI {self.ai_score}:{self.human_score} hráč • "
+                f"timeout={timeout_seconds}s"
+            )
+            parallel_overview = ""
+            if len(self._active_turn_models) > 1:
+                parallel_labels = ", ".join(
+                    str(model.get("name") or model.get("id") or "?")
+                    for model in self._active_turn_models
+                )
+                parallel_overview = (
+                    f"Paralelná súťaž modelov ({len(self._active_turn_models)}): {parallel_labels}"
+                )
+            for model in self._active_turn_models:
+                model_id = str(model.get("id") or "").strip()
+                model_name = str(model.get("name") or model_id).strip() or model_id
+                self._set_agent_profile_status(
+                    model_id,
+                    model_name,
+                    "Čakám na odpoveď modelu...",
+                    is_working=True,
+                )
+                self._append_agent_profile_activity(
+                    model_id,
+                    model_name,
+                    turn_header,
+                    prefix="🚀",
+                    color="#9ec8ff",
+                    section="tool_calls",
+                )
+                if parallel_overview:
+                    self._append_agent_profile_activity(
+                        model_id,
+                        model_name,
+                        parallel_overview,
+                        prefix="🧵",
+                        color="#9ec8ff",
+                        section="tool_calls",
+                    )
         # Start countdown for this AI turn
         self._ai_deadline = self._ai_turn_started_monotonic + timeout_seconds
         self._update_mode_timeout_indicator(timeout_seconds)
@@ -4690,11 +4811,11 @@ class MainWindow(QMainWindow):
         if not self._ai_waiting_worker and not self._ai_thinking:
             log.debug("Ignoring stale partial model update outside active AI turn")
             return
-        model_id = result.get("model", "?")
-        model_name = result.get("model_name", model_id)
-        status = result.get("status", "pending")
+        model_id = str(result.get("model") or result.get("id") or "?").strip() or "?"
+        model_name = str(result.get("model_name") or model_id).strip() or model_id
+        status = str(result.get("status") or "pending").lower()
         score = result.get("score")
-        model_key = str(model_id or "").strip()
+        model_key = model_id
         if model_key and model_key in self._runtime_disabled_models:
             return
 
@@ -4702,13 +4823,34 @@ class MainWindow(QMainWindow):
             remaining = result.get("remaining", 0)
             if self.chat_dialog:
                 self.chat_dialog.update_countdown(remaining)
+            self._set_agent_profile_status(
+                model_key,
+                model_name,
+                f"Čakám na výsledok… ({remaining}s)",
+                is_working=True,
+            )
             return
 
         if status == "pending":
+            pending_msg = str(
+                result.get("message") or "Model štartuje samostatný agentický workflow."
+            )
+            self._profile_last_attempts_preview.pop(model_key, None)
+            self._set_agent_profile_status(
+                model_key,
+                model_name,
+                "Štartujem agentický workflow...",
+                is_working=True,
+            )
+            self._append_agent_profile_activity(
+                model_key,
+                model_name,
+                pending_msg,
+                prefix="🚀",
+                color="#9ec8ff",
+                section="tool_calls",
+            )
             if self.chat_dialog:
-                pending_msg = str(
-                    result.get("message") or "Model štartuje samostatný agentický workflow."
-                )
                 self.chat_dialog.add_agent_activity(
                     f"🚀 {model_name}: {pending_msg}",
                     section="planning",
@@ -4721,6 +4863,20 @@ class MainWindow(QMainWindow):
             drop_model_id = str(result.get("model") or "").strip()
             if drop_model_id:
                 self.model_results_table.remove_model(drop_model_id)
+            self._append_agent_profile_activity(
+                model_key,
+                model_name,
+                "Dočasne preťažený (429), model vyradený z tabuľky.",
+                prefix="⚠️",
+                color="#ffcc80",
+                section="judge",
+            )
+            self._set_agent_profile_status(
+                model_key,
+                model_name,
+                "Vyradený po 429 chybe",
+                is_working=False,
+            )
             if self.chat_dialog:
                 self.chat_dialog.add_agent_activity(
                     f"⚠️ {model_name}: dočasne preťažený (429), vyraďujem z tabuľky.",
@@ -4733,13 +4889,45 @@ class MainWindow(QMainWindow):
 
         if status == "tool_use":
             tool_data = result.get("tool_calls_data")
-            if tool_data and self.chat_dialog:
+            self._set_agent_profile_status(
+                model_key,
+                model_name,
+                "Používam nástroje...",
+                is_working=True,
+            )
+            if isinstance(tool_data, list) and self.chat_dialog:
                 for tc in tool_data:
+                    if not isinstance(tc, dict):
+                        continue
                     tool_name = tc.get("name", "?")
                     tool_args = tc.get("args", {})
                     self.chat_dialog.add_tool_call(tool_name, tool_args, model_name=model_name)
+            if isinstance(tool_data, list) and tool_data:
+                for tc in tool_data:
+                    if not isinstance(tc, dict):
+                        continue
+                    tool_name = str(tc.get("name") or "?")
+                    args_raw = tc.get("args")
+                    tool_args = args_raw if isinstance(args_raw, dict) else {}
+                    tool_line = self._format_tool_call_preview(tool_name, tool_args)
+                    self._append_agent_profile_activity(
+                        model_key,
+                        model_name,
+                        tool_line,
+                        prefix="🛠️",
+                        color="#9ec8ff",
+                        section="tool_calls",
+                    )
             else:
                 message = result.get("message", "🛠️ Používam nástroj...")
+                self._append_agent_profile_activity(
+                    model_key,
+                    model_name,
+                    str(message),
+                    prefix="🛠️",
+                    color="#9ec8ff",
+                    section="tool_calls",
+                )
                 if self.chat_dialog:
                     self.chat_dialog.add_agent_activity(
                         f"[{model_name}] {message}",
@@ -4751,9 +4939,71 @@ class MainWindow(QMainWindow):
 
         if status == "tool_result":
             self._update_attempt_tracking_from_tool_result(result)
+            tool_name = str(result.get("tool_name") or "?")
+            tool_args_raw = result.get("tool_args")
+            tool_args_map: dict[str, Any] = tool_args_raw if isinstance(tool_args_raw, dict) else {}
+            res_data_raw = result.get("result")
+            res_data: dict[str, Any] = res_data_raw if isinstance(res_data_raw, dict) else {}
+            self._set_agent_profile_status(
+                model_key,
+                model_name,
+                f"Nástroj {tool_name} dokončený",
+                is_working=True,
+            )
+            tool_name_lower = tool_name.lower()
+            if tool_name_lower in {"validate_word_slovak", "validate_word_english"}:
+                word = str(tool_args_map.get("word") or "?").strip().upper() or "?"
+                is_valid = bool(res_data.get("valid"))
+                reason = str(res_data.get("reason") or "").strip()
+                if is_valid:
+                    self._append_agent_profile_activity(
+                        model_key,
+                        model_name,
+                        f"Overenie slova '{word}': validné",
+                        prefix="✅",
+                        color="#8ef0a7",
+                        section="word_validation",
+                    )
+                else:
+                    suffix = f" ({reason})" if reason else ""
+                    self._append_agent_profile_activity(
+                        model_key,
+                        model_name,
+                        f"Overenie slova '{word}': neplatné{suffix}",
+                        prefix="❌",
+                        color="#ff9e9e",
+                        section="word_validation",
+                    )
+            elif tool_name_lower in {"calculate_move_score", "scoring_score_words"}:
+                words_payload = res_data.get("words")
+                if not isinstance(words_payload, list):
+                    words_payload = tool_args_map.get("words")
+                words = self._extract_words_from_tool_payload(words_payload)
+                score_total = self._coerce_int(res_data.get("total_score"))
+                words_text = ", ".join(words) if words else "?"
+                score_text = f"{score_total} b" if score_total is not None else "?"
+                self._append_agent_profile_activity(
+                    model_key,
+                    model_name,
+                    f"Scoring kandidáta: {words_text} -> {score_text}",
+                    prefix="📊",
+                    color="#8ef0a7",
+                    section="tool_calls",
+                )
+            else:
+                summary = self._format_tool_result_preview(
+                    tool_name,
+                    res_data,
+                    tool_args_map,
+                )
+                self._append_agent_profile_activity(
+                    model_key,
+                    model_name,
+                    f"{tool_name}: {summary or 'hotovo'}",
+                    prefix="🧩",
+                    section="tool_calls",
+                )
             if self.chat_dialog:
-                tool_name = result.get("tool_name", "?")
-                res_data = result.get("result", {})
                 is_error = isinstance(res_data, dict) and "error" in res_data
                 self.chat_dialog.add_tool_result(
                     tool_name,
@@ -4761,19 +5011,32 @@ class MainWindow(QMainWindow):
                     is_error=is_error,
                     model_name=model_name,
                 )
+            self._emit_attempt_summary_activity(model_key, model_name)
             self.model_results_table.update_result(self._merge_attempt_summary_into_result(result))
             return
 
         if status == "retry":
-            error_msg = result.get("error", "")
+            retry_note = self._format_retry_note(result)
+            self._append_agent_profile_activity(
+                model_key,
+                model_name,
+                retry_note,
+                prefix="🔄",
+                color="#ffcc80",
+                section="tool_calls",
+            )
+            self._set_agent_profile_status(
+                model_key,
+                model_name,
+                "Retry: hľadám lepší kandidát",
+                is_working=True,
+            )
             if self.chat_dialog:
-                retry_note = "Model skúša nový variant ťahu."
-                if isinstance(error_msg, str) and "exchange/pass too early" in error_msg:
-                    retry_note = "Model skúša znova: musí nájsť slovný ťah (nie exchange/pass)."
                 self.chat_dialog.add_agent_activity(
                     f"🔄 {model_name}: {retry_note}",
                     section="planning",
                 )
+            self._emit_attempt_summary_activity(model_key, model_name)
             # Continue to update table
 
         self.model_results_table.update_result(self._merge_attempt_summary_into_result(result))
@@ -4782,6 +5045,37 @@ class MainWindow(QMainWindow):
             words = result.get("words") or []
             word_preview = ", ".join(words) if words else result.get("move", {}).get("word", "—")
             score_text = f"{score} b" if isinstance(score, (int, float)) else "—"
+            self._append_agent_profile_activity(
+                model_key,
+                model_name,
+                f"Kandidát '{word_preview}' ({score_text})",
+                prefix="✅",
+                color="#8ef0a7",
+                section="judge",
+            )
+            self._emit_attempt_summary_activity(model_key, model_name, force=True)
+            self._set_agent_profile_status(
+                model_key,
+                model_name,
+                f"Hotovo: kandidát {score_text}",
+                is_working=False,
+            )
+            raw_response = str(result.get("raw_response") or "").strip()
+            compact_raw = raw_response.replace("\n", " ").strip()
+            if len(compact_raw) > 180:
+                compact_raw = compact_raw[:177] + "..."
+            if compact_raw:
+                self._set_agent_profile_response(
+                    model_key,
+                    model_name,
+                    f"Kandidát: {word_preview}\nSkóre: {score_text}\nRaw: {compact_raw}",
+                )
+            else:
+                self._set_agent_profile_response(
+                    model_key,
+                    model_name,
+                    f"Kandidát: {word_preview}\nSkóre: {score_text}",
+                )
             if self.chat_dialog:
                 self.chat_dialog.add_agent_activity(
                     f"✅ {model_name}: kandidát '{word_preview}' ({score_text})",
@@ -4791,6 +5085,30 @@ class MainWindow(QMainWindow):
                 f"{model_name} odpovedal: {word_preview} ({score_text})"
             )
         elif status == "parse_error":
+            self._append_agent_profile_activity(
+                model_key,
+                model_name,
+                "Neplatný formát odpovede, model pokračuje ďalším pokusom.",
+                prefix="⚠️",
+                color="#ffcc80",
+                section="judge",
+            )
+            self._set_agent_profile_status(
+                model_key,
+                model_name,
+                "Neplatná odpoveď (parse error)",
+                is_working=True,
+            )
+            raw_response = str(result.get("raw_response") or "").strip()
+            if raw_response:
+                compact_raw = raw_response.replace("\n", " ").strip()
+                if len(compact_raw) > 180:
+                    compact_raw = compact_raw[:177] + "..."
+                self._set_agent_profile_response(
+                    model_key,
+                    model_name,
+                    f"Parse error odpovede.\nRaw: {compact_raw}",
+                )
             if self.chat_dialog:
                 self.chat_dialog.add_agent_activity(
                     f"⚠️ {model_name}: neplatný formát odpovede, skúšam ďalšie modely.",
@@ -4810,6 +5128,38 @@ class MainWindow(QMainWindow):
                 str(model_name or model_id or ""),
                 error_text=error_text,
             )
+            if was_disabled:
+                self._append_agent_profile_activity(
+                    model_key,
+                    model_name,
+                    f"Nekompatibilná API chyba, model je vyradený. {error_text}",
+                    prefix="❌",
+                    color="#ff9e9e",
+                    section="judge",
+                )
+                self._set_agent_profile_status(
+                    model_key,
+                    model_name,
+                    "Vyradený po API chybe",
+                    is_working=False,
+                )
+            else:
+                self._append_agent_profile_activity(
+                    model_key,
+                    model_name,
+                    f"API chyba v tomto pokuse: {error_text}",
+                    prefix="⚠️",
+                    color="#ffcc80",
+                    section="judge",
+                )
+                self._set_agent_profile_status(
+                    model_key,
+                    model_name,
+                    "API chyba, čakám na ďalšie pokusy",
+                    is_working=False,
+                )
+            if error_text:
+                self._set_agent_profile_response(model_key, model_name, f"Chyba API:\n{error_text}")
             if self.chat_dialog:
                 if was_disabled:
                     self.chat_dialog.add_agent_activity(
@@ -4827,6 +5177,31 @@ class MainWindow(QMainWindow):
                 self.status.showMessage(f"{model_name}: API chyba – čakám na ostatné modely")
             return
         elif status == "timeout":
+            self._append_agent_profile_activity(
+                model_key,
+                model_name,
+                "Model prekročil časový limit generovania.",
+                prefix="⏳",
+                color="#ffcc80",
+                section="judge",
+            )
+            self._set_agent_profile_status(
+                model_key,
+                model_name,
+                "Timeout",
+                is_working=False,
+            )
+            timeout_summary = self._build_attempt_summary(model_key)
+            attempts_preview = str(timeout_summary.get("attempts_display") or "").strip()
+            if attempts_preview:
+                self._emit_attempt_summary_activity(model_key, model_name, force=True)
+                self._set_agent_profile_response(
+                    model_key,
+                    model_name,
+                    f"Timeout po limite, ale model stihol kandidáty: {attempts_preview}",
+                )
+            else:
+                self._set_agent_profile_response(model_key, model_name, "Timeout počas generovania.")
             if self.chat_dialog:
                 self.chat_dialog.add_agent_activity(
                     f"⏳ {model_name}: timeout, pokračujem ďalšími modelmi.",
@@ -4857,6 +5232,63 @@ class MainWindow(QMainWindow):
             self.model_results_table.set_results(visible_results)
         else:
             self.model_results_table.clear_results()
+        if self.agents_dialog is not None:
+            self._sync_agent_profile_tabs(self.agents_dialog)
+
+        for entry in visible_results:
+            model_id = str(entry.get("model") or entry.get("id") or "").strip()
+            if not model_id:
+                continue
+            model_name = str(entry.get("model_name") or model_id).strip() or model_id
+            entry_status = str(entry.get("status") or "").lower()
+            if entry_status == "ok":
+                words_obj = entry.get("words")
+                words = [str(word) for word in words_obj] if isinstance(words_obj, list) else []
+                move_raw = entry.get("move")
+                move_obj: dict[str, Any] = move_raw if isinstance(move_raw, dict) else {}
+                words_text = ", ".join(words) if words else str(move_obj.get("word", "—"))
+                score_value = self._coerce_int(entry.get("score"))
+                score_text = f"{score_value} b" if score_value is not None else "—"
+                judge_valid = bool(entry.get("judge_valid"))
+                judge_reason = str(entry.get("judge_reason") or "").strip()
+                if judge_valid:
+                    self._append_agent_profile_activity(
+                        model_id,
+                        model_name,
+                        f"Judge valid: {words_text} ({score_text})",
+                        prefix="⚖️",
+                        color="#8ef0a7",
+                        section="judge",
+                    )
+                    self._set_agent_profile_status(
+                        model_id,
+                        model_name,
+                        f"Kandidát pripravený ({score_text})",
+                        is_working=False,
+                    )
+                else:
+                    detail = f" ({judge_reason})" if judge_reason else ""
+                    self._append_agent_profile_activity(
+                        model_id,
+                        model_name,
+                        f"Judge reject: {words_text}{detail}",
+                        prefix="⚖️",
+                        color="#ffcc80",
+                        section="judge",
+                    )
+                    self._set_agent_profile_status(
+                        model_id,
+                        model_name,
+                        "Kandidát čaká na finálny výber",
+                        is_working=False,
+                    )
+            elif entry_status in {"timeout", "error", "parse_error", "invalid"}:
+                self._set_agent_profile_status(
+                    model_id,
+                    model_name,
+                    f"Ukončené: {entry_status}",
+                    is_working=False,
+                )
 
         # Store the winning model name for status messages
         # Find the best valid result
@@ -4868,6 +5300,21 @@ class MainWindow(QMainWindow):
             self._current_ai_model_id = winner.get("model")
             winner_word = ", ".join(winner.get("words", []))
             winner_score = winner.get("score", 0)
+            winner_id = str(winner.get("model") or winner.get("id") or "").strip()
+            self._append_agent_profile_activity(
+                winner_id,
+                str(self._current_ai_model),
+                f"Víťaz návrhov: {winner_word} ({winner_score} b)",
+                prefix="🏆",
+                color="#8ef0a7",
+                section="judge",
+            )
+            self._set_agent_profile_status(
+                winner_id,
+                str(self._current_ai_model),
+                "Víťaz návrhov",
+                is_working=False,
+            )
             if self.chat_dialog:
                 self.chat_dialog.add_agent_activity(
                     f"🏆 Víťaz návrhov: {self._current_ai_model} -> {winner_word} ({winner_score} b)",
@@ -4883,6 +5330,21 @@ class MainWindow(QMainWindow):
                 fallback = all_sorted[0]
                 self._current_ai_model = fallback.get("model_name", "AI")
                 self._current_ai_model_id = fallback.get("model")
+                fallback_id = str(fallback.get("model") or fallback.get("id") or "").strip()
+                self._append_agent_profile_activity(
+                    fallback_id,
+                    str(self._current_ai_model),
+                    "Žiadny model nedal judge-valid návrh, používam najlepší dostupný kandidát.",
+                    prefix="⚠️",
+                    color="#ffcc80",
+                    section="judge",
+                )
+                self._set_agent_profile_status(
+                    fallback_id,
+                    str(self._current_ai_model),
+                    "Použitý fallback kandidát",
+                    is_working=False,
+                )
                 if self.chat_dialog:
                     self.chat_dialog.add_agent_activity(
                         f"⚠️ Žiadny model nedal judge-valid návrh, beriem najlepší dostupný: {self._current_ai_model}",
@@ -4892,6 +5354,23 @@ class MainWindow(QMainWindow):
             else:
                 self._current_ai_model = "AI"
                 self._current_ai_model_id = None
+                for model in self._active_turn_models:
+                    model_id = str(model.get("id") or "").strip()
+                    model_name = str(model.get("name") or model_id).strip() or model_id
+                    self._append_agent_profile_activity(
+                        model_id,
+                        model_name,
+                        "Žiadne návrhy od modelov.",
+                        prefix="❌",
+                        color="#ff9e9e",
+                        section="judge",
+                    )
+                    self._set_agent_profile_status(
+                        model_id,
+                        model_name,
+                        "Bez návrhu",
+                        is_working=False,
+                    )
                 if self.chat_dialog:
                     self.chat_dialog.add_agent_activity(
                         "❌ Žiadne návrhy od modelov.",
@@ -4901,6 +5380,7 @@ class MainWindow(QMainWindow):
 
     def _reset_model_attempt_tracking(self) -> None:
         self._model_attempt_tracking = {}
+        self._profile_last_attempts_preview = {}
 
     @staticmethod
     def _is_resource_exhausted_error(error_text: str) -> bool:
@@ -5263,7 +5743,7 @@ class MainWindow(QMainWindow):
                 "model": model_id,
                 "model_name": model_name,
                 "status": "timeout",
-                "error": f"Timeout during generation ({timeout_seconds}s)",
+                "error": "Timeout",
                 "score": -1,
                 "words": [],
             }
@@ -5280,11 +5760,13 @@ class MainWindow(QMainWindow):
                 "model": model_id,
                 "model_name": model_name,
                 "status": "timeout",
-                "error": f"Timeout during generation ({timeout_seconds}s)",
+                "error": "Timeout",
                 "score": -1,
                 "words": [],
             }
-            self.model_results_table.update_result(payload)
+            self.model_results_table.update_result(
+                self._merge_attempt_summary_into_result(payload)
+            )
 
     def _disable_model_after_error(
         self,
@@ -6141,7 +6623,25 @@ class MainWindow(QMainWindow):
                 best_by_words[word_key] = (score, order_idx, tracked_at)
 
         if not best_by_words:
-            return {}
+            validated_only = [
+                word
+                for word in validation_order
+                if word in validated_words and word not in invalid_words
+            ]
+            if not validated_only:
+                return {}
+            preview = [word.lower() for word in validated_only[:8]]
+            attempts_text = ", ".join(preview)
+            return {
+                "attempts_display": attempts_text,
+                "attempts_html": html.escape(attempts_text),
+                "attempts_count": len(validated_only),
+                "best_attempt_score": None,
+                "first_attempt_seconds": self._elapsed_from_turn_start(
+                    self._coerce_float(validated_word_times.get(validated_only[0]))
+                ),
+                "best_attempt_seconds": None,
+            }
 
         ordered = sorted(
             best_by_words.items(),
@@ -6191,12 +6691,14 @@ class MainWindow(QMainWindow):
     
     def _update_table_for_judging(self, words: list[str]) -> None:
         """Update table to highlight which words are being judged."""
+        model_id = str(getattr(self, "_current_ai_model_id", "") or "").strip()
         model_name = str(getattr(self, "_current_ai_model", "") or "").strip() or "AI"
         if model_name == "AI":
             resolved_id, resolved_name = self._resolve_attempt_target_model()
             if resolved_id:
                 self._current_ai_model_id = resolved_id
                 self._current_ai_model = resolved_name
+                model_id = resolved_id
                 model_name = resolved_name
         log.info("Judge validating words %s from model %s", words, model_name)
         
@@ -6204,6 +6706,21 @@ class MainWindow(QMainWindow):
         words_str = ", ".join(words)
         judge_status = f"Rozhodca validuje: {words_str} (navrhol {model_name})"
         self.status.showMessage(judge_status)
+        if model_id:
+            self._append_agent_profile_activity(
+                model_id,
+                model_name,
+                f"Rozhodca validuje slová: {words_str}",
+                prefix="⚖️",
+                color="#9ec8ff",
+                section="judge",
+            )
+            self._set_agent_profile_status(
+                model_id,
+                model_name,
+                "Rozhodca overuje slová...",
+                is_working=True,
+            )
 
     def _validate_ai_move(self, proposal: dict[str, Any]) -> Optional[str]:
         # zakladna validacia schema a rack
@@ -6294,6 +6811,14 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         log.info("AI navrhla: %s", proposal)
+        profile_model_id, profile_model_name = self._resolve_profile_target_model()
+        if profile_model_id:
+            self._set_agent_profile_status(
+                profile_model_id,
+                profile_model_name,
+                "Model odovzdal návrh, validujem ťah...",
+                is_working=True,
+            )
         proposal = self._prefer_best_tracked_move(proposal)
         usage = proposal.get("_usage")
         if usage:
@@ -6336,6 +6861,21 @@ class MainWindow(QMainWindow):
         if err is not None:
             model_name = getattr(self, '_current_ai_model', "AI")
             log.warning("AI navrhol neplatný ťah: %s", err)
+            if profile_model_id:
+                self._append_agent_profile_activity(
+                    profile_model_id,
+                    profile_model_name,
+                    f"Návrh ťahu bol zamietnutý validáciou: {err}",
+                    prefix="❌",
+                    color="#ff9e9e",
+                    section="judge",
+                )
+                self._set_agent_profile_status(
+                    profile_model_id,
+                    profile_model_name,
+                    "Neplatný návrh, prepínam na exchange",
+                    is_working=False,
+                )
             self._apply_ai_exchange_turn(
                 reason=f"invalid_move:{err}",
                 requested_exchange=None,
@@ -6414,6 +6954,21 @@ class MainWindow(QMainWindow):
         words = [wf.word for wf in words_found]
         log.info("AI slová na overenie: %s", words)
         self._track_single_model_candidate_words(words, max_new=12)
+        if profile_model_id and words:
+            self._append_agent_profile_activity(
+                profile_model_id,
+                profile_model_name,
+                "Slová na overenie: " + ", ".join(words),
+                prefix="📤",
+                color="#9ec8ff",
+                section="word_validation",
+            )
+            self._set_agent_profile_status(
+                profile_model_id,
+                profile_model_name,
+                "Čakám na rozhodcu (judge)...",
+                is_working=True,
+            )
         if self.chat_dialog and words:
             self.chat_dialog.add_agent_activity(
                 f"📤 AI navrhla slová na overenie: {', '.join(words)}",
@@ -6486,6 +7041,21 @@ class MainWindow(QMainWindow):
             self.board.clear_letters(ps2)
             self._refresh_board_view()
             log.warning("AI vytvorila neplatné lepené slovo: main=%s anchor=%s", main_word, anchor)
+            if profile_model_id:
+                self._append_agent_profile_activity(
+                    profile_model_id,
+                    profile_model_name,
+                    f"Návrh odmietnutý: neplatné lepené slovo '{main_word}'.",
+                    prefix="❌",
+                    color="#ff9e9e",
+                    section="judge",
+                )
+                self._set_agent_profile_status(
+                    profile_model_id,
+                    profile_model_name,
+                    "Neplatné slovo, prepínam na exchange",
+                    is_working=False,
+                )
             self._apply_ai_exchange_turn(
                 reason=f"invalid_glued_word:{main_word}",
                 requested_exchange=None,
@@ -6576,6 +7146,35 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         log.exception("AI navrh zlyhal: %s", e)
+        active_models = list(self._active_turn_models)
+        if not active_models:
+            model_id, model_name = self._resolve_profile_target_model()
+            if model_id:
+                active_models = [{"id": model_id, "name": model_name}]
+        for model in active_models:
+            model_id = str(model.get("id") or "").strip()
+            model_name = str(model.get("name") or model_id).strip() or model_id
+            if not model_id:
+                continue
+            self._append_agent_profile_activity(
+                model_id,
+                model_name,
+                f"AI worker zlyhal: {e}",
+                prefix="❌",
+                color="#ff9e9e",
+                section="judge",
+            )
+            self._set_agent_profile_status(
+                model_id,
+                model_name,
+                "Zlyhanie workeru",
+                is_working=False,
+            )
+            self._set_agent_profile_response(
+                model_id,
+                model_name,
+                f"Chyba workeru:\n{e}",
+            )
         try:
             self.chat_dialog.add_error_message(f"AI chyba: {e}")
         except Exception:
@@ -6592,6 +7191,7 @@ class MainWindow(QMainWindow):
             return
         self._stop_status_spinner("judge")
         self._stop_status_spinner("ai")
+        profile_model_id, profile_model_name = self._resolve_profile_target_model()
         all_valid, entries = self._analyze_judge_response(resp)
         if not all_valid:
             # guided retry ak ešte neprebehol
@@ -6615,6 +7215,22 @@ class MainWindow(QMainWindow):
                     summary_word,
                     summary_reason,
                 )
+                if profile_model_id:
+                    reason_text_profile = summary_reason or "neplatné slovo podľa rozhodcu"
+                    self._append_agent_profile_activity(
+                        profile_model_id,
+                        profile_model_name,
+                        f"Rozhodca zamietol ťah ({summary_word}): {reason_text_profile}",
+                        prefix="⚖️",
+                        color="#ff9e9e",
+                        section="judge",
+                    )
+                    self._set_agent_profile_status(
+                        profile_model_id,
+                        profile_model_name,
+                        "Judge reject, prepínam na exchange",
+                        is_working=False,
+                    )
                 if self.chat_dialog:
                     reason_text = summary_reason or "neplatné slovo podľa rozhodcu"
                     self.chat_dialog.add_agent_activity(
@@ -6677,6 +7293,26 @@ class MainWindow(QMainWindow):
             self.model_results_table.update_result(
                 self._merge_attempt_summary_into_result(update_payload)
             )
+            words_text = ", ".join(judged_words) if judged_words else "?"
+            self._append_agent_profile_activity(
+                str(model_row_id),
+                str(self._current_ai_model),
+                f"Rozhodca potvrdil ťah: {words_text} ({total} b)",
+                prefix="⚖️",
+                color="#8ef0a7",
+                section="judge",
+            )
+            self._set_agent_profile_status(
+                str(model_row_id),
+                str(self._current_ai_model),
+                f"Ťah potvrdený ({total} b)",
+                is_working=False,
+            )
+            self._set_agent_profile_response(
+                str(model_row_id),
+                str(self._current_ai_model),
+                f"Validované slová: {words_text}\nBody: {total}\nDôvod: {reason_text or '-'}",
+            )
 
         self.ai_score += total
         if self.chat_dialog:
@@ -6706,6 +7342,7 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         self._update_scores_label()
+        self._set_all_agent_profile_racks(self.ai_rack)
         self._ai_thinking = False
         self._update_mode_timeout_indicator()
         self._enable_human_inputs()
@@ -6724,6 +7361,27 @@ class MainWindow(QMainWindow):
             log.debug("Ignoring AI judge failure during shutdown: %s", e)
             return
         log.exception("AI judge zlyhal: %s", e)
+        model_id, model_name = self._resolve_profile_target_model()
+        if model_id:
+            self._append_agent_profile_activity(
+                model_id,
+                model_name,
+                f"Judge zlyhal: {e}",
+                prefix="❌",
+                color="#ff9e9e",
+                section="judge",
+            )
+            self._set_agent_profile_status(
+                model_id,
+                model_name,
+                "Judge chyba, prepínam na exchange",
+                is_working=False,
+            )
+            self._set_agent_profile_response(
+                model_id,
+                model_name,
+                f"Chyba rozhodcu:\n{e}",
+            )
         self.board.clear_letters(getattr(self, "_ai_ps2", []))
         self._refresh_board_view()
         self._apply_ai_exchange_turn(
@@ -7063,20 +7721,365 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
     
-    def open_agents_dialog(self) -> None:
-        """Open agents activity dialog (non-modal)."""
-        if self.agents_dialog is None:
-            self.agents_dialog = AgentsDialog(parent=self)
-        
-        self.agents_dialog.show()
-        self.agents_dialog.raise_()
-        self.agents_dialog.activateWindow()
-    
+    @staticmethod
+    def _normalize_profile_model_id(model_id: str) -> str:
+        raw = str(model_id or "").strip()
+        if not raw:
+            return ""
+        lowered = raw.lower()
+        for prefix in ("openai:", "google:", "lmstudio:", "openrouter:", "novita:", "agent:"):
+            if lowered.startswith(prefix):
+                trimmed = raw[len(prefix):].strip()
+                return trimmed or raw
+        return raw
+
+    def _profile_tab_key(self, model_id: str, model_name: str | None = None) -> str:
+        normalized = self._normalize_profile_model_id(model_id)
+        if not normalized:
+            normalized = self._normalize_profile_model_id(model_name or "")
+        return f"profile:{normalized or 'unknown'}"
+
+    def _profile_tab_label(self, model_id: str, model_name: str | None = None) -> str:
+        label = str(model_name or "").strip()
+        if label:
+            return label
+        normalized = self._normalize_profile_model_id(model_id)
+        return normalized or "AI model"
+
+    def _iter_profile_models(self) -> list[tuple[str, str]]:
+        models: list[tuple[str, str]] = []
+        seen: set[str] = set()
+
+        def _push(model_id: str, model_name: str) -> None:
+            model_key = str(model_id or "").strip()
+            if not model_key:
+                return
+            tab_key = self._profile_tab_key(model_key, model_name)
+            if tab_key in seen:
+                return
+            seen.add(tab_key)
+            models.append((model_key, self._profile_tab_label(model_key, model_name)))
+
+        use_active_models = bool(self._active_turn_models) and bool(
+            self._ai_waiting_worker or self._ai_thinking
+        )
+        if use_active_models:
+            for model in self._active_turn_models:
+                _push(str(model.get("id") or ""), str(model.get("name") or ""))
+        else:
+            for entry in self._build_model_preview_entries():
+                _push(
+                    str(entry.get("model") or ""),
+                    str(entry.get("model_name") or ""),
+                )
+
+        current_id = str(getattr(self, "_current_ai_model_id", "") or "").strip()
+        current_name = str(getattr(self, "_current_ai_model", "") or "").strip()
+        if current_id:
+            _push(current_id, current_name)
+
+        return models
+
+    def _sync_agent_profile_tabs(self, dialog: AgentsDialog | None = None) -> None:
+        target = dialog or self.agents_dialog
+        if target is None:
+            return
+
+        expected_tabs: set[str] = set()
+        for model_id, model_name in self._iter_profile_models():
+            tab_key = self._profile_tab_key(model_id, model_name)
+            expected_tabs.add(tab_key)
+            widget = target.get_or_create_agent_tab(tab_key, model_name)
+            if not widget.activity_log.toPlainText().strip():
+                widget.set_status("Pripravený", is_working=False)
+            widget.set_ai_rack(self.ai_rack)
+
+        for tab_key in list(target.agent_tabs.keys()):
+            if not tab_key.startswith("profile:"):
+                continue
+            if tab_key in expected_tabs:
+                continue
+            target.remove_agent_tab(tab_key)
+
     def get_agents_dialog(self) -> AgentsDialog:
         """Get or create agents dialog instance."""
         if self.agents_dialog is None:
             self.agents_dialog = AgentsDialog(parent=self)
         return self.agents_dialog
+
+    def _get_agent_profile_widget(
+        self,
+        model_id: str,
+        model_name: str | None = None,
+    ) -> AgentActivityWidget:
+        dialog = self.get_agents_dialog()
+        tab_key = self._profile_tab_key(model_id, model_name)
+        tab_label = self._profile_tab_label(model_id, model_name)
+        return dialog.get_or_create_agent_tab(tab_key, tab_label)
+
+    def _append_agent_profile_activity(
+        self,
+        model_id: str,
+        model_name: str | None,
+        message: str,
+        *,
+        prefix: str = "ℹ️",
+        color: str | None = None,
+        section: str = "auto",
+    ) -> None:
+        if not message:
+            return
+        try:
+            widget = self._get_agent_profile_widget(model_id, model_name)
+            widget.append_activity(
+                message,
+                prefix=prefix,
+                color=color,
+                section=section,
+            )
+        except Exception:
+            log.debug("Agent profile activity append skipped for %s", model_id)
+
+    def _set_agent_profile_status(
+        self,
+        model_id: str,
+        model_name: str | None,
+        status: str,
+        *,
+        is_working: bool,
+    ) -> None:
+        try:
+            widget = self._get_agent_profile_widget(model_id, model_name)
+            widget.set_status(status, is_working=is_working)
+        except Exception:
+            log.debug("Agent profile status update skipped for %s", model_id)
+
+    def _set_agent_profile_response(
+        self,
+        model_id: str,
+        model_name: str | None,
+        response: str,
+    ) -> None:
+        if not response:
+            return
+        try:
+            widget = self._get_agent_profile_widget(model_id, model_name)
+            widget.set_response(response)
+        except Exception:
+            log.debug("Agent profile response update skipped for %s", model_id)
+
+    def _set_agent_profile_rack(
+        self,
+        model_id: str,
+        model_name: str | None,
+        letters: list[str],
+    ) -> None:
+        try:
+            widget = self._get_agent_profile_widget(model_id, model_name)
+            widget.set_ai_rack(letters)
+        except Exception:
+            log.debug("Agent profile rack update skipped for %s", model_id)
+
+    def _set_all_agent_profile_racks(self, letters: list[str]) -> None:
+        for model_id, model_name in self._iter_profile_models():
+            self._set_agent_profile_rack(model_id, model_name, letters)
+
+    def _emit_attempt_summary_activity(
+        self,
+        model_id: str,
+        model_name: str | None,
+        *,
+        force: bool = False,
+    ) -> None:
+        summary = self._build_attempt_summary(model_id)
+        preview = str(summary.get("attempts_display") or "").strip()
+        if not preview:
+            return
+
+        compact_preview = preview if len(preview) <= 150 else f"{preview[:147]}..."
+        previous = self._profile_last_attempts_preview.get(model_id, "")
+        if not force and compact_preview == previous:
+            return
+
+        self._profile_last_attempts_preview[model_id] = compact_preview
+        attempts_count = self._coerce_int(summary.get("attempts_count"))
+        best_score = self._coerce_int(summary.get("best_attempt_score"))
+        meta_parts: list[str] = []
+        if attempts_count is not None and attempts_count > 0:
+            meta_parts.append(f"pokusy={attempts_count}")
+        if best_score is not None and best_score >= 0:
+            meta_parts.append(f"top={best_score} b")
+        label = "Priebežné kandidáty"
+        if meta_parts:
+            label = f"{label} ({', '.join(meta_parts)})"
+        self._append_agent_profile_activity(
+            model_id,
+            model_name,
+            f"{label}: {compact_preview}",
+            prefix="🧠",
+            color="#9ec8ff",
+            section="tool_calls",
+        )
+
+    @staticmethod
+    def _format_retry_note(result: dict[str, Any]) -> str:
+        error_msg = str(result.get("error") or "").strip()
+        lowered = error_msg.lower()
+
+        if "exchange/pass too early" in lowered:
+            base = "Model skúša znova: musí nájsť slovný ťah (nie exchange/pass)."
+        elif "required tool workflow missing" in lowered:
+            base = "Model nedodržal povinný tool workflow, opakujem pokus."
+        elif "previous response failed parsing/structure checks" in lowered:
+            base = "Predošlý pokus mal neplatný JSON formát, model ho opravuje."
+        elif "previous move was invalid by rules/dictionary" in lowered:
+            base = "Predošlý pokus bol neplatný podľa pravidiel/slovníka, hľadám ďalší."
+        elif "timeout during generation" in lowered or "openai round timeout" in lowered:
+            base = "Kolo vypršalo, model pokračuje v hľadaní."
+        elif error_msg:
+            base = error_msg
+        else:
+            base = "Model skúša nový variant ťahu."
+
+        attempt = MainWindow._coerce_int(result.get("attempt"))
+        max_attempts = MainWindow._coerce_int(result.get("max_attempts"))
+        remaining = MainWindow._coerce_int(result.get("remaining"))
+        suffix_parts: list[str] = []
+        if attempt is not None and max_attempts is not None and max_attempts > 0:
+            suffix_parts.append(f"pokus {attempt}/{max_attempts}")
+        if remaining is not None and remaining >= 0:
+            suffix_parts.append(f"zostáva ~{remaining}s")
+        if suffix_parts:
+            base = f"{base} ({', '.join(suffix_parts)})"
+
+        if len(base) > 190:
+            return base[:187] + "..."
+        return base
+
+    def _extract_words_from_move_for_profile(self, move: dict[str, Any]) -> list[str]:
+        placements_obj = move.get("placements")
+        if not isinstance(placements_obj, list) or not placements_obj:
+            word = self._normalize_attempt_word(move.get("word"))
+            return [word] if word else []
+
+        placements = self._placements_from_tool_args(placements_obj)
+        if not placements:
+            word = self._normalize_attempt_word(move.get("word"))
+            return [word] if word else []
+
+        placements, normalize_err = self._normalize_new_placements(placements)
+        if normalize_err is not None:
+            word = self._normalize_attempt_word(move.get("word"))
+            return [word] if word else []
+
+        board_snapshot = deepcopy(self.board)
+        board_snapshot.place_letters(placements)
+        words_found = extract_all_words(board_snapshot, placements)
+        words: list[str] = []
+        for item in words_found:
+            word = self._normalize_attempt_word(getattr(item, "word", ""))
+            if word:
+                words.append(word)
+        if words:
+            return words
+        fallback_word = self._normalize_attempt_word(move.get("word"))
+        return [fallback_word] if fallback_word else []
+
+    def _format_tool_call_preview(self, tool_name: str, tool_args: dict[str, Any]) -> str:
+        lower = tool_name.lower()
+        if lower in {"get_board_state", "get_premium_squares", "get_tile_values"}:
+            return f"{tool_name}()"
+        if lower in {"validate_word_slovak", "validate_word_english"}:
+            word = str(tool_args.get("word") or "?").strip().upper() or "?"
+            return f"{tool_name}(word='{word}')"
+        if lower == "validate_move_legality":
+            placements = tool_args.get("placements")
+            count = len(placements) if isinstance(placements, list) else 0
+            return f"{tool_name}(placements={count})"
+        if lower in {"calculate_move_score", "scoring_score_words"}:
+            words_payload = tool_args.get("words")
+            words = self._extract_words_from_tool_payload(words_payload)
+            words_text = ", ".join(words[:3]) if words else "?"
+            return f"{tool_name}(words={words_text})"
+        args_text = self._format_profile_payload(tool_args, max_len=120)
+        return f"{tool_name}({args_text})" if args_text else tool_name
+
+    def _format_tool_result_preview(
+        self,
+        tool_name: str,
+        result_data: dict[str, Any],
+        tool_args: dict[str, Any],
+    ) -> str:
+        lower = tool_name.lower()
+        if lower == "get_board_state":
+            grid = result_data.get("grid")
+            blanks = result_data.get("blanks")
+            occupied = 0
+            if isinstance(grid, list):
+                for row in grid:
+                    if isinstance(row, str):
+                        occupied += sum(1 for ch in row if ch != ".")
+            blank_count = len(blanks) if isinstance(blanks, list) else 0
+            return f"doska: obsadené polia={occupied}, jokery={blank_count}"
+        if lower == "get_premium_squares":
+            premiums = result_data.get("premiums")
+            count = len(premiums) if isinstance(premiums, list) else 0
+            return f"prémiové polia: {count}"
+        if lower == "get_tile_values":
+            values = result_data.get("values")
+            count = len(values) if isinstance(values, dict) else 0
+            variant = str(result_data.get("variant") or "?")
+            return f"hodnoty písmen: variant={variant}, položiek={count}"
+        if lower == "validate_move_legality":
+            valid = bool(result_data.get("valid"))
+            reason = str(result_data.get("reason") or "").strip()
+            suffix = f" ({reason})" if reason else ""
+            return "legalita ťahu: validná" + suffix if valid else "legalita ťahu: neplatná" + suffix
+        if lower in {"calculate_move_score", "scoring_score_words"}:
+            words_payload = result_data.get("words")
+            if not isinstance(words_payload, list):
+                words_payload = tool_args.get("words")
+            words = self._extract_words_from_tool_payload(words_payload)
+            total_score = self._coerce_int(result_data.get("total_score"))
+            words_text = ", ".join(words[:3]) if words else "?"
+            score_text = f"{total_score} b" if total_score is not None else "?"
+            return f"scoring: {words_text} -> {score_text}"
+        summary = self._format_profile_payload(result_data, max_len=140)
+        return summary or "hotovo"
+
+    @staticmethod
+    def _format_profile_payload(payload: Any, *, max_len: int = 240) -> str:
+        if payload is None:
+            return ""
+        try:
+            text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        except Exception:
+            text = str(payload)
+        text = text.replace("\n", " ").strip()
+        if len(text) <= max_len:
+            return text
+        return text[: max_len - 3] + "..."
+
+    def _resolve_profile_target_model(self) -> tuple[str, str]:
+        model_id = str(getattr(self, "_current_ai_model_id", "") or "").strip()
+        model_name = str(getattr(self, "_current_ai_model", "") or "").strip()
+        if model_id:
+            if not model_name or model_name == "AI":
+                model_name = self._lookup_active_model_name(model_id)
+            return model_id, model_name or model_id
+
+        resolved_id, resolved_name = self._resolve_attempt_target_model()
+        if resolved_id:
+            return resolved_id, resolved_name or resolved_id
+        return "", model_name or "AI"
+
+    def open_agents_dialog(self) -> None:
+        """Open agents activity dialog (non-modal)."""
+        dialog = self.get_agents_dialog()
+        self._sync_agent_profile_tabs(dialog)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
     
     def open_chat_dialog(self) -> None:
         """Otvorí chat dialog s AI protihráčom (non-modal).
@@ -7105,7 +8108,7 @@ class MainWindow(QMainWindow):
         )
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
-        """Open chat when user clicks status bar."""
+        """Open agents profiling when user clicks status bar."""
         if watched is self.status and event.type() == QEvent.Type.MouseButtonPress:
             mouse_event = cast(QMouseEvent, event)
             self._on_statusbar_click(mouse_event)
@@ -7113,31 +8116,30 @@ class MainWindow(QMainWindow):
         return super().eventFilter(watched, event)
     
     def _on_statusbar_click(self, event: QMouseEvent) -> None:
-        """Handler pre kliknutie na statusbar - otvorí chat dialog.
-        
-        Komentár (SK): Statusbar slúži ako rýchly prístup k chat dialogu.
-        Kliknutím kdekoľvek na statusbar sa otvorí chat s AI.
-        """
-        self.open_chat_dialog()
-        log.debug("Statusbar clicked, opening chat dialog")
+        """Handler pre kliknutie na statusbar - otvorí okno Agenti."""
+        del event
+        self.open_agents_dialog()
+        log.debug("Statusbar clicked, opening agents dialog")
 
     def _on_agent_row_clicked(self, model_id: str, model_name: str) -> None:
-        """Klik na LMStudio row v tabuľke modelov - otvorí profiling/chat."""
-        self.selected_agent_name = model_name
-        self.opponent_mode = OpponentMode.LMSTUDIO
-        self._update_mode_status_label()
+        """Klik na riadok modelu otvorí profil agenta v okne Agenti."""
         try:
-            self.chat_dialog.setWindowTitle(f"LMStudio Chat – {model_name}")
+            dialog = self.get_agents_dialog()
+            self._sync_agent_profile_tabs(dialog)
+            tab_key = self._profile_tab_key(model_id, model_name)
+            tab_label = self._profile_tab_label(model_id, model_name)
+            dialog.show_agent_tab(tab_key, tab_label)
+            self._set_agent_profile_rack(model_id, model_name, self.ai_rack)
+            self._append_agent_profile_activity(
+                model_id,
+                model_name,
+                "Riadok modelu otvorený z tabuľky výsledkov.",
+                prefix="🖱️",
+                color="#9ec8ff",
+                section="tool_calls",
+            )
         except Exception:
-            pass
-        # Otvor Agents dialog a prepni na daného agenta
-        try:
-            agents_dialog = self.get_agents_dialog()
-            widget = agents_dialog.show_agent_tab(model_name, model_name)
-            widget.append_status("Používam lokálne Scrabble nástroje")
-        except Exception:
-            log.exception("Nepodarilo sa zobraziť Agents dialog pre agenta %s", model_name)
-        self.open_chat_dialog()
+            log.exception("Nepodarilo sa otvoriť profiling pre model %s", model_name or model_id)
 
     def _on_status_message_changed(self, message: str) -> None:
         """Mirror dôležité status správy do chatu (pre kontext LLM)."""
@@ -7214,6 +8216,35 @@ class MainWindow(QMainWindow):
             "AI turn hard-timeout reached at %ss, forcing best tracked candidate",
             timeout_seconds,
         )
+        active_models = list(self._active_turn_models)
+        if not active_models:
+            model_id, model_name = self._resolve_profile_target_model()
+            if model_id:
+                active_models = [{"id": model_id, "name": model_name}]
+        for model in active_models:
+            model_id = str(model.get("id") or "").strip()
+            model_name = str(model.get("name") or model_id).strip() or model_id
+            if not model_id:
+                continue
+            self._append_agent_profile_activity(
+                model_id,
+                model_name,
+                f"Timeout {timeout_seconds}s vypršal, finalizujem najlepší dostupný pokus.",
+                prefix="⏱",
+                color="#ffcc80",
+                section="judge",
+            )
+            self._set_agent_profile_status(
+                model_id,
+                model_name,
+                "Timeout - fallback finalizácia",
+                is_working=False,
+            )
+            self._emit_attempt_summary_activity(
+                model_id,
+                model_name,
+                force=True,
+            )
         try:
             if self.chat_dialog:
                 self.chat_dialog.add_agent_activity(
@@ -7262,9 +8293,6 @@ class MainWindow(QMainWindow):
         if not self._ai_waiting_worker:
             return
         try:
-            if not self.chat_dialog:
-                return
-
             raw = (message or "").strip()
             if not raw:
                 return
@@ -7276,7 +8304,19 @@ class MainWindow(QMainWindow):
                 "on",
             }
             if verbose:
-                self.chat_dialog.add_debug_message(raw)
+                if self.chat_dialog:
+                    self.chat_dialog.add_debug_message(raw)
+                active_models = list(self._active_turn_models)
+                if len(active_models) == 1:
+                    model = active_models[0]
+                    self._append_agent_profile_activity(
+                        str(model.get("id") or ""),
+                        str(model.get("name") or ""),
+                        raw,
+                        prefix="🧪",
+                        color="#9ec8ff",
+                        section="tool_calls",
+                    )
                 return
 
             first_line = raw.splitlines()[0].strip()
@@ -7290,7 +8330,39 @@ class MainWindow(QMainWindow):
                 return
             if len(first_line) > 220:
                 first_line = first_line[:220] + "..."
-            self.chat_dialog.add_agent_activity(f"ℹ️ {first_line}", section="planning")
+            targets: list[dict[str, str]] = []
+            first_line_lower = first_line.lower()
+            for model in self._active_turn_models:
+                model_id = str(model.get("id") or "").strip()
+                model_name = str(model.get("name") or model_id).strip() or model_id
+                if not model_id:
+                    continue
+                if model_id.lower() in first_line_lower or model_name.lower() in first_line_lower:
+                    targets.append({"id": model_id, "name": model_name})
+            if not targets and len(self._active_turn_models) == 1:
+                model = self._active_turn_models[0]
+                targets.append(
+                    {
+                        "id": str(model.get("id") or "").strip(),
+                        "name": str(model.get("name") or "").strip(),
+                    }
+                )
+            if not targets:
+                model_id, model_name = self._resolve_profile_target_model()
+                if model_id:
+                    targets.append({"id": model_id, "name": model_name})
+
+            for target in targets:
+                self._append_agent_profile_activity(
+                    target["id"],
+                    target["name"],
+                    first_line,
+                    prefix="ℹ️",
+                    color="#9ec8ff",
+                    section="tool_calls",
+                )
+            if self.chat_dialog:
+                self.chat_dialog.add_agent_activity(f"ℹ️ {first_line}", section="planning")
         except Exception:
             log.debug("Debug log to chat skipped")
     
