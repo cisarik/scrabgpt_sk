@@ -42,7 +42,6 @@ from PySide6.QtGui import (
     QMouseEvent,
     QPaintEvent,
     QIntValidator,
-    QTextCursor,
     QPixmap,
     QDrag,
     QLinearGradient,
@@ -53,13 +52,13 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QToolBar, QLabel, QSplitter, QStatusBar, QMessageBox, QPushButton,
     QDialog, QFormLayout, QLineEdit, QDialogButtonBox, QListWidget, QListWidgetItem,
-    QGridLayout, QGraphicsDropShadowEffect, QListView, QPlainTextEdit, QCheckBox,
+    QGridLayout, QGraphicsDropShadowEffect, QListView, QCheckBox,
     QComboBox, QSizePolicy, QStyleOptionViewItem, QStyledItemDelegate, QStyle, QButtonGroup,
     QFrame,
     QAbstractButton,
     QTextEdit,
 )
-from ..logging_setup import configure_logging, TRACE_ID_VAR, default_log_path
+from ..logging_setup import configure_logging, TRACE_ID_VAR
 
 from ..core.board import Board
 from ..core.assets import get_premiums_path
@@ -74,7 +73,7 @@ from ..core.rules import placements_in_line
 from ..core.rules import first_move_must_cover_center, connected_to_existing, no_gaps_in_line, extract_all_words
 from ..core.scoring import score_words, apply_premium_consumption
 from ..core.types import Placement, Premium
-from ..ai.client import OpenAIClient
+from ..ai.client import OpenAIClient, JudgeBatchResponse
 from ..ai.player import (
     propose_move as ai_propose_move,
     should_auto_trigger_ai_opening,
@@ -143,7 +142,6 @@ ASSETS = str(Path(__file__).parent / ".." / "assets")
 PREMIUMS_PATH = get_premiums_path()
 ROOT_DIR = Path(__file__).resolve().parents[2]
 ENV_PATH = str(ROOT_DIR / ".env")
-LOG_PATH = default_log_path()
 EUR_PER_TOKEN = 0.00000186  # 1 token ≈ 0.00000186 EUR (zadané majiteľom)
 
 DEFAULT_AI_MOVE_TIMEOUT = 120
@@ -646,80 +644,6 @@ class SettingsDialog(QDialog):
                 # aj pri zlyhaní zápisu do .env necháme aspoň runtime hodnotu
                 os.environ["SCRABBLE_VARIANT"] = slug_data
         super().accept()
-
-
-class LogViewerDialog(QDialog):
-    """Jednoduchý prehliadač logu s hľadaním.
-
-    Zobrazí posledných N riadkov zo `scrabgpt.log`. Text je len na čítanie.
-    """
-    def __init__(self, parent: QWidget | None = None, max_lines: int = 500) -> None:
-        super().__init__(parent)
-        self.setWindowTitle("Log — posledné záznamy")
-        self.resize(900, 600)
-        lay = QVBoxLayout(self)
-        # vyhľadávanie
-        search_row = QHBoxLayout()
-        self.search_edit = QLineEdit(self)
-        self.search_edit.setPlaceholderText("Hľadať…")
-        self.search_edit.returnPressed.connect(self._find_next)
-        self.find_btn = QPushButton("Hľadať")
-        self.find_btn.clicked.connect(self._find_next)
-        search_row.addWidget(self.search_edit)
-        search_row.addWidget(self.find_btn)
-        search_w = QWidget(self)
-        search_w.setLayout(search_row)
-        lay.addWidget(search_w)
-
-        self.text = QPlainTextEdit(self)
-        self.text.setReadOnly(True)
-        lay.addWidget(self.text)
-
-        # načítaj obsah
-        self._load_tail(LOG_PATH, max_lines)
-
-        close_btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
-        close_btns.rejected.connect(self.reject)
-        close_btns.accepted.connect(self.accept)
-        lay.addWidget(close_btns)
-
-        self._last_find_pos: int = 0
-
-    def _load_tail(self, path: str, max_lines: int) -> None:
-        try:
-            from pathlib import Path as _Path
-            with _Path(path).open(encoding="utf-8", errors="replace") as f:
-                lines = f.readlines()
-            tail = "".join(lines[-max_lines:])
-        except Exception:
-            tail = "(Žiadne logy alebo súbor neexistuje.)"
-        self.text.setPlainText(tail)
-        # scroll na koniec
-        # posun kurzor na koniec dokumentu
-        try:
-            self.text.moveCursor(QTextCursor.MoveOperation.End)
-        except Exception:
-            # kompatibilita, ak by sa API lisilo
-            cursor = self.text.textCursor()
-            self.text.setTextCursor(cursor)
-
-    def _find_next(self) -> None:
-        term = self.search_edit.text().strip()
-        if not term:
-            return
-        doc = self.text.document()
-        # vyhľadávanie od poslednej pozície
-        pos = self._last_find_pos
-        found = doc.find(term, pos)
-        if not found.isNull():
-            self.text.setTextCursor(found)
-            self._last_find_pos = found.position()
-        else:
-            # od začiatku
-            found2 = doc.find(term, 0)
-            if not found2.isNull():
-                self.text.setTextCursor(found2)
-                self._last_find_pos = found2.position()
 
 
 class BoardView(QWidget):
@@ -1595,6 +1519,7 @@ class MainWindow(QMainWindow):
 
         # Opponent mode configuration
         self.opponent_mode = OpponentMode.BEST_MODEL
+        self.judge_provider = self._load_judge_provider()
         self.selected_agent_name: Optional[str] = None
         self.available_agents = discover_agents(get_default_agents_dir())
         self.game_in_progress = False
@@ -1684,10 +1609,6 @@ class MainWindow(QMainWindow):
         self.act_settings.triggered.connect(self.open_settings)
         self.toolbar.addAction(self.act_settings)
 
-        self.act_log = QAction("📜 Zobraziť log…", self)
-        self.act_log.triggered.connect(self.show_log)
-        self.toolbar.addAction(self.act_log)
-
         # Save/Load
         self.act_save = QAction("💾 Uložiť…", self)
         self.act_save.triggered.connect(self.save_game_dialog)
@@ -1695,10 +1616,6 @@ class MainWindow(QMainWindow):
         self.act_open = QAction("📂 Otvoriť…", self)
         self.act_open.triggered.connect(self.open_game_dialog)
         self.toolbar.addAction(self.act_open)
-
-        self.act_create_iq_test = QAction("🧠 Uložiť ako test", self)
-        self.act_create_iq_test.triggered.connect(self.create_iq_test)
-        self.toolbar.addAction(self.act_create_iq_test)
         
         # Add spacer to push following items to the right
         spacer = QWidget()
@@ -2164,6 +2081,259 @@ class MainWindow(QMainWindow):
         if value <= 0:
             return default, False
         return value, True
+
+    @staticmethod
+    def _load_judge_provider() -> OpponentMode:
+        raw = (os.getenv("JUDGE_PROVIDER") or "").strip()
+        if raw:
+            try:
+                resolved = OpponentMode.from_string(raw)
+                if resolved in {OpponentMode.GEMINI, OpponentMode.BEST_MODEL}:
+                    return resolved
+                log.warning(
+                    "Unsupported JUDGE_PROVIDER '%s' (allowed: gemini, best_model). Falling back to OpenAI.",
+                    raw,
+                )
+                return OpponentMode.BEST_MODEL
+            except ValueError:
+                log.warning("Invalid JUDGE_PROVIDER value '%s', falling back to OpenAI", raw)
+        return OpponentMode.BEST_MODEL
+
+    @staticmethod
+    def _extract_json_from_content(content: str) -> Any:
+        text = content.strip()
+        if not text:
+            raise ValueError("Model vrátil prázdny obsah.")
+
+        if text.startswith("```"):
+            lines = [
+                line
+                for line in text.splitlines()
+                if not line.strip().startswith("```")
+            ]
+            text = "\n".join(lines).strip()
+
+        candidates: list[str] = [text]
+        obj_start = text.find("{")
+        obj_end = text.rfind("}")
+        if obj_start >= 0 and obj_end > obj_start:
+            candidates.append(text[obj_start:obj_end + 1].strip())
+        arr_start = text.find("[")
+        arr_end = text.rfind("]")
+        if arr_start >= 0 and arr_end > arr_start:
+            candidates.append(text[arr_start:arr_end + 1].strip())
+
+        seen: set[str] = set()
+        for candidate in candidates:
+            if not candidate or candidate in seen:
+                continue
+            seen.add(candidate)
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+        raise ValueError("Model nevrátil validný JSON pre rozhodcu.")
+
+    def _resolve_judge_model_id(self, provider: OpponentMode) -> str:
+        if provider == OpponentMode.BEST_MODEL:
+            judge_openai_model = (os.getenv("JUDGE_OPENAI_MODEL") or "").strip()
+            if judge_openai_model:
+                return judge_openai_model
+            candidates = self._build_openai_model_candidates()
+            model_id = str(candidates[0].get("id") or "").strip() if candidates else ""
+            return model_id or "gpt-5.2"
+
+        if provider == OpponentMode.GEMINI:
+            judge_gemini_model = (os.getenv("JUDGE_GEMINI_MODEL") or "").strip()
+            if judge_gemini_model:
+                return judge_gemini_model
+            candidates = self._build_gemini_model_candidates()
+            model_id = str(candidates[0].get("id") or "").strip() if candidates else ""
+            if model_id:
+                return model_id
+            raise RuntimeError("Google/Gemini rozhodca nemá nakonfigurovaný model.")
+
+        if provider == OpponentMode.OPENROUTER:
+            selection = self.team_manager.load_provider_selection("openrouter")
+            model_ids = selection[0] if selection else []
+            if not model_ids:
+                model_ids = [
+                    str(model.get("id") or "").strip()
+                    for model in self.selected_ai_models
+                    if str(model.get("id") or "").strip()
+                ]
+            if model_ids:
+                return model_ids[0]
+            raise RuntimeError("OpenRouter rozhodca nemá nakonfigurovaný model.")
+
+        if provider == OpponentMode.NOVITA:
+            selection = self.team_manager.load_provider_selection("novita")
+            model_ids = selection[0] if selection else []
+            if not model_ids:
+                model_ids = [
+                    str(model.get("id") or "").strip()
+                    for model in self.selected_novita_models
+                    if str(model.get("id") or "").strip()
+                ]
+            if model_ids:
+                return model_ids[0]
+            raise RuntimeError("Novita rozhodca nemá nakonfigurovaný model.")
+
+        lmstudio_candidates = self._build_lmstudio_model_candidates()
+        model_id = str(lmstudio_candidates[0].get("id") or "").strip() if lmstudio_candidates else ""
+        if model_id:
+            return model_id
+        raise RuntimeError("LMStudio rozhodca nemá nakonfigurovaný model.")
+
+    def _judge_with_external_provider(
+        self,
+        *,
+        provider: OpponentMode,
+        words: list[str],
+        language: str,
+        max_output_tokens: int,
+    ) -> JudgeBatchResponse:
+        model_id = self._resolve_judge_model_id(provider)
+        timeout_seconds = max(5, int(self.ai_move_timeout_seconds))
+        capped_tokens = max(128, min(int(max_output_tokens), 20000))
+        prompt = OpenAIClient.build_judge_prompt(words, language)
+        schema_json = json.dumps(OpenAIClient.judge_schema(), ensure_ascii=False)
+        prompt_with_schema = (
+            f"{prompt}\n"
+            f"Return ONLY strict JSON matching this schema:\n{schema_json}\n"
+            "Do not include markdown or commentary."
+        )
+
+        async def run_provider_call() -> dict[str, Any]:
+            if provider == OpponentMode.GEMINI:
+                vertex_client = VertexClient(
+                    timeout_seconds=timeout_seconds,
+                    allow_model_fallback=False,
+                )
+                try:
+                    return await vertex_client.call_model(
+                        model_id,
+                        prompt=prompt_with_schema,
+                        max_tokens=capped_tokens,
+                        thinking_mode=False,
+                        tools=[],
+                        request_timeout_seconds=timeout_seconds,
+                    )
+                finally:
+                    await vertex_client.close()
+
+            api_key: str | None = None
+            base_url: str | None = None
+            default_headers: dict[str, str] | None = None
+            if provider == OpponentMode.OPENROUTER:
+                api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+                if not api_key:
+                    raise RuntimeError("OPENROUTER_API_KEY nie je nastavený.")
+                base_url = "https://openrouter.ai/api/v1"
+                default_headers = {
+                    "HTTP-Referer": "https://github.com/cisarik/scrabgpt_sk",
+                    "X-Title": "ScrabGPT SK",
+                }
+            elif provider == OpponentMode.NOVITA:
+                api_key = os.getenv("NOVITA_API_KEY", "").strip()
+                if not api_key:
+                    raise RuntimeError("NOVITA_API_KEY nie je nastavený.")
+                base_url = "https://api.novita.ai/openai"
+            elif provider == OpponentMode.LMSTUDIO:
+                base_url = (
+                    os.getenv("OPENAI_BASE_URL")
+                    or os.getenv("LLMSTUDIO_BASE_URL")
+                    or "http://127.0.0.1:1234/v1"
+                ).strip()
+            else:
+                raise RuntimeError(f"Nepodporovaný provider rozhodcu: {provider.value}")
+
+            tool_client = OpenAIToolClient(
+                api_key=api_key or None,
+                base_url=base_url,
+                timeout_seconds=timeout_seconds,
+                default_headers=default_headers,
+            )
+            try:
+                return await tool_client.call_model(
+                    model_id,
+                    prompt=prompt_with_schema,
+                    max_tokens=capped_tokens,
+                    tools=[],
+                    request_timeout_seconds=timeout_seconds,
+                    round_timeout_seconds=min(25, timeout_seconds),
+                )
+            finally:
+                await tool_client.close()
+
+        log.info(
+            "Judge provider=%s model=%s words=%s",
+            provider.value,
+            model_id,
+            words,
+        )
+        response = asyncio.run(run_provider_call())
+        if str(response.get("status") or "").lower() != "ok":
+            error_text = str(response.get("error") or "Neznáma chyba providera.")
+            raise RuntimeError(
+                f"Rozhodca provider {provider.display_name_sk} zlyhal: {error_text}"
+            )
+        raw_content = str(response.get("content") or "").strip()
+        if not raw_content:
+            raise RuntimeError(
+                f"Rozhodca provider {provider.display_name_sk} vrátil prázdnu odpoveď."
+            )
+        raw_payload = self._extract_json_from_content(raw_content)
+        normalized = OpenAIClient.normalize_judge_payload(raw_payload, words)
+        if words and not normalized.get("results"):
+            raise RuntimeError(
+                f"Rozhodca provider {provider.display_name_sk} vrátil neplatnú štruktúru."
+            )
+        return normalized
+
+    def _judge_words_with_selected_provider(
+        self,
+        words: list[str],
+        *,
+        language: str,
+    ) -> JudgeBatchResponse:
+        provider = getattr(self, "judge_provider", OpponentMode.BEST_MODEL)
+        if provider not in {OpponentMode.GEMINI, OpponentMode.BEST_MODEL}:
+            log.warning(
+                "Judge provider %s is not supported for fallback tier. Using OpenAI.",
+                provider.value,
+            )
+            provider = OpponentMode.BEST_MODEL
+        try:
+            judge_tokens = int(os.getenv("JUDGE_MAX_OUTPUT_TOKENS", "800") or 800)
+        except ValueError:
+            judge_tokens = 800
+        judge_tokens = max(1, judge_tokens)
+
+        if self.ai_client is None:
+            self.ai_client = OpenAIClient()
+        base_client = self.ai_client
+        base_client.judge_max_output_tokens = judge_tokens
+
+        if provider == OpponentMode.BEST_MODEL:
+            return base_client.judge_words(words, language=language)
+
+        def provider_llm_validator(
+            pending_words: list[str],
+            pending_language: str,
+        ) -> JudgeBatchResponse:
+            return self._judge_with_external_provider(
+                provider=provider,
+                words=pending_words,
+                language=pending_language,
+                max_output_tokens=judge_tokens,
+            )
+
+        return base_client.judge_words(
+            words,
+            language=language,
+            llm_validator=provider_llm_validator,
+        )
 
 
     def _resolve_openai_model_label(self) -> str:
@@ -3226,7 +3396,12 @@ class MainWindow(QMainWindow):
     def _format_judge_status(self, words: list[str]) -> str:
         """Format judge status message with model name if available."""
         model_name = getattr(self, '_current_ai_model', None)
-        model_prefix = f"[{model_name}] " if model_name and model_name != "AI" else ""
+        judge_provider = getattr(self, "judge_provider", OpponentMode.BEST_MODEL)
+        provider_label = judge_provider.display_name_sk
+        if model_name and model_name != "AI":
+            model_prefix = f"[{provider_label}/{model_name}] "
+        else:
+            model_prefix = f"[{provider_label}] "
         
         if not words:
             return f"{model_prefix}Rozhoduje rozhodca"
@@ -4087,30 +4262,35 @@ class MainWindow(QMainWindow):
         judge_status = self._format_judge_status(words)
         self._start_status_spinner("judge", judge_status, wait_cursor=False)
 
-        # lazy init klienta
-        if self.ai_client is None:
-            self.ai_client = OpenAIClient()
-
         # worker v pozadi na rozhodcu
         class JudgeWorker(QObject):
             finished: Signal = Signal(dict)
             failed: Signal = Signal(Exception)
-            def __init__(self, client: OpenAIClient, words: list[str], trace_id: str, language: str) -> None:
+            def __init__(
+                self,
+                owner: MainWindow,
+                words: list[str],
+                trace_id: str,
+                language: str,
+            ) -> None:
                 super().__init__()
-                self.client = client
+                self.owner = owner
                 self.words = words
                 self.trace_id = trace_id
                 self.language = language
             def run(self) -> None:
                 try:
                     TRACE_ID_VAR.set(self.trace_id)
-                    resp = self.client.judge_words(self.words, language=self.language)
+                    resp = self.owner._judge_words_with_selected_provider(
+                        self.words,
+                        language=self.language,
+                    )
                     self.finished.emit(resp)
                 except Exception as e:  # noqa: BLE001
                     self.failed.emit(e)
 
         self._judge_thread = QThread(self)
-        self._judge_worker = JudgeWorker(self.ai_client, words, TRACE_ID_VAR.get(), self.variant_language)
+        self._judge_worker = JudgeWorker(self, words, TRACE_ID_VAR.get(), self.variant_language)
         self._judge_worker.moveToThread(self._judge_thread)
         self._judge_thread.started.connect(self._judge_worker.run)
         self._judge_worker.finished.connect(self._on_judge_ok)
@@ -7087,16 +7267,25 @@ class MainWindow(QMainWindow):
         class JudgeWorker(QObject):
             finished: Signal = Signal(dict)
             failed: Signal = Signal(Exception)
-            def __init__(self, client: OpenAIClient, words: list[str], trace_id: str, language: str) -> None:
+            def __init__(
+                self,
+                owner: MainWindow,
+                words: list[str],
+                trace_id: str,
+                language: str,
+            ) -> None:
                 super().__init__()
-                self.client = client
+                self.owner = owner
                 self.words = words
                 self.trace_id = trace_id
                 self.language = language
             def run(self) -> None:
                 try:
                     TRACE_ID_VAR.set(self.trace_id)
-                    resp = self.client.judge_words(self.words, language=self.language)
+                    resp = self.owner._judge_words_with_selected_provider(
+                        self.words,
+                        language=self.language,
+                    )
                     self.finished.emit(resp)
                 except Exception as e:  # noqa: BLE001
                     self.failed.emit(e)
@@ -7112,7 +7301,7 @@ class MainWindow(QMainWindow):
         
         self._ai_judge_thread = QThread(self)
         self._ai_judge_worker = JudgeWorker(
-            self.ai_client if self.ai_client else OpenAIClient(),
+            self,
             words,
             TRACE_ID_VAR.get(),
             self.variant_language,
@@ -7473,6 +7662,7 @@ class MainWindow(QMainWindow):
             new_agent = dlg.get_selected_agent_name()
             new_google_models = dlg.get_selected_google_models()
             new_openai_models = dlg.get_selected_openai_models()
+            new_judge_provider = dlg.get_selected_judge_provider()
             
             if new_mode != self.opponent_mode or new_agent != self.selected_agent_name:
                 self.opponent_mode = new_mode
@@ -7488,6 +7678,10 @@ class MainWindow(QMainWindow):
                     self.status.showMessage(f"AI Režim: {mode_name}", 3000)
                 else:
                     self.status.showMessage(f"AI Režim: {mode_name}", 3000)
+
+            if new_judge_provider != self.judge_provider:
+                self.judge_provider = new_judge_provider
+                log.info("Judge provider changed to: %s", new_judge_provider.value)
 
             if new_google_models:
                 model_values = [m.strip() for m in new_google_models if isinstance(m, str) and m.strip()]
@@ -7580,10 +7774,6 @@ class MainWindow(QMainWindow):
             self.surrender()
         else:
             self.new_game()
-
-    def show_log(self) -> None:
-        dlg = LogViewerDialog(self, max_lines=500)
-        dlg.exec()
 
     # ---------- Save/Load ----------
     def save_game_dialog(self) -> None:
@@ -7699,28 +7889,6 @@ class MainWindow(QMainWindow):
             log.exception("Load failed: %s", e)
             QMessageBox.critical(self, "Otvoriť", f"Zlyhalo načítanie: {e}")
 
-    def create_iq_test(self) -> None:
-        """Otvorí okno pre vytvorenie IQ testu."""
-        from .iq_creator import IQTestCreatorWindow
-        
-        if not self.ai_rack:
-            QMessageBox.warning(
-                self,
-                "IQ test",
-                "AI nemá žiadne písmená na racku. Začni novú hru najprv.",
-            )
-            return
-        
-        dialog = IQTestCreatorWindow(
-            board=self.board,
-            ai_rack=self.ai_rack,
-            variant_definition=self.variant_definition,
-            ai_client=self.ai_client,
-            parent=self,
-        )
-        dialog.exec()
-
-    
     @staticmethod
     def _normalize_profile_model_id(model_id: str) -> str:
         raw = str(model_id or "").strip()
@@ -8390,12 +8558,15 @@ class MainWindow(QMainWindow):
             new_agent = dialog.get_selected_agent_name()
             new_google_models = dialog.get_selected_google_models()
             new_openai_models = dialog.get_selected_openai_models()
+            new_judge_provider = dialog.get_selected_judge_provider()
             
             log.info("=== Settings Accepted: mode=%s, agent=%s ===", new_mode.value, new_agent)
             
             # Store settings
             self.opponent_mode = new_mode
             self.selected_agent_name = new_agent
+            self.judge_provider = new_judge_provider
+            log.info("Saved judge provider: %s", new_judge_provider.value)
             
             # Save opponent mode to config
             self.team_manager.save_opponent_mode(new_mode.value)

@@ -34,6 +34,9 @@ class MoveProposal(TypedDict):
     exchange: list[str]
     pass_: bool
 
+
+JudgeValidator = Callable[[list[str], str], JudgeBatchResponse]
+
 def _mask_key(k: str) -> str:
     if not k:
         return ""
@@ -450,111 +453,9 @@ class OpenAIClient:
             raise
 
     # ---------------- Rozhodca (batched) ----------------
-    def judge_words(self, words: list[str], *, language: str) -> JudgeBatchResponse:
-        """Validuje zoznam slov pre Scrabble.
-        
-        Pre slovenčinu: 3-stupňová validácia:
-        1. Lokálny slovník (najrýchlejšie)
-        2. Online JÚĽŠ slovník (stredne rýchle)
-        3. OpenAI (najdrahšie, len ako posledná možnosť)
-        
-        Pre ostatné jazyky: používa len OpenAI.
-        """
-        # Pre slovenčinu: kontrola slovníka najprv
-        if language.lower() == "slovak" and self._slovak_dict:
-            dict_results: list[JudgeResult] = []
-            juls_needed: list[str] = []
-            
-            # Úroveň 1: Lokálny slovník
-            for word in words:
-                if self._slovak_dict(word):
-                    dict_results.append({
-                        "word": word,
-                        "valid": True,
-                        "reason": "Slovo nájdené v oficiálnom slovenskom slovníku.",
-                    })
-                else:
-                    juls_needed.append(word)
-            
-            # Ak všetky slová našli sa v lokálnom slovníku, vráť výsledky
-            if not juls_needed:
-                return cast(JudgeBatchResponse, {
-                    "results": dict_results,
-                    "all_valid": True,
-                })
-            
-            # Úroveň 2: Online JÚĽŠ slovník pre slová nenájdené lokálne
-            juls_results: list[JudgeResult] = []
-            openai_needed: list[str] = []
-            
-            log.info(
-                "Local dictionary: %d/%d words found, checking JULS for %d words",
-                len(dict_results), len(words), len(juls_needed)
-            )
-            
-            for word in juls_needed:
-                try:
-                    if is_word_in_juls(word):
-                        result: JudgeResult = {
-                            "word": word,
-                            "valid": True,
-                            "reason": "Slovo nájdené v online slovníku JÚĽŠ.",
-                        }
-                        juls_results.append(result)
-                    else:
-                        openai_needed.append(word)
-                except Exception as e:
-                    # Pri chybe JÚĽŠ (network timeout, atď), pridaj do OpenAI fronty
-                    log.warning("JULS lookup failed for '%s': %s, falling back to OpenAI", word, e)
-                    openai_needed.append(word)
-            
-            combined_results = dict_results + juls_results
-            
-            # Ak všetky slová našli sa v slovníkoch (lokálny + JÚĽŠ), vráť výsledky
-            if not openai_needed:
-                log.info(
-                    "JULS online: %d/%d remaining words found",
-                    len(juls_results), len(juls_needed)
-                )
-                return cast(JudgeBatchResponse, {
-                    "results": combined_results,
-                    "all_valid": True,
-                })
-            
-            # Úroveň 3: OpenAI pre slová nenájdené ani v JÚĽŠ
-            log.info(
-                "JULS online: %d/%d found, asking OpenAI about final %d words",
-                len(juls_results), len(juls_needed), len(openai_needed)
-            )
-            try:
-                openai_response = self._judge_with_openai(openai_needed, language)
-            except Exception as e:  # noqa: BLE001
-                log.exception("OpenAI judge fallback failed: %s", e)
-                # Mark unresolved words as invalid but keep previous findings
-                error_results: list[JudgeResult] = [
-                    {"word": w, "valid": False, "reason": f"OpenAI judge failed: {e}"}
-                    for w in openai_needed
-                ]
-                combined_results = combined_results + error_results
-                all_valid = all(r["valid"] for r in combined_results)
-                return cast(JudgeBatchResponse, {
-                    "results": combined_results,
-                    "all_valid": all_valid,
-                })
-            combined_results = combined_results + openai_response["results"]
-            all_valid = all(r["valid"] for r in combined_results)
-            return cast(JudgeBatchResponse, {
-                "results": combined_results,
-                "all_valid": all_valid,
-            })
-        
-        # Pre ostatné jazyky alebo ak slovník neexistuje: použiť len OpenAI
-        return self._judge_with_openai(words, language)
-
-    def _judge_with_openai(self, words: list[str], language: str) -> JudgeBatchResponse:
-        if not words:
-            return cast(JudgeBatchResponse, {"results": [], "all_valid": True})
-        schema = {
+    @staticmethod
+    def judge_schema() -> dict[str, Any]:
+        return {
             "type": "object",
             "properties": {
                 "results": {
@@ -575,6 +476,9 @@ class OpenAIClient:
             "required": ["results", "all_valid"],
             "additionalProperties": False,
         }
+
+    @staticmethod
+    def build_judge_prompt(words: list[str], language: str) -> str:
         sys_prompt = (
             f"You are a strict Scrabble referee for {language} words. "
             "Reply with JSON only. "
@@ -600,12 +504,10 @@ class OpenAIClient:
             f"Validate these words for {language} Scrabble play: {words}. "
             "Return JSON exactly matching the schema."
         )
-        raw = self._call_json(
-            sys_prompt + "\n" + user_prompt,
-            schema,
-            max_output_tokens=self.judge_max_output_tokens,
-        )
+        return sys_prompt + "\n" + user_prompt
 
+    @staticmethod
+    def normalize_judge_payload(raw: Any, words: list[str]) -> JudgeBatchResponse:
         if isinstance(raw, dict):
             normalized: list[JudgeResult] = []
             reserved_keys = {
@@ -803,6 +705,131 @@ class OpenAIClient:
 
         # Fallback: create minimal structure
         return cast(JudgeBatchResponse, {"results": [], "all_valid": False})
+
+    def judge_words(
+        self,
+        words: list[str],
+        *,
+        language: str,
+        llm_validator: JudgeValidator | None = None,
+    ) -> JudgeBatchResponse:
+        """Validuje zoznam slov pre Scrabble.
+        
+        Pre slovenčinu: 3-stupňová validácia:
+        1. Lokálny slovník (najrýchlejšie)
+        2. Online JÚĽŠ slovník (stredne rýchle)
+        3. LLM fallback (Google/OpenAI podľa nastavenia rozhodcu; najdrahšie)
+        
+        Pre ostatné jazyky: používa len LLM fallback podľa konfigurácie.
+        """
+        judge_llm = llm_validator or self._judge_with_openai
+        llm_label = "OpenAI" if llm_validator is None else "configured judge model"
+
+        # Pre slovenčinu: kontrola slovníka najprv
+        if language.lower() == "slovak" and self._slovak_dict:
+            dict_results: list[JudgeResult] = []
+            juls_needed: list[str] = []
+            
+            # Úroveň 1: Lokálny slovník
+            for word in words:
+                if self._slovak_dict(word):
+                    dict_results.append({
+                        "word": word,
+                        "valid": True,
+                        "reason": "Slovo nájdené v oficiálnom slovenskom slovníku.",
+                    })
+                else:
+                    juls_needed.append(word)
+            
+            # Ak všetky slová našli sa v lokálnom slovníku, vráť výsledky
+            if not juls_needed:
+                return cast(JudgeBatchResponse, {
+                    "results": dict_results,
+                    "all_valid": True,
+                })
+            
+            # Úroveň 2: Online JÚĽŠ slovník pre slová nenájdené lokálne
+            juls_results: list[JudgeResult] = []
+            openai_needed: list[str] = []
+            
+            log.info(
+                "Local dictionary: %d/%d words found, checking JULS for %d words",
+                len(dict_results), len(words), len(juls_needed)
+            )
+            
+            for word in juls_needed:
+                try:
+                    if is_word_in_juls(word):
+                        result: JudgeResult = {
+                            "word": word,
+                            "valid": True,
+                            "reason": "Slovo nájdené v online slovníku JÚĽŠ.",
+                        }
+                        juls_results.append(result)
+                    else:
+                        openai_needed.append(word)
+                except Exception as e:
+                    # Pri chybe JÚĽŠ (network timeout, atď), pridaj do LLM fallback fronty
+                    log.warning("JULS lookup failed for '%s': %s, falling back to LLM", word, e)
+                    openai_needed.append(word)
+            
+            combined_results = dict_results + juls_results
+            
+            # Ak všetky slová našli sa v slovníkoch (lokálny + JÚĽŠ), vráť výsledky
+            if not openai_needed:
+                log.info(
+                    "JULS online: %d/%d remaining words found",
+                    len(juls_results), len(juls_needed)
+                )
+                return cast(JudgeBatchResponse, {
+                    "results": combined_results,
+                    "all_valid": True,
+                })
+            
+            # Úroveň 3: LLM fallback pre slová nenájdené ani v JÚĽŠ
+            log.info(
+                "JULS online: %d/%d found, asking %s for final %d words",
+                len(juls_results),
+                len(juls_needed),
+                llm_label,
+                len(openai_needed),
+            )
+            try:
+                openai_response = judge_llm(openai_needed, language)
+            except Exception as e:  # noqa: BLE001
+                log.exception("%s judge fallback failed: %s", llm_label, e)
+                # Mark unresolved words as invalid but keep previous findings
+                error_results: list[JudgeResult] = [
+                    {"word": w, "valid": False, "reason": f"LLM judge failed: {e}"}
+                    for w in openai_needed
+                ]
+                combined_results = combined_results + error_results
+                all_valid = all(r["valid"] for r in combined_results)
+                return cast(JudgeBatchResponse, {
+                    "results": combined_results,
+                    "all_valid": all_valid,
+                })
+            combined_results = combined_results + openai_response["results"]
+            all_valid = all(r["valid"] for r in combined_results)
+            return cast(JudgeBatchResponse, {
+                "results": combined_results,
+                "all_valid": all_valid,
+            })
+        
+        # Pre ostatné jazyky alebo ak slovník neexistuje: použiť len OpenAI
+        return judge_llm(words, language)
+
+    def _judge_with_openai(self, words: list[str], language: str) -> JudgeBatchResponse:
+        if not words:
+            return cast(JudgeBatchResponse, {"results": [], "all_valid": True})
+        schema = self.judge_schema()
+        prompt = self.build_judge_prompt(words, language)
+        raw = self._call_json(
+            prompt,
+            schema,
+            max_output_tokens=self.judge_max_output_tokens,
+        )
+        return self.normalize_judge_payload(raw, words)
 
 class TokenBudgetExceededError(RuntimeError):
     """Vyvolané pri pravdepodobnom orezaní výstupu modelu kvôli limitu tokenov."""

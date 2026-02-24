@@ -16,7 +16,7 @@ from PySide6.QtGui import QIntValidator, QMouseEvent
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QPushButton,
     QLabel, QTabWidget, QWidget, QMessageBox, QFormLayout,
-    QLineEdit, QCheckBox, QComboBox, QSpinBox, QDialogButtonBox,
+    QLineEdit, QCheckBox, QComboBox, QSpinBox, QDialogButtonBox, QRadioButton,
 )
 
 from ..core.opponent_mode import OpponentMode
@@ -48,6 +48,18 @@ log = logging.getLogger("scrabgpt.ui")
 ROOT_DIR = Path(__file__).resolve().parents[2]
 ENV_PATH = str(ROOT_DIR / ".env")
 EUR_PER_TOKEN = 0.00000186  # 1 token ≈ 0.00000186 EUR
+
+
+def _load_env_file() -> None:
+    """Best-effort load of project .env into process environment."""
+
+    try:
+        from dotenv import load_dotenv as _load_dotenv
+
+        _load_dotenv(ENV_PATH, override=False)
+    except Exception:
+        # Optional dependency / malformed env should not break settings dialog.
+        pass
 
 
 class ClickableLabel(QLabel):
@@ -93,6 +105,9 @@ class SettingsDialog(QDialog):
             user_defined_ai_tokens: Whether user defined tokens
         """
         super().__init__(parent)
+
+        # Ensure persisted values are visible before any os.getenv(...) reads below.
+        _load_env_file()
         
         self.current_mode = current_mode or OpponentMode.BEST_MODEL
         self.current_agent_name = current_agent_name
@@ -124,6 +139,9 @@ class SettingsDialog(QDialog):
         self.selected_variant_slug = get_active_variant_slug()
         self._installed_variants: list[VariantDefinition] = []
         self._languages: list[LanguageInfo] = []
+        self.selected_judge_provider = self._load_judge_provider_from_env()
+        self.selected_judge_openai_model = self._load_judge_openai_model_from_env()
+        self.selected_judge_google_model = self._load_judge_google_model_from_env()
         
         # Language fetch animation state
         self._lang_dot_count = 0
@@ -175,7 +193,11 @@ class SettingsDialog(QDialog):
         # AI Opponent tab
         ai_tab = self._create_ai_tab()
         self.tabs.addTab(ai_tab, "🤖 AI Protivník")
-        
+
+        # Judge tab (single-provider, no parallel execution)
+        judge_tab = self._create_judge_tab()
+        self.tabs.addTab(judge_tab, "⚖️ Rozhodca")
+
         # API Settings tab
         api_tab = self._create_api_tab()
         self.tabs.addTab(api_tab, "⚡ Nastavenia API")
@@ -350,6 +372,11 @@ class SettingsDialog(QDialog):
         """Get selected Google Gemini models for GEMINI mode."""
         return list(self.selected_google_models)
 
+    def get_selected_judge_provider(self) -> OpponentMode:
+        """Get selected provider for judge workflow."""
+
+        return self.selected_judge_provider
+
     @staticmethod
     def _parse_google_models(raw: str) -> list[str]:
         parsed: list[str] = []
@@ -393,6 +420,334 @@ class SettingsDialog(QDialog):
         if parsed:
             return parsed
         return ["gpt-5.2"]
+
+    def _load_judge_provider_from_env(self) -> OpponentMode:
+        raw = (os.getenv("JUDGE_PROVIDER") or "").strip()
+        if raw:
+            try:
+                resolved = OpponentMode.from_string(raw)
+                if resolved in {OpponentMode.GEMINI, OpponentMode.BEST_MODEL}:
+                    return resolved
+                log.warning(
+                    "Unsupported JUDGE_PROVIDER '%s' for judge tab (allowed: gemini, best_model).",
+                    raw,
+                )
+                return OpponentMode.BEST_MODEL
+            except ValueError:
+                log.warning("Invalid JUDGE_PROVIDER value '%s', falling back to OpenAI", raw)
+        return OpponentMode.BEST_MODEL
+
+    def _load_judge_openai_model_from_env(self) -> str:
+        model_id = (os.getenv("JUDGE_OPENAI_MODEL") or "").strip()
+        if model_id:
+            return model_id
+        if self.selected_openai_models:
+            return self.selected_openai_models[0]
+        return "gpt-5.2"
+
+    def _load_judge_google_model_from_env(self) -> str:
+        model_id = (os.getenv("JUDGE_GEMINI_MODEL") or "").strip()
+        if model_id:
+            return model_id
+        if self.selected_google_models:
+            return self.selected_google_models[0]
+        fallback = (
+            os.getenv("GEMINI_MODEL")
+            or os.getenv("GOOGLE_GEMINI_MODEL")
+            or "gemini-2.5-pro"
+        ).strip()
+        return fallback or "gemini-2.5-pro"
+
+    def _create_judge_tab(self) -> QWidget:
+        """Create judge settings tab with single-provider workflow."""
+
+        widget = QWidget()
+        layout = QFormLayout(widget)
+        layout.setSpacing(12)
+        layout.setContentsMargins(16, 16, 16, 16)
+
+        input_style = (
+            "QLineEdit { "
+            "background: #000000; color: #e8f5e9; padding: 8px; "
+            "border: 1px solid #2f5c39; border-radius: 4px; "
+            "} "
+            "QLineEdit:hover { border-color: #4caf50; } "
+            "QLineEdit:focus { border-color: #4caf50; background: #0a0a0a; }"
+        )
+        combo_style = (
+            "QComboBox { "
+            "background: #000000; color: #e8f5e9; padding: 6px; "
+            "border: 1px solid #2f5c39; border-radius: 4px; "
+            "} "
+            "QComboBox:hover { border-color: #4caf50; background: #0a0a0a; } "
+            "QComboBox:focus { border-color: #4caf50; } "
+            "QComboBox::drop-down { border: none; width: 20px; } "
+            "QComboBox QAbstractItemView { "
+            "background: #000000; color: #e8f5e9; "
+            "selection-background-color: #295c33; "
+            "}"
+        )
+
+        self.judge_provider_combo = QComboBox(widget)
+        self.judge_provider_combo.setStyleSheet(combo_style)
+        provider_order = [
+            OpponentMode.GEMINI,
+            OpponentMode.BEST_MODEL,
+        ]
+        for provider in provider_order:
+            self.judge_provider_combo.addItem(provider.display_name_sk, provider.value)
+        provider_index = self.judge_provider_combo.findData(self.selected_judge_provider.value)
+        if provider_index >= 0:
+            self.judge_provider_combo.setCurrentIndex(provider_index)
+
+        self.judge_provider_config_btn = QPushButton("Nastaviť provider", widget)
+        self.judge_provider_config_btn.setStyleSheet(
+            "QPushButton { "
+            "padding: 8px 14px; font-size: 12px; border-radius: 4px; "
+            "background-color: #2e7d32; color: #e8f5e9; border: 1px solid #4caf50; "
+            "} "
+            "QPushButton:hover { background-color: #388e3c; } "
+            "QPushButton:pressed { background-color: #1b5e20; }"
+        )
+        provider_row = QHBoxLayout()
+        provider_row.addWidget(self.judge_provider_combo, 2)
+        provider_row.addWidget(self.judge_provider_config_btn, 1)
+        provider_row_widget = QWidget(widget)
+        provider_row_widget.setLayout(provider_row)
+        layout.addRow(
+            self._styled_label("Poskytovateľ rozhodcu:"),
+            provider_row_widget,
+        )
+
+        self.judge_parallel_hint = QLabel(
+            "Rozhodca volá vždy len 1 model (bez paralelizácie). "
+            "Použije sa model, ktorý vyberieš pre rozhodcu."
+        )
+        self.judge_parallel_hint.setWordWrap(True)
+        self.judge_parallel_hint.setStyleSheet("color: #b6e0bd; font-size: 12px;")
+        layout.addRow("", self.judge_parallel_hint)
+
+        self.judge_provider_preview = QLabel("")
+        self.judge_provider_preview.setWordWrap(True)
+        self.judge_provider_preview.setTextFormat(Qt.TextFormat.RichText)
+        layout.addRow("", self.judge_provider_preview)
+
+        self.judge_tokens_edit = QLineEdit(widget)
+        self.judge_tokens_edit.setValidator(QIntValidator(1, 1_000_000, widget))
+        self.judge_tokens_edit.setText(os.getenv("JUDGE_MAX_OUTPUT_TOKENS", "800"))
+        self.judge_tokens_edit.setStyleSheet(input_style)
+        self.judge_tokens_cost = QLabel("")
+        self.judge_tokens_cost.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.judge_tokens_cost.setStyleSheet("color: #ffd54f; font-size: 12px;")
+        j_row = QHBoxLayout()
+        j_row.addWidget(self.judge_tokens_edit, 2)
+        j_row.addWidget(self.judge_tokens_cost, 1)
+        j_row_w = QWidget(widget)
+        j_row_w.setLayout(j_row)
+        layout.addRow(
+            self._styled_label("Rozhodca — max výstupných tokenov:"),
+            j_row_w,
+        )
+
+        self.judge_provider_combo.currentIndexChanged.connect(self._on_judge_provider_changed)
+        self.judge_provider_config_btn.clicked.connect(self._configure_selected_judge_provider)
+        self.judge_tokens_edit.textChanged.connect(self._update_costs)
+        self._refresh_judge_provider_preview()
+        self._update_costs()
+
+        return widget
+
+    def _on_judge_provider_changed(self, index: int) -> None:
+        provider_data = self.judge_provider_combo.itemData(index)
+        if not isinstance(provider_data, str):
+            return
+        try:
+            self.selected_judge_provider = OpponentMode.from_string(provider_data)
+        except ValueError:
+            self.selected_judge_provider = OpponentMode.BEST_MODEL
+        self._refresh_judge_provider_preview()
+
+    def _configure_selected_judge_provider(self) -> None:
+        provider = self.selected_judge_provider
+        if provider == OpponentMode.GEMINI:
+            self._configure_judge_google_model()
+        else:
+            self._configure_judge_openai_model()
+        self._refresh_judge_provider_preview()
+
+    def _configure_judge_openai_model(self) -> None:
+        """Configure single OpenAI model for judge (no parallel selection)."""
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("OpenAI Model pre Rozhodcu")
+        form = QFormLayout(dialog)
+        form.setContentsMargins(14, 14, 14, 14)
+        form.setSpacing(10)
+
+        known_models: list[tuple[str, str]] = [
+            ("gpt-5.2", "gpt-5.2"),
+            ("gpt-5-mini", "gpt-5-mini"),
+            ("gpt-4.1", "gpt-4.1"),
+        ]
+
+        radios_container = QWidget(dialog)
+        radios_layout = QVBoxLayout(radios_container)
+        radios_layout.setContentsMargins(0, 0, 0, 0)
+        radios_layout.setSpacing(8)
+
+        model_radios: list[tuple[str, QRadioButton]] = []
+        selected_model = (self.selected_judge_openai_model or "").strip()
+        for label, model_id in known_models:
+            radio = QRadioButton(label, radios_container)
+            radio.setProperty("model_id", model_id)
+            radio.setChecked(model_id == selected_model)
+            radio.setToolTip(model_id)
+            radios_layout.addWidget(radio)
+            model_radios.append((model_id, radio))
+
+        if model_radios and not any(radio.isChecked() for _, radio in model_radios):
+            model_radios[0][1].setChecked(True)
+
+        form.addRow("Model:", radios_container)
+
+        info = QLabel("Rozhodca používa presne jeden OpenAI model (bez paralelizácie).")
+        info.setWordWrap(True)
+        info.setStyleSheet("color: #b6e0bd; font-size: 11px;")
+        form.addRow("", info)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
+            parent=dialog,
+        )
+        form.addRow(buttons)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        selected = ""
+        for model_id, radio in model_radios:
+            if radio.isChecked():
+                selected = model_id
+                break
+
+        if not selected:
+            QMessageBox.warning(
+                self,
+                "OpenAI model rozhodcu",
+                "Vyber jeden OpenAI model pre rozhodcu.",
+            )
+            return
+
+        self.selected_judge_openai_model = selected
+        log.info("Judge OpenAI model configured: %s", selected)
+
+    def _configure_judge_google_model(self) -> None:
+        """Configure single Google/Gemini model for judge (no parallel selection)."""
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Google Model pre Rozhodcu")
+        form = QFormLayout(dialog)
+        form.setContentsMargins(14, 14, 14, 14)
+        form.setSpacing(10)
+
+        known_models: list[tuple[str, str]] = [
+            ("Gemini 3.1 Pro (preview)", "gemini-3.1-pro-preview"),
+            ("Gemini 3 Pro (preview)", "gemini-3-pro-preview"),
+            ("Gemini 3 Flash (preview)", "gemini-3-flash-preview"),
+            ("Gemini 2.5 Pro", "gemini-2.5-pro"),
+            ("Gemini 2.5 Flash", "gemini-2.5-flash"),
+        ]
+
+        radios_container = QWidget(dialog)
+        radios_layout = QVBoxLayout(radios_container)
+        radios_layout.setContentsMargins(0, 0, 0, 0)
+        radios_layout.setSpacing(8)
+
+        model_radios: list[tuple[str, QRadioButton]] = []
+        selected_model = (self.selected_judge_google_model or "").strip()
+        for label, model_id in known_models:
+            radio = QRadioButton(label, radios_container)
+            radio.setProperty("model_id", model_id)
+            radio.setChecked(model_id == selected_model)
+            radio.setToolTip(model_id)
+            radios_layout.addWidget(radio)
+            model_radios.append((model_id, radio))
+
+        if model_radios and not any(radio.isChecked() for _, radio in model_radios):
+            model_radios[0][1].setChecked(True)
+
+        form.addRow("Model:", radios_container)
+
+        info = QLabel("Rozhodca používa presne jeden Google/Gemini model (bez paralelizácie).")
+        info.setWordWrap(True)
+        info.setStyleSheet("color: #b6e0bd; font-size: 11px;")
+        form.addRow("", info)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
+            parent=dialog,
+        )
+        form.addRow(buttons)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        selected = ""
+        for model_id, radio in model_radios:
+            if radio.isChecked():
+                selected = model_id
+                break
+
+        if not selected:
+            QMessageBox.warning(
+                self,
+                "Google model rozhodcu",
+                "Vyber jeden Google/Gemini model pre rozhodcu.",
+            )
+            return
+
+        self.selected_judge_google_model = selected
+        log.info("Judge Google model configured: %s", selected)
+
+    def _resolve_judge_preview_model(self, provider: OpponentMode) -> str:
+        if provider == OpponentMode.GEMINI:
+            model_id = (self.selected_judge_google_model or "").strip()
+            if model_id:
+                return model_id
+            model_id = (os.getenv("JUDGE_GEMINI_MODEL") or "").strip()
+            if model_id:
+                return model_id
+            return ""
+
+        if provider == OpponentMode.BEST_MODEL:
+            model_id = (self.selected_judge_openai_model or "").strip()
+            if model_id:
+                return model_id
+            model_id = (os.getenv("JUDGE_OPENAI_MODEL") or "").strip()
+            if model_id:
+                return model_id
+            return ""
+
+        return ""
+
+    def _refresh_judge_provider_preview(self) -> None:
+        provider = self.selected_judge_provider
+        model_id = self._resolve_judge_preview_model(provider)
+        if model_id:
+            self.judge_provider_preview.setStyleSheet("color: #9ad0a2; font-size: 12px;")
+            self.judge_provider_preview.setText(
+                f"Rozhodca použije model: <b>{model_id}</b>"
+            )
+            return
+        self.judge_provider_preview.setStyleSheet("color: #ffb74d; font-size: 12px;")
+        self.judge_provider_preview.setText(
+            "Rozhodca nemá nakonfigurovaný model pre vybraného providera. "
+            "Klikni na <b>Nastaviť provider</b>."
+        )
     
     def _configure_google(self) -> None:
         """Open Google Gemini model configuration dialog (multi-select)."""
@@ -460,6 +815,7 @@ class SettingsDialog(QDialog):
             self.selected_google_models = selected
             self.selected_google_model = selected[0]
             log.info("Google models configured: %s", selected)
+            self._refresh_judge_provider_preview()
 
     def _configure_openai(self) -> None:
         """Open OpenAI model configuration dialog (multi-select)."""
@@ -526,6 +882,7 @@ class SettingsDialog(QDialog):
             if hasattr(self, "mode_selector") and self.mode_selector:
                 self.mode_selector.set_openai_models_preview(selected)
             log.info("OpenAI models configured: %s", selected)
+            self._refresh_judge_provider_preview()
     
     def _configure_openrouter(self) -> None:
         """Open OpenRouter model configuration dialog."""
@@ -545,6 +902,7 @@ class SettingsDialog(QDialog):
             # Sync shared token limit back to settings field for consistency
             self.ai_tokens_edit.setText(str(self.openrouter_tokens))
             log.info("OpenRouter models configured: %d models", len(self.selected_openrouter_models))
+            self._refresh_judge_provider_preview()
             
             # Refresh model info display in mode selector
             if hasattr(self, 'mode_selector') and self.mode_selector:
@@ -568,6 +926,7 @@ class SettingsDialog(QDialog):
             # Sync shared token limit back to settings field for consistency
             self.ai_tokens_edit.setText(str(self.novita_tokens))
             log.info("Novita models configured: %d models", len(self.selected_novita_models))
+            self._refresh_judge_provider_preview()
             
             # Refresh model info display in mode selector
             if hasattr(self, 'mode_selector') and self.mode_selector:
@@ -662,6 +1021,7 @@ class SettingsDialog(QDialog):
             if hasattr(self, "ai_tokens_edit"):
                 self.ai_tokens_edit.setText(tokens_val)
             
+            self._refresh_judge_provider_preview()
             dialog.accept()
         
         save_btn.clicked.connect(_save)
@@ -768,11 +1128,7 @@ class SettingsDialog(QDialog):
         return widget
     
     def _create_api_tab(self) -> QWidget:
-        """Create API and game settings tab.
-        
-        Returns:
-            Widget with API settings
-        """
+        """Create API credentials + AI move budget tab."""
         widget = QWidget()
         layout = QFormLayout(widget)
         layout.setSpacing(12)
@@ -785,11 +1141,7 @@ class SettingsDialog(QDialog):
         except Exception:
             pass
         
-        # OpenAI API key
-        self.key_edit = QLineEdit(widget)
-        self.key_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        self.key_edit.setText(os.getenv("OPENAI_API_KEY", ""))
-        self.key_edit.setStyleSheet(
+        input_style = (
             "QLineEdit { "
             "background: #000000; color: #e8f5e9; padding: 8px; "
             "border: 1px solid #2f5c39; border-radius: 4px; "
@@ -797,16 +1149,55 @@ class SettingsDialog(QDialog):
             "QLineEdit:hover { border-color: #4caf50; } "
             "QLineEdit:focus { border-color: #4caf50; background: #0a0a0a; }"
         )
+
+        # OpenAI API key
+        self.openai_key_edit = QLineEdit(widget)
+        self.openai_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.openai_key_edit.setText(os.getenv("OPENAI_API_KEY", ""))
+        self.openai_key_edit.setStyleSheet(input_style)
         layout.addRow(
             self._styled_label("OpenAI API kľúč:"),
-            self.key_edit,
+            self.openai_key_edit,
         )
-        
+
+        # Backward-compat alias for older call sites
+        self.key_edit = self.openai_key_edit
+
+        # OpenRouter API key
+        self.openrouter_key_edit = QLineEdit(widget)
+        self.openrouter_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.openrouter_key_edit.setText(os.getenv("OPENROUTER_API_KEY", ""))
+        self.openrouter_key_edit.setStyleSheet(input_style)
+        layout.addRow(
+            self._styled_label("OpenRouter API kľúč:"),
+            self.openrouter_key_edit,
+        )
+
+        # Novita API key
+        self.novita_key_edit = QLineEdit(widget)
+        self.novita_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.novita_key_edit.setText(os.getenv("NOVITA_API_KEY", ""))
+        self.novita_key_edit.setStyleSheet(input_style)
+        layout.addRow(
+            self._styled_label("Novita API kľúč:"),
+            self.novita_key_edit,
+        )
+
+        # Google API key (legacy/fallback path)
+        self.google_key_edit = QLineEdit(widget)
+        self.google_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.google_key_edit.setText(os.getenv("GOOGLE_API_KEY", ""))
+        self.google_key_edit.setStyleSheet(input_style)
+        layout.addRow(
+            self._styled_label("Google API kľúč:"),
+            self.google_key_edit,
+        )
+
         # AI tokens with cost
         self.ai_tokens_edit = QLineEdit(widget)
         self.ai_tokens_edit.setValidator(QIntValidator(1, 1_000_000, widget))
         self.ai_tokens_edit.setText(os.getenv("AI_MOVE_MAX_OUTPUT_TOKENS", "3600"))
-        self.ai_tokens_edit.setStyleSheet(self.key_edit.styleSheet())
+        self.ai_tokens_edit.setStyleSheet(input_style)
         self.ai_tokens_cost = QLabel("")
         self.ai_tokens_cost.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self.ai_tokens_cost.setStyleSheet("color: #ffd54f; font-size: 12px;")
@@ -819,27 +1210,9 @@ class SettingsDialog(QDialog):
             self._styled_label("AI ťah — max výstupných tokenov:"),
             ai_row_w,
         )
-        
-        # Judge tokens with cost
-        self.judge_tokens_edit = QLineEdit(widget)
-        self.judge_tokens_edit.setValidator(QIntValidator(1, 1_000_000, widget))
-        self.judge_tokens_edit.setText(os.getenv("JUDGE_MAX_OUTPUT_TOKENS", "800"))
-        self.judge_tokens_edit.setStyleSheet(self.key_edit.styleSheet())
-        self.judge_tokens_cost = QLabel("")
-        self.judge_tokens_cost.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        self.judge_tokens_cost.setStyleSheet("color: #ffd54f; font-size: 12px;")
-        j_row = QHBoxLayout()
-        j_row.addWidget(self.judge_tokens_edit, 2)
-        j_row.addWidget(self.judge_tokens_cost, 1)
-        j_row_w = QWidget(widget)
-        j_row_w.setLayout(j_row)
-        layout.addRow(
-            self._styled_label("Rozhodca — max výstupných tokenov:"),
-            j_row_w,
-        )
-        
+
         # Test connection button
-        self.test_btn = QPushButton("🔌 Testovať pripojenie", widget)
+        self.test_btn = QPushButton("🔌 Testovať OpenAI", widget)
         self.test_btn.clicked.connect(self._test_connection)
         self.test_btn.setStyleSheet(
             "QPushButton { "
@@ -852,7 +1225,6 @@ class SettingsDialog(QDialog):
         
         # Connect cost updates
         self.ai_tokens_edit.textChanged.connect(self._update_costs)
-        self.judge_tokens_edit.textChanged.connect(self._update_costs)
         self._update_costs()
         
         return widget
@@ -884,8 +1256,10 @@ class SettingsDialog(QDialog):
             except ValueError:
                 return ""
         
-        self.ai_tokens_cost.setText(fmt(self.ai_tokens_edit.text()))
-        self.judge_tokens_cost.setText(fmt(self.judge_tokens_edit.text()))
+        if hasattr(self, "ai_tokens_cost") and hasattr(self, "ai_tokens_edit"):
+            self.ai_tokens_cost.setText(fmt(self.ai_tokens_edit.text()))
+        if hasattr(self, "judge_tokens_cost") and hasattr(self, "judge_tokens_edit"):
+            self.judge_tokens_cost.setText(fmt(self.judge_tokens_edit.text()))
     
     @staticmethod
     def _parse_positive_int(value: Any) -> int | None:
@@ -1274,18 +1648,29 @@ class SettingsDialog(QDialog):
     
     def accept(self) -> None:
         """Handle accept - save API settings to .env."""
-        # Save API key
-        key_str = self.key_edit.text().strip()
+        # Save API keys
+        openai_key = self.openai_key_edit.text().strip()
+        openrouter_key = self.openrouter_key_edit.text().strip()
+        novita_key = self.novita_key_edit.text().strip()
+        google_key = self.google_key_edit.text().strip()
         try:
             if not os.path.exists(ENV_PATH):
                 Path(ENV_PATH).open("a", encoding="utf-8").close()
         except Exception:
             pass
-        if key_str:
-            os.environ["OPENAI_API_KEY"] = key_str
+        api_values = {
+            "OPENAI_API_KEY": openai_key,
+            "OPENROUTER_API_KEY": openrouter_key,
+            "NOVITA_API_KEY": novita_key,
+            "GOOGLE_API_KEY": google_key,
+        }
+        for env_key, env_value in api_values.items():
+            if not env_value:
+                continue
+            os.environ[env_key] = env_value
             try:
                 from dotenv import set_key as _set_key
-                _set_key(ENV_PATH, "OPENAI_API_KEY", key_str)
+                _set_key(ENV_PATH, env_key, env_value)
             except Exception:
                 pass
         
@@ -1298,8 +1683,14 @@ class SettingsDialog(QDialog):
             from dotenv import set_key as _set_key2
             _set_key2(ENV_PATH, "AI_MOVE_MAX_OUTPUT_TOKENS", ai_tokens)
             _set_key2(ENV_PATH, "JUDGE_MAX_OUTPUT_TOKENS", judge_tokens)
+            _set_key2(ENV_PATH, "JUDGE_PROVIDER", self.selected_judge_provider.value)
+            _set_key2(ENV_PATH, "JUDGE_OPENAI_MODEL", self.selected_judge_openai_model)
+            _set_key2(ENV_PATH, "JUDGE_GEMINI_MODEL", self.selected_judge_google_model)
         except Exception:
             pass
+        os.environ["JUDGE_PROVIDER"] = self.selected_judge_provider.value
+        os.environ["JUDGE_OPENAI_MODEL"] = self.selected_judge_openai_model
+        os.environ["JUDGE_GEMINI_MODEL"] = self.selected_judge_google_model
 
         # Save OpenAI parallel model list
         openai_models = [

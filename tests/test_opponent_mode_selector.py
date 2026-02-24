@@ -123,5 +123,5 @@ class TestSettingsDialog:
         )
 
         tab_titles = [dialog.tabs.tabText(i).lower() for i in range(dialog.tabs.count())]
-        assert dialog.tabs.count() == 3
+        assert dialog.tabs.count() == 4
         assert all("prompt" not in title for title in tab_titles)

@@ -93,15 +93,45 @@ class OpenAIToolClient:
     @staticmethod
     def _tool_unsupported(error_text: str) -> bool:
         lowered = str(error_text or "").lower()
-        markers = (
+        # Parameter-level errors (e.g. max_tokens/max_completion_tokens) are not tool-compat issues.
+        if "max_tokens" in lowered or "max_completion_tokens" in lowered:
+            return False
+        tool_markers = (
             "tool",
+            "tool_choice",
+            "tool_calls",
             "function",
+            "function_call",
+            "functions",
+        )
+        unsupported_markers = (
             "unsupported",
             "not supported",
             "unknown parameter",
             "invalid parameter",
+            "unrecognized",
+            "extra inputs are not permitted",
         )
-        return any(marker in lowered for marker in markers)
+        return any(marker in lowered for marker in tool_markers) and any(
+            marker in lowered for marker in unsupported_markers
+        )
+
+    @staticmethod
+    def _should_retry_with_max_tokens(error: Exception) -> bool:
+        lowered = str(error or "").lower()
+        if "max_completion_tokens" not in lowered:
+            return False
+        fallback_markers = (
+            "unsupported",
+            "not supported",
+            "unknown parameter",
+            "invalid parameter",
+            "unexpected keyword",
+            "unexpected argument",
+            "extra inputs are not permitted",
+            "unrecognized",
+        )
+        return any(marker in lowered for marker in fallback_markers)
 
     @staticmethod
     def _parse_tool_arguments(arguments: Any) -> dict[str, Any]:
@@ -195,7 +225,9 @@ class OpenAIToolClient:
             )
         except APITimeoutError:
             raise
-        except Exception:
+        except Exception as exc:
+            if not self._should_retry_with_max_tokens(exc):
+                raise
             return self.client.chat.completions.create(
                 max_tokens=max_tokens,
                 **kwargs,

@@ -156,6 +156,44 @@ class _DummyChatScored:
         self.completions = _DummyCompletionsScored()
 
 
+class _DummyCompletionsMaxCompletionFallback:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.requests: list[dict] = []
+
+    def create(self, **kwargs):  # type: ignore[no-untyped-def]
+        self.calls += 1
+        self.requests.append(kwargs)
+        if self.calls == 1:
+            raise RuntimeError(
+                "Unsupported parameter: 'max_completion_tokens'. Use 'max_tokens' instead."
+            )
+        return _DummyResponse(
+            _DummyMessage(
+                content=(
+                    '{"start":{"row":7,"col":7},"direction":"ACROSS",'
+                    '"placements":[{"row":7,"col":7,"letter":"A"}],"word":"A"}'
+                )
+            )
+        )
+
+
+class _DummyCompletionsRateLimited:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.requests: list[dict] = []
+
+    def create(self, **kwargs):  # type: ignore[no-untyped-def]
+        self.calls += 1
+        self.requests.append(kwargs)
+        raise RuntimeError("429 Too Many Requests")
+
+
+class _DummyChatCustom:
+    def __init__(self, completions) -> None:  # type: ignore[no-untyped-def]
+        self.completions = completions
+
+
 class _DummyOpenAI:
     def __init__(self, *args, **kwargs) -> None:  # noqa: ANN002, ANN003
         del args, kwargs
@@ -172,6 +210,18 @@ class _DummyOpenAIScored:
     def __init__(self, *args, **kwargs) -> None:  # noqa: ANN002, ANN003
         del args, kwargs
         self.chat = _DummyChatScored()
+
+
+class _DummyOpenAIMaxCompletionFallback:
+    def __init__(self, *args, **kwargs) -> None:  # noqa: ANN002, ANN003
+        del args, kwargs
+        self.chat = _DummyChatCustom(_DummyCompletionsMaxCompletionFallback())
+
+
+class _DummyOpenAIRateLimited:
+    def __init__(self, *args, **kwargs) -> None:  # noqa: ANN002, ANN003
+        del args, kwargs
+        self.chat = _DummyChatCustom(_DummyCompletionsRateLimited())
 
 
 @pytest.mark.asyncio
@@ -274,3 +324,54 @@ async def test_openai_tools_client_can_force_more_scored_candidates(
 
     assert result["status"] == "ok"
     assert client.client.chat.completions.calls >= 4
+
+
+@pytest.mark.asyncio
+async def test_openai_tools_client_falls_back_to_max_tokens_only_when_needed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "scrabgpt.ai.openai_tools_client.OpenAI",
+        _DummyOpenAIMaxCompletionFallback,
+    )
+    client = OpenAIToolClient(api_key="test-key", timeout_seconds=30)
+
+    result = await client.call_model(
+        model_id="legacy-provider-model",
+        prompt="test prompt",
+        tools=[],
+    )
+
+    assert result["status"] == "ok"
+    requests = client.client.chat.completions.requests
+    assert len(requests) == 2
+    assert "max_completion_tokens" in requests[0]
+    assert "max_tokens" not in requests[0]
+    assert "max_tokens" in requests[1]
+
+
+@pytest.mark.asyncio
+async def test_openai_tools_client_does_not_retry_with_max_tokens_on_rate_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("scrabgpt.ai.openai_tools_client.OpenAI", _DummyOpenAIRateLimited)
+    client = OpenAIToolClient(api_key="test-key", timeout_seconds=30)
+
+    result = await client.call_model(
+        model_id="gpt-5.2",
+        prompt="test prompt",
+        tools=[],
+    )
+
+    assert result["status"] == "error"
+    assert "429 Too Many Requests" in str(result.get("error", ""))
+    assert client.client.chat.completions.calls == 1
+
+
+def test_openai_tools_client_tool_unsupported_detection_ignores_token_parameter_errors() -> None:
+    token_error = (
+        "Unsupported parameter: 'max_tokens' is not supported with this model. "
+        "Use 'max_completion_tokens' instead."
+    )
+    assert OpenAIToolClient._tool_unsupported(token_error) is False
+    assert OpenAIToolClient._tool_unsupported("Unknown parameter: 'tools'.") is True
